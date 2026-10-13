@@ -165,7 +165,8 @@ DEFAULT_CONFIG = {
     "companion_advert_flood": False,          # auto adverts: flood (whole mesh) instead of zero-hop
     "tenant_rooms": [],             # tenant rooms: [{"name", "path", "public_key"}]; everything else is in tenants/{key}.db
     "kaas_keys": [],                # KaaS API keys (made on the dashboard): only a hash of each key is kept, never the key
-    "kaas_send_interval_s": 10,     #   per key: at most one packet this often (ACKs and path returns excepted)
+    "kaas_send_burst": 3,           #   per key: at most this many packets...
+    "kaas_send_window_s": 20,       #   ...in any this many seconds (ACKs and path returns excepted)
     "kaas_airtime_pct": 5,          #   all API clients together may use at most this share of airtime
 }
 
@@ -6799,14 +6800,14 @@ def kaas_token_hash(token):
 
 
 def kaas_key_spec(body, now=None):
-    """A new API key's settings from the dashboard -> dict(read, write, description, expires), or ValueError."""
+    """A new API key's settings from the dashboard -> dict(receive, send, description, expires), or ValueError."""
     if not isinstance(body, dict):
         raise ValueError("bad request")
-    read, write = body.get("read"), body.get("write")
-    if not isinstance(read, bool) or not isinstance(write, bool):
-        raise ValueError("read and write must be true or false")
-    if not (read or write):
-        raise ValueError("choose Read, Write or both")
+    receive, send = body.get("receive"), body.get("send")
+    if not isinstance(receive, bool) or not isinstance(send, bool):
+        raise ValueError("receive and send must be true or false")
+    if not (receive or send):
+        raise ValueError("choose Receive, Send or both")
     desc = body.get("description", "")
     if not isinstance(desc, str) or len(desc.strip()) > 80:
         raise ValueError("description: text, at most 80 characters")
@@ -6817,7 +6818,7 @@ def kaas_key_spec(body, now=None):
         if exp <= (now or time.time()):
             raise ValueError("that expiry date has already passed")
         exp = int(exp)
-    return dict(read=read, write=write, description=desc.strip(), expires=exp)
+    return dict(receive=receive, send=send, description=desc.strip(), expires=exp)
 
 
 def ws_accept(key):
@@ -6896,7 +6897,7 @@ class KaasConn:
 
     def __init__(self, hub, sock, rfile, key, peer):
         self.hub, self.sock, self.rfile, self.peer = hub, sock, rfile, peer
-        self.key_id, self.read, self.write = key["id"], bool(key.get("read")), bool(key.get("write"))
+        self.key_id, self.can_receive, self.can_send = key["id"], bool(key.get("receive")), bool(key.get("send"))
         self.out = collections.deque()
         self.cv = threading.Condition()
         self.wlock = threading.Lock()
@@ -7008,7 +7009,7 @@ class KaasHub:
         self.lock = threading.Lock()
         self.conns = []                     # (replaced, never mutated: the main loop reads it without the lock)
         self.last_used = {}                 # key id -> time (this run; the config keeps the last connect)
-        self.last_send = {}                 # key id -> monotonic time of its last rate-limited send
+        self.last_send = {}                 # key id -> deque of monotonic times of its rate-limited sends in the window
         self.air = collections.deque()      # (monotonic, airtime ms) of clients' transmissions: the shared cap
         self.stats = dict(rx=0, tx=0, sent=0, local=0, dropped=0)
         self.next_check = 0.0
@@ -7039,14 +7040,13 @@ class KaasHub:
         """(token, entry): the token goes back to the dashboard once; the config keeps only its hash."""
         import secrets
         token = KAAS_TOKEN_PREFIX + secrets.token_urlsafe(32)
-        entry = dict(id=secrets.token_hex(4), hash=kaas_token_hash(token), prefix=token[:len(KAAS_TOKEN_PREFIX) + 4],
-                     created=now_s(), last_used=None, **spec)
+        entry = dict(id=secrets.token_hex(4), hash=kaas_token_hash(token), created=now_s(), last_used=None, **spec)
         return token, entry
 
     def key_rows(self):
         conns = list(self.conns)
-        return [dict(id=k["id"], prefix=k.get("prefix", ""), description=k.get("description", ""),
-                     read=bool(k.get("read")), write=bool(k.get("write")), expires=k.get("expires"),
+        return [dict(id=k["id"], description=k.get("description", ""),
+                     receive=bool(k.get("receive")), send=bool(k.get("send")), expires=k.get("expires"),
                      created=k.get("created"), expired=not self.valid(k),
                      last_used=max(self.last_used.get(k["id"]) or 0, k.get("last_used") or 0) or None,
                      connected=sum(1 for c in conns if c.key_id == k["id"]))
@@ -7091,9 +7091,10 @@ class KaasHub:
         room = self.room
         radio = dict(zip(("freq_hz", "bw_hz", "sf", "cr"), room.radio)) if room.radio else None
         return {"type": "hello", "api": 1, "server": FIRMWARE_VERSION,
-                "key": {"id": key["id"], "read": bool(key.get("read")), "write": bool(key.get("write")),
+                "key": {"id": key["id"], "receive": bool(key.get("receive")), "send": bool(key.get("send")),
                         "expires": key.get("expires")},
-                "send_interval_s": float(room.cfg.kaas_send_interval_s), "airtime_pct": float(room.cfg.kaas_airtime_pct),
+                "send_burst": int(room.cfg.kaas_send_burst), "send_window_s": float(room.cfg.kaas_send_window_s),
+                "airtime_pct": float(room.cfg.kaas_airtime_pct),
                 "radio": radio,
                 "nodes": {"room": hexs(room.id.pub_key),
                           "tenants": [hexs(t.id.pub_key) for t in list(room.tenants.values())],
@@ -7113,8 +7114,8 @@ class KaasHub:
         def drop(reason):
             self.stats["dropped"] += 1
             conn.send_json({"type": "send_result", "id": rid, "status": "dropped", "reason": reason})
-        if not conn.write:
-            return drop("this key has no Write permission")
+        if not conn.can_send:
+            return drop("this key can't send")
         try:
             raw = bytes.fromhex(str(msg.get("raw", "")))
         except ValueError:
@@ -7141,8 +7142,8 @@ class KaasHub:
         return keys
 
     def publish(self, direction, raw, snr=None, rssi=None):
-        """A packet this radio heard ("rx") or sent ("tx"): to every client with Read."""
-        conns = [c for c in self.conns if c.read]
+        """A packet this radio heard ("rx") or sent ("tx"): to every client that may receive."""
+        conns = [c for c in self.conns if c.can_receive]
         if not conns:
             return
         raw = bytes(raw)
@@ -7160,7 +7161,7 @@ class KaasHub:
 
     def send(self, conn, raw, rid):
         """A client's packet: checked, rate-limited, offered to the nodes on this radio, then queued for the air at the
-        lowest priority. ACKs and path returns (which usually carry an ACK) skip the per-key interval, since a bot must
+        lowest priority. ACKs and path returns (which usually carry an ACK) skip the per-key rate limit, since a bot must
         answer what it's sent, but count toward the airtime cap."""
         with conn.cv:
             conn.inflight -= 1
@@ -7172,7 +7173,7 @@ class KaasHub:
         if conn.closed:
             return
         k = self.key_by_id(conn.key_id)
-        if not self.valid(k) or not k.get("write"):
+        if not self.valid(k) or not k.get("send"):
             return result("dropped", reason="key revoked or expired")
         pkt = Packet.parse(raw)
         if pkt is None or pkt.encode() != raw:
@@ -7183,12 +7184,13 @@ class KaasHub:
             return result("dropped", reason="that packet speaks for a node on this radio")
         now = time.monotonic()
         exempt = pkt.ptype in (PT_ACK, PT_PATH)
-        interval = float(self.room.cfg.kaas_send_interval_s or 0)
-        if not exempt:
-            wait = self.last_send.get(conn.key_id, float("-inf")) + interval - now
-            if wait > 0:
-                return result("dropped", reason="rate limit: one packet every %g s per key (ACKs and paths excepted)" % interval,
-                              retry_after=round(max(wait, 0.1), 1))
+        burst, window = int(self.room.cfg.kaas_send_burst or 1), float(self.room.cfg.kaas_send_window_s or 0)
+        recent = self.last_send.setdefault(conn.key_id, collections.deque())
+        while recent and recent[0] <= now - window:
+            recent.popleft()
+        if not exempt and len(recent) >= burst:
+            return result("dropped", reason="rate limit: %d packets per %g s per key (ACKs and paths excepted)" % (burst, window),
+                          retry_after=round(max(recent[0] + window - now, 0.1), 1))
         at = self.room.airtime_ms(len(raw))
         while self.air and self.air[0][0] < now - KAAS_AIR_WINDOW_S:
             self.air.popleft()
@@ -7198,7 +7200,7 @@ class KaasHub:
             return result("dropped", reason="API airtime cap reached (%g%% of airtime)" % float(self.room.cfg.kaas_airtime_pct),
                           retry_after=round(max(wait, 1.0), 1))
         if not exempt:
-            self.last_send[conn.key_id] = now
+            recent.append(now)
         self.last_used[conn.key_id] = now_s()
         if self.room.offer(pkt, self) and (pkt.is_flood or pkt.hop_count == 0 or pkt.ptype == PT_TRACE):
             self.stats["local"] += 1
@@ -7370,12 +7372,12 @@ admins (web UI password) see its members and the map, chat, advert, resync, sugg
 people use from their MeshCore apps. Tenant rooms share this radio, its map and its airtime; nothing a tenant does reaches outside its room.</div>
 <table id="tnlist" style="margin-top:8px"></table></div>
 <div class="card" id="kaascard" style="display:none"><h2>KaaS <span class="hdesc">KISS radio as an API service - useful for bots or other integrations</span></h2>
-<div class="rprow"><label><input id="kk_read" type="checkbox" checked> Read</label><label><input id="kk_write" type="checkbox"> Write</label>
+<div class="rprow"><label><input id="kk_receive" type="checkbox" checked> Receive</label><label><input id="kk_send" type="checkbox"> Send</label>
 <label>Description <input id="kk_desc" maxlength="80" size="22" placeholder="e.g. weather bot"></label>
 <label>Expires <input id="kk_exp" type="date"></label><span class="dim small">(optional)</span>
 <button onclick="kkCreate(this)">Save</button><span id="kkmsg" class="small"></span></div>
 <div class="hint" style="margin-left:26px">Clients connect a websocket to <code id="kk_url"></code> with the header <code>Authorization: Bearer &lt;key&gt;</code>.
-Read streams every packet this radio hears and sends. Write may send raw packets: one every <span id="kk_int">10</span> s per key (ACKs and path returns excepted), all keys
+Receive streams every packet this radio hears and sends. Send may send raw packets: <span id="kk_burst">3</span> per <span id="kk_win">20</span> s per key (ACKs and path returns excepted), all keys
 together within <span id="kk_air">5</span>% of airtime, after everything of the room's. Clients do their own MeshCore crypto: see docs/api.md and the Python client in client/.
 A key is shown once, when it is made: only a hash of it is kept, so a lost key can't be recovered, only revoked and replaced.</div>
 <table id="kklist" style="margin-top:8px"></table></div>
@@ -7461,15 +7463,15 @@ async function loadTenants(){if(!MAINADM)return;try{const r=await fetch("api/ten
   `<option value="">Actions&hellip;</option><option value="pw">Reset web UI password</option><option value="del">Delete room</option></select></td></tr>`).join("")}
 let KK_ROWS=[];
 async function loadKaas(){if(!MAINADM)return;let d;try{const r=await fetch("api/v1/kaas/keys");if(!r.ok)return;d=await r.json()}catch(e){return}
- KK_ROWS=d.keys||[];$("kk_url").textContent=(location.protocol==="https:"?"wss://":"ws://")+location.host+d.path;$("kk_int").textContent=d.send_interval_s;$("kk_air").textContent=d.airtime_pct;
+ KK_ROWS=d.keys||[];$("kk_url").textContent=(location.protocol==="https:"?"wss://":"ws://")+location.host+d.path;$("kk_burst").textContent=d.send_burst;$("kk_win").textContent=d.send_window_s;$("kk_air").textContent=d.airtime_pct;
  const t=$("kklist");if(!KK_ROWS.length){t.innerHTML='<tr><td class="dim">No API keys yet.</td></tr>';return}
  const day=x=>x?new Date(x*1000).toLocaleDateString():"never";
- t.innerHTML="<tr><th>Key</th><th>Description</th><th>Access</th><th>Expires</th><th>Last used</th><th>Connected</th><th></th></tr>"+KK_ROWS.map(k=>
-  `<tr><td class="mono4">${esc(k.prefix)}&hellip;</td><td>${esc(k.description)||'<span class="dim">-</span>'}</td><td>${[k.read?"Read":"",k.write?"Write":""].filter(Boolean).join(" + ")}</td>`+
+ t.innerHTML="<tr><th>Description</th><th>Access</th><th>Expires</th><th>Last used</th><th>Connected</th><th></th></tr>"+KK_ROWS.map(k=>
+  `<tr><td>${esc(k.description)||'<span class="dim">(no description)</span>'}</td><td>${[k.receive?"Receive":"",k.send?"Send":""].filter(Boolean).join(" + ")}</td>`+
   `<td class="${k.expired?"poor":""}">${k.expired?"expired "+day(k.expires):day(k.expires)}</td><td>${k.last_used?ago(k.last_used)+" ago":"never"}</td>`+
   `<td>${k.connected?'<span class="mqdot on"></span> '+k.connected:'<span class="dim">no</span>'}</td>`+
-  `<td><button data-id="${esc(k.id)}" data-name="${esc(k.description||k.prefix)}" onclick="kkRevoke(this)">Revoke</button></td></tr>`).join("")}
-async function kkCreate(btn){const v=$("kk_exp").value;const o={read:$("kk_read").checked,write:$("kk_write").checked,description:$("kk_desc").value.trim(),
+  `<td><button data-id="${esc(k.id)}" data-name="${esc(k.description||"(no description)")}" onclick="kkRevoke(this)">Revoke</button></td></tr>`).join("")}
+async function kkCreate(btn){const v=$("kk_exp").value;const o={receive:$("kk_receive").checked,send:$("kk_send").checked,description:$("kk_desc").value.trim(),
  expires:v?Math.floor(new Date(v+"T23:59:59").getTime()/1000):null};
  btn.disabled=true;const r=await fetch("api/v1/kaas/keys",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(o)});btn.disabled=false;
  let d={};try{d=await r.json()}catch(e){}
@@ -8106,7 +8108,8 @@ class WebUI:
                         return self._send(401, '{"error":"log in first"}')
                     hub = room.kaas
                     return self._send(200, json.dumps({"keys": hub.key_rows(), "path": KAAS_PATH, "max": KAAS_MAX_KEYS,
-                                                       "send_interval_s": float(cfg.kaas_send_interval_s),
+                                                       "send_burst": int(cfg.kaas_send_burst),
+                                                       "send_window_s": float(cfg.kaas_send_window_s),
                                                        "airtime_pct": float(cfg.kaas_airtime_pct), "stats": dict(hub.stats)}))
                 if path.startswith("/static/"):
                     # files in data_dir/static (e.g. a local copy of Leaflet); Leaflet falls back to the CDN

@@ -445,16 +445,16 @@ How it fits together:
 ## Optional KaaS API
 
 KaaS ("KISS radio as an API service") lets bots and other integrations use the radio over a websocket at
-`/api/v1/kaas` on the dashboard's port. A client with a **Read** key receives every packet the radio hears and
-sends. A **Write** key can also send raw packets:
+`/api/v1/kaas` on the dashboard's port. A client with a **Receive** key gets every packet the radio hears and
+sends. A **Send** key can also send raw packets:
 
-* one every 10 s per key (ACKs and path returns excepted)
+* 3 in any 20 s per key (ACKs and path returns excepted)
 * within a 5% airtime cap shared by all keys
 * at the lowest priority, after everything the room, its repeater and its pushes send
 
 Clients do all MeshCore crypto themselves.
 
-The main admin makes keys on the **KaaS** card: Read and/or Write, a description and an optional expiry date. Each key
+The main admin makes keys on the **KaaS** card: Receive and/or Send, a description and an optional expiry date. Each key
 is shown once, when it's saved. The config keeps only its hash, so a lost key can only be revoked and replaced. The
 card lists every key with its last use and live connections, and **Revoke** disconnects a key's clients at once.
 

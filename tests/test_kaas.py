@@ -22,8 +22,8 @@ import meshroom_kaas as kc
 
 
 class FakeConn:
-    def __init__(self, key, read=True, write=True):
-        self.key_id, self.read, self.write = key, read, write
+    def __init__(self, key, receive=True, send=True):
+        self.key_id, self.can_receive, self.can_send = key, receive, send
         self.closed, self.inflight, self.msgs = False, 1, []
         self.cv = threading.Lock()
 
@@ -48,10 +48,10 @@ def flood(ptype, payload):
 
 class KeyAndFrameTests(unittest.TestCase):
     def test_key_spec(self):
-        spec = mr.kaas_key_spec({"read": True, "write": False, "description": " bot ", "expires": None})
-        self.assertEqual(spec, dict(read=True, write=False, description="bot", expires=None))
-        for bad in ({"read": False, "write": False}, {"read": "yes", "write": True}, {"read": True, "write": True, "expires": 5},
-                    {"read": True, "write": True, "description": "x" * 81}):
+        spec = mr.kaas_key_spec({"receive": True, "send": False, "description": " bot ", "expires": None})
+        self.assertEqual(spec, dict(receive=True, send=False, description="bot", expires=None))
+        for bad in ({"receive": False, "send": False}, {"receive": "yes", "send": True}, {"receive": True, "send": True, "expires": 5},
+                    {"receive": True, "send": True, "description": "x" * 81}):
             with self.assertRaises(ValueError):
                 mr.kaas_key_spec(bad)
 
@@ -59,7 +59,7 @@ class KeyAndFrameTests(unittest.TestCase):
         h = Harness()
         try:
             hub = h.room.kaas
-            token, entry = hub.new_key(mr.kaas_key_spec({"read": True, "write": True}))
+            token, entry = hub.new_key(mr.kaas_key_spec({"receive": True, "send": True}))
             self.assertTrue(token.startswith("kaas_"))
             self.assertNotIn(token, json.dumps(entry))
             hub.event(("kaas_key_add", entry))
@@ -88,9 +88,9 @@ class KeyAndFrameTests(unittest.TestCase):
 
 class SendTests(unittest.TestCase):
     def setUp(self):
-        self.h = Harness(kaas_send_interval_s=10, kaas_airtime_pct=5)
+        self.h = Harness(kaas_send_burst=3, kaas_send_window_s=20, kaas_airtime_pct=5)
         self.hub = self.h.room.kaas
-        _, self.key = self.hub.new_key(mr.kaas_key_spec({"read": True, "write": True}))
+        _, self.key = self.hub.new_key(mr.kaas_key_spec({"receive": True, "send": True}))
         self.hub.event(("kaas_key_add", self.key))
         self.conn = FakeConn(self.key["id"])
 
@@ -107,12 +107,15 @@ class SendTests(unittest.TestCase):
         advert = self.h.room.make_advert()
         advert.header |= mr.ROUTE_FLOOD
         self.assertIn("node on this radio", self.send(advert.encode())["reason"])
-        self.assertEqual(self.send(flood(mr.PT_GRP_TXT, os.urandom(40)))["status"], "queued")
-        r = self.send(flood(mr.PT_GRP_TXT, os.urandom(40)))
+        for _ in range(3):                                  # a burst of 3...
+            self.assertEqual(self.send(flood(mr.PT_GRP_TXT, os.urandom(40)))["status"], "queued")
+        r = self.send(flood(mr.PT_GRP_TXT, os.urandom(40)))   # ...then nothing until the first leaves the 20 s window
         self.assertEqual(r["status"], "dropped")
         self.assertIn("rate limit", r["reason"])
-        self.assertGreater(r["retry_after"], 9)
-        for _ in range(3):                                  # ACKs and path returns: no interval
+        self.assertGreater(r["retry_after"], 19)
+        self.hub.last_send[self.key["id"]][0] -= 20.0
+        self.assertEqual(self.send(flood(mr.PT_GRP_TXT, os.urandom(40)))["status"], "queued")
+        for _ in range(3):                                  # ACKs and path returns: no limit
             self.assertEqual(self.send(flood(mr.PT_ACK, os.urandom(4)))["status"], "queued")
         self.assertEqual(self.send(flood(mr.PT_PATH, os.urandom(40)))["status"], "queued")
 
@@ -128,7 +131,7 @@ class SendTests(unittest.TestCase):
         self.assertEqual(self.conn.closed, (4001, "key revoked"))
         self.conn = FakeConn(self.key["id"])                # (a send that was already on its way)
         self.assertEqual(self.send(flood(mr.PT_ACK, os.urandom(4)))["reason"], "key revoked or expired")
-        _, k2 = self.hub.new_key(mr.kaas_key_spec({"read": True, "write": True, "expires": time.time() + 60}))
+        _, k2 = self.hub.new_key(mr.kaas_key_spec({"receive": True, "send": True, "expires": time.time() + 60}))
         self.hub.event(("kaas_key_add", k2))
         self.h.cfg.set("kaas_keys", [dict(k2, expires=int(time.time()) - 1)])
         c2 = FakeConn(k2["id"])
@@ -138,7 +141,7 @@ class SendTests(unittest.TestCase):
 
     def test_sent_after_everything_else_and_streamed(self):
         room = self.h.room
-        reader, writer = FakeConn("r", write=False), FakeConn("w", read=False)
+        reader, writer = FakeConn("r", send=False), FakeConn("w", receive=False)
         self.hub.conns = [reader, writer, self.conn]
         self.send(flood(mr.PT_GRP_TXT, os.urandom(40)))
         room.send_flood(room.make_ack(os.urandom(4)))       # the room's own, queued after it
@@ -151,7 +154,7 @@ class SendTests(unittest.TestCase):
         self.assertEqual(self.conn.results()[-1]["status"], "sent")
         self.assertEqual([m["ptype"] for m in reader.msgs], ["ack", "grp_txt"])
         self.assertEqual(reader.msgs[0]["dir"], "tx")
-        self.assertEqual(writer.msgs, [], "no Read: no stream")
+        self.assertEqual(writer.msgs, [], "can't receive: no stream")
         room.on_rx(flood(mr.PT_ADVERT, os.urandom(120)), 7.5, -88)
         self.assertEqual((reader.msgs[-1]["dir"], reader.msgs[-1]["snr"], reader.msgs[-1]["rssi"]), ("rx", 7.5, -88))
 
@@ -169,7 +172,7 @@ class EndToEndTests(unittest.TestCase):
 
     def setUp(self):
         self.port = free_port()
-        self.h = Harness(web_password="adminpw", room_password="hello", kaas_send_interval_s=0.2,
+        self.h = Harness(web_password="adminpw", room_password="hello", kaas_send_window_s=0.5,
                          push_quiet_ms=0, push_pace_start_ms=300, push_pace_min_ms=300)
         self.h.cfg.set("web_port", self.port)
         self.h.cfg.set("web_bind", "127.0.0.1")
@@ -195,20 +198,20 @@ class EndToEndTests(unittest.TestCase):
         except urllib.error.HTTPError as e:
             return e.code, json.loads(e.read() or b"{}")
 
-    def make_key(self, read=True, write=True):
-        code, d = self.http("POST", "/api/v1/kaas/keys", {"read": read, "write": write, "description": "test"})
+    def make_key(self, receive=True, send=True):
+        code, d = self.http("POST", "/api/v1/kaas/keys", {"receive": receive, "send": send, "description": "test"})
         self.assertEqual(code, 200, d)
         self.h.pump(lambda: self.h.room.kaas.find(d["token"]) is not None, 5)
         return d["token"]
 
     def test_keys_need_the_admin(self):
         self.assertEqual(self.http("GET", "/api/v1/kaas/keys")[0], 401)
-        self.assertEqual(self.http("POST", "/api/v1/kaas/keys", {"read": True, "write": True})[0], 401)
+        self.assertEqual(self.http("POST", "/api/v1/kaas/keys", {"receive": True, "send": True})[0], 401)
         self.http("POST", "/api/login", {"password": "adminpw"})
-        token = self.make_key(read=True, write=False)
+        token = self.make_key(receive=True, send=False)
         code, d = self.http("GET", "/api/v1/kaas/keys")
         self.assertEqual(code, 200)
-        self.assertEqual([(k["read"], k["write"], k["description"]) for k in d["keys"]], [(True, False, "test")])
+        self.assertEqual([(k["receive"], k["send"], k["description"]) for k in d["keys"]], [(True, False, "test")])
         self.assertNotIn(token, json.dumps(d))
         with self.assertRaises(kc.HandshakeError) as e:
             kc.KaasClient(self.url, "kaas_wrong").connect()
@@ -216,11 +219,11 @@ class EndToEndTests(unittest.TestCase):
 
     def test_stream_then_revoke(self):
         self.http("POST", "/api/login", {"password": "adminpw"})
-        token = self.make_key(read=True, write=False)
+        token = self.make_key(receive=True, send=False)
         c = kc.KaasClient(self.url, token)
         hello = self.h.run_client(c.connect)
         self.assertEqual(hello["nodes"]["room"], mr.hexs(self.h.room.id.pub_key))
-        self.assertFalse(hello["key"]["write"])
+        self.assertFalse(hello["key"]["send"])
         got = []
         c.on_packet(got.append)
         raw = flood(mr.PT_GRP_TXT, os.urandom(40))
@@ -228,7 +231,7 @@ class EndToEndTests(unittest.TestCase):
         self.assertTrue(self.h.pump(lambda: got, 10))
         self.assertEqual((got[0].encode(), got[0].dir, got[0].snr), (raw, "rx", 6.0))
         res = self.h.run_client(lambda: c.send(raw))
-        self.assertEqual((res.status, res["reason"]), ("dropped", "this key has no Write permission"))
+        self.assertEqual((res.status, res["reason"]), ("dropped", "this key can't send"))
         kid = self.h.room.kaas.find(token)["id"]
         self.assertEqual(self.http("POST", "/api/v1/kaas/keys/%s/revoke" % kid, {})[0], 200)
         self.assertTrue(self.h.pump(lambda: c.closed.is_set(), 10))

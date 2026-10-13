@@ -67,7 +67,7 @@ components:
       summary: First message after connecting.
       payload:
         type: object
-        required: [type, api, key, send_interval_s, airtime_pct, nodes]
+        required: [type, api, key, send_burst, send_window_s, airtime_pct, nodes]
         properties:
           type: {const: hello}
           api: {type: integer, const: 1}
@@ -76,10 +76,11 @@ components:
             type: object
             properties:
               id: {type: string}
-              read: {type: boolean}
-              write: {type: boolean}
+              receive: {type: boolean}
+              send: {type: boolean}
               expires: {type: [integer, "null"], description: seconds since 1970}
-          send_interval_s: {type: number}
+          send_burst: {type: integer, description: packets per key per send_window_s (ACKs and path returns excepted)}
+          send_window_s: {type: number}
           airtime_pct: {type: number}
           radio:
             type: [object, "null"]
@@ -97,7 +98,7 @@ components:
               repeater: {type: [string, "null"]}
               companion: {type: [string, "null"]}
     packet:
-      summary: A packet the radio heard (rx) or sent (tx). Keys with Read only.
+      summary: A packet the radio heard (rx) or sent (tx). Keys that may receive only.
       payload:
         type: object
         required: [type, dir, ts, raw]
@@ -143,7 +144,7 @@ components:
           id: {type: [string, integer, "null"]}
           error: {type: string}
     send:
-      summary: A raw packet to transmit. Keys with Write only.
+      summary: A raw packet to transmit. Keys that may send only.
       payload:
         type: object
         required: [type, raw]

@@ -1,7 +1,7 @@
 # KaaS: the radio as an API
 
 KaaS ("KISS radio as an API service") lets bots and other programs use pyMeshRoom's radio over a websocket. A client
-with an API key receives every packet the radio hears and sends, and can send raw MeshCore packets of its own.
+with an API key can receive every packet the radio hears and sends, and can send raw MeshCore packets of its own.
 
 The server never decrypts anything for a client. Clients do all MeshCore crypto themselves: they are nodes on the
 mesh with their own identities. The [Python client](../client/README.md) does that work for you: adverts, contacts,
@@ -11,24 +11,24 @@ DMs, channels and joining rooms. The machine-readable description is [asyncapi.y
 
 The main admin makes keys on the dashboard's **KaaS** card:
 
-* **Read**: stream every packet.
-* **Write**: send packets.
+* **Receive**: stream every packet.
+* **Send**: send packets.
 * A description, and an optional expiry date. The key stops working at the end of that day, in the browser's time
   zone.
 
 **Save** shows the key once. pyMeshRoom keeps only a SHA-256 hash of it, in `kaas_keys` in the config. A lost key
 can't be recovered: revoke it and make a new one.
 
-The list on the card shows each key's first characters, its description, access, expiry, last use and current
-connections. **Revoke** deletes the key and disconnects its clients at once. When a key expires, its clients are
+The list on the card shows each key's description, access, expiry, last use and current connections. The key itself
+is never shown again. **Revoke** deletes the key and disconnects its clients at once. When a key expires, its clients are
 disconnected within a second.
 
 Admin endpoints use the dashboard's admin login cookie:
 
 | Method | Path | Body | Answer |
 |---|---|---|---|
-| GET | `/api/v1/kaas/keys` | | `{"keys": [...], "path", "send_interval_s", "airtime_pct", "stats"}` |
-| POST | `/api/v1/kaas/keys` | `{"read": bool, "write": bool, "description": str, "expires": epoch or null}` | `{"ok": true, "id", "token"}` |
+| GET | `/api/v1/kaas/keys` | | `{"keys": [...], "path", "send_burst", "send_window_s", "airtime_pct", "stats"}` |
+| POST | `/api/v1/kaas/keys` | `{"receive": bool, "send": bool, "description": str, "expires": epoch or null}` | `{"ok": true, "id", "token"}` |
 | POST | `/api/v1/kaas/keys/<id>/revoke` | | `{"ok": true}` |
 
 ## Connecting
@@ -64,15 +64,15 @@ Close codes from the server:
 
 ```json
 {"type": "hello", "api": 1, "server": "meshroom-py 4.9",
- "key": {"id": "3f2a9c1b", "read": true, "write": true, "expires": null},
- "send_interval_s": 10, "airtime_pct": 5,
+ "key": {"id": "3f2a9c1b", "receive": true, "send": true, "expires": null},
+ "send_burst": 3, "send_window_s": 20, "airtime_pct": 5,
  "radio": {"freq_hz": 910525000, "bw_hz": 62500, "sf": 7, "cr": 5},
  "nodes": {"room": "<64 hex>", "tenants": [], "repeater": null, "companion": null}}
 ```
 
 `nodes` lists the public keys of the nodes running on this radio.
 
-**packet**: one for every packet the radio hears (`"dir": "rx"`) or sends (`"dir": "tx"`). Keys with Read only.
+**packet**: one for every packet the radio hears (`"dir": "rx"`) or sends (`"dir": "tx"`). Keys that may receive only.
 
 ```json
 {"type": "packet", "dir": "rx", "ts": 1760313600.123, "raw": "1500a1b2...",
@@ -99,7 +99,7 @@ arrive as tx packets.
 
 ```json
 {"type": "send_result", "id": 7, "status": "dropped",
- "reason": "rate limit: one packet every 10 s per key (ACKs and paths excepted)", "retry_after": 6.2}
+ "reason": "rate limit: 3 packets per 20 s per key (ACKs and paths excepted)", "retry_after": 6.2}
 ```
 
 Other messages:
@@ -111,7 +111,7 @@ Other messages:
 
 ## Client to server
 
-**send**: needs Write. `id` is optional, any string or number up to 64 characters, and is echoed in the results.
+**send**: needs a key that may send. `id` is optional, any string or number up to 64 characters, and is echoed in the results.
 
 ```json
 {"type": "send", "id": 7, "raw": "1100a1b2..."}
@@ -121,7 +121,8 @@ Other messages:
 
 ## Sending rules
 
-* **One packet every 10 s per key** (`kaas_send_interval_s`). ACKs and path returns are exempt: a bot has to answer
+* **3 packets in any 20 s per key** (`kaas_send_burst`, `kaas_send_window_s`), a rolling window, so a bot can send a
+  short burst. ACKs and path returns are exempt: a bot has to answer
   what it receives, or room joins and DMs fail. Path returns usually carry an ACK.
 * **An airtime cap shared by every key**: 5% of airtime (`kaas_airtime_pct`) over a rolling 10 minutes. This one
   includes ACKs.
@@ -139,7 +140,8 @@ Other messages:
 | Setting | Default | |
 |---|---|---|
 | `kaas_keys` | `[]` | The keys, hashed. Managed from the dashboard. |
-| `kaas_send_interval_s` | 10 | Per key: at most one packet this often, ACKs and path returns excepted. |
+| `kaas_send_burst` | 3 | Per key: at most this many packets... |
+| `kaas_send_window_s` | 20 | ...in any this many seconds. ACKs and path returns are excepted. |
 | `kaas_airtime_pct` | 5 | All API clients together: at most this share of airtime. |
 
 ## Writing your own client

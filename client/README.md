@@ -1,7 +1,7 @@
 # meshroom-kaas
 
 A Python client for pyMeshRoom's **KaaS** API (KISS radio as an API service). It connects to a pyMeshRoom server over a
-websocket and receives every packet that server's radio hears and sends. With a Write key it can also send packets.
+websocket and receives every packet that server's radio hears and sends. With a key that may send, it can also send packets.
 The server never decrypts anything for you, so all MeshCore crypto runs here: your bot is a node on the mesh with
 its own identity.
 
@@ -11,7 +11,7 @@ It needs Python 3.9+ and `cryptography`. The websocket client is built in.
 pip install ./client            # from the pyMeshRoom checkout; or put client/ on PYTHONPATH
 ```
 
-Get a key from the main admin. It is made on the dashboard's **KaaS** card, with Read and/or Write. The protocol is
+Get a key from the main admin. It is made on the dashboard's **KaaS** card, with Receive and/or Send. The protocol is
 described in [docs/api.md](../docs/api.md).
 
 ## Raw packets
@@ -35,7 +35,7 @@ for pkt in client.packets():                 # every packet, heard ("rx") or sen
 * `dropped`: refused. `result["reason"]` says why, and `result.get("retry_after")` says how long to wait when waiting
   would help.
 
-Write keys may send one packet every 10 s. ACKs and path returns are exempt. All API clients together share an
+Each key may send 3 packets in any 20 s. ACKs and path returns are exempt. All API clients together share an
 airtime cap, 5% by default.
 
 ## A chat node: adverts, DMs, channels and rooms
@@ -87,7 +87,7 @@ Some notes:
   `Identity(hex)` also takes a 64-byte private key exported from a MeshCore app.
 * DMs need the other node's public key. `node.find("name")` looks up contacts learned from adverts, and
   `node.contact(pub)` adds one by key.
-* Sends that aren't ACKs or path returns wait their turn for the per-key interval. Use one key per bot.
+* Sends that aren't ACKs or path returns wait their turn under the per-key rate limit. Use one key per bot.
 * Nothing reconnects by itself. When `client.wait()` returns, connect again and create a new `Node`.
 
 ## Example

@@ -20,7 +20,7 @@ log = logging.getLogger("meshroom_kaas")
 ADV_LATLON_MASK, ADV_FEAT1_MASK, ADV_FEAT2_MASK, ADV_NAME_MASK = 0x10, 0x20, 0x40, 0x80
 MAX_ADVERT_DATA_SIZE = 32
 MAX_TEXT_LEN = 160
-UNLIMITED = (PT_ACK, PT_PATH)           # the server's per-key send interval doesn't apply to these
+UNLIMITED = (PT_ACK, PT_PATH)           # the server's per-key rate limit doesn't apply to these
 
 
 class LoginFailed(Exception):
@@ -114,7 +114,7 @@ class Node:
         self.dm_handlers, self.channel_handlers, self.advert_handlers = [], [], []
         self.lock = threading.Lock()
         self.send_lock = threading.Lock()
-        self.last_limited = float("-inf")
+        self.limited = collections.deque()   # when our rate-limited sends went (the server's rolling window)
         self.last_ts = 0
         self.jobs = queue.Queue()
         self.recent_dms = collections.OrderedDict()
@@ -158,17 +158,20 @@ class Node:
             return self.last_ts
 
     def send(self, pkt, wait=True):
-        """Send a packet, keeping to the server's per-key interval (ACKs and path returns go at once)."""
+        """Send a packet, keeping to the server's per-key rate limit (ACKs and path returns go at once)."""
         self._seen(pkt.packet_hash())
         if pkt.ptype in UNLIMITED:
             return self.client.send(pkt, wait=wait)
-        interval = float((self.client.hello or {}).get("send_interval_s", 10))
+        hello = self.client.hello or {}
+        burst, window = int(hello.get("send_burst", 3)), float(hello.get("send_window_s", 20))
         with self.send_lock:
             for _ in range(3):
-                gap = self.last_limited + interval - time.monotonic()
-                if gap > 0:
-                    time.sleep(gap)
-                self.last_limited = time.monotonic()
+                while len(self.limited) >= burst:
+                    gap = self.limited[0] + window - time.monotonic()
+                    if gap > 0:
+                        time.sleep(gap)
+                    self.limited.popleft()
+                self.limited.append(time.monotonic())
                 res = self.client.send(pkt, wait=True)
                 if res.status == "dropped" and "rate limit" in (res.get("reason") or ""):
                     time.sleep(float(res.get("retry_after") or 0.1))   # (another client on the same key, or network jitter)
