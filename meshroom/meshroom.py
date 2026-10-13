@@ -7058,6 +7058,9 @@ class KaasHub:
         if kind == "kaas_tx":
             self.send(*ev[1:])
             return
+        if kind == "kaas_query":
+            self.query(*ev[1:])
+            return
         if kind == "kaas_key_add":
             cfg.set("kaas_keys", self.keys() + [ev[1]])
         elif kind == "kaas_key_del":
@@ -7108,8 +7111,10 @@ class KaasHub:
             rid = None
         if t == "ping":
             return conn.send_json({"type": "pong", "id": rid})
+        if t in ("near", "routes"):
+            return self.ask(conn, t, msg, rid)
         if t != "send":
-            return conn.send_json({"type": "error", "id": rid, "error": "unknown message type: use send or ping"})
+            return conn.send_json({"type": "error", "id": rid, "error": "unknown message type: use send, near, routes or ping"})
 
         def drop(reason):
             self.stats["dropped"] += 1
@@ -7130,7 +7135,60 @@ class KaasHub:
             return drop("too many sends waiting: wait for their results")
         self.room.events_put(("kaas_tx", conn, raw, rid))
 
+    def ask(self, conn, t, msg, rid):
+        """A route question: checked here, answered by the main loop (it owns the map). Shares the in-flight cap."""
+        def err(e):
+            conn.send_json({"type": "error", "id": rid, "error": e})
+        try:
+            key = bytes.fromhex(str(msg.get("node" if t == "near" else "repeater", "")))
+        except ValueError:
+            key = b""
+        if t == "near" and not 8 <= len(key) <= 32:
+            return err("node: its public key in hex (at least the first 8 bytes)")
+        if t == "routes" and not 2 <= len(key) <= 32:
+            return err("repeater: its public key in hex (at least the first 2 bytes)")
+        limit = msg.get("limit", 4 if t == "near" else 3)
+        if isinstance(limit, bool) or not isinstance(limit, int) or not 1 <= limit <= 10:
+            return err("limit: 1 to 10")
+        with conn.cv:
+            if conn.inflight >= KAAS_MAX_INFLIGHT:
+                return err("too many requests waiting: wait for their answers")
+            conn.inflight += 1
+        self.room.events_put(("kaas_query", conn, t, key, limit, rid))
+
     # ---------------------------------------------------------------- the main loop's side
+
+    def query(self, conn, t, key, limit, rid):
+        """near: the repeaters that hear a node (its first hop into the mesh), with each one's share.
+        routes: the room's best known routes to a repeater (from this radio), ready to use as a direct path."""
+        with conn.cv:
+            conn.inflight -= 1
+        r = self.room
+        if getattr(r, "_rpt_idx", None) is None:
+            r.build_rpt_index()
+
+        def name(h):
+            hit = r.rpt_lookup(h)
+            return hit[1]["name"] if hit and hit[1].get("name") else None
+        if t == "near":
+            tab = r.mrpts.get(key[:8]) or {}
+            now = now_s()
+            ws = {k: fade(v[0], v[1], now, r.rhalf()) for k, v in tab.items()}
+            tot = sum(ws.values()) or 1.0
+            rows = sorted(((k, w / tot) for k, w in ws.items() if w > 0.01), key=lambda x: -x[1])[:limit]
+            conn.send_json({"type": "near_result", "id": rid, "node": key.hex(),
+                            "repeaters": [{"direct": True, "share": round(share, 3)} if h == b"" else
+                                          {"id": h.hex(), "name": name(h), "share": round(share, 3)}
+                                          for h, share in rows]})
+            return
+        target = key[:2]
+        rows = []
+        for rr, conf in r.top_rpt_routes(target, limit):
+            sz = (rr.plen >> 6) + 1
+            hops = [rr.path[i * sz:(i + 1) * sz] for i in range(rr.plen & 63)]
+            rows.append({"path_len": rr.plen, "path": rr.path.hex(), "hops": [h.hex() for h in hops],
+                         "names": [name(h) for h in hops], "confidence": round(conf, 3)})
+        conn.send_json({"type": "routes_result", "id": rid, "repeater": target.hex(), "name": name(target), "routes": rows})
 
     def own_keys(self):
         r = self.room
@@ -7202,6 +7260,9 @@ class KaasHub:
         if not exempt:
             recent.append(now)
         self.last_used[conn.key_id] = now_s()
+        if self.room.vr is not None and pkt.is_direct and pkt.hop_count and pkt.ptype != PT_TRACE:
+            pkt.path, pkt.path_len = self.room.vr.strip_first_hops(pkt.path, pkt.path_len)   # (as the room does: our own
+                                                                                             # repeater is this radio)
         if self.room.offer(pkt, self) and (pkt.is_flood or pkt.hop_count == 0 or pkt.ptype == PT_TRACE):
             self.stats["local"] += 1
             return result("local")                          # only for a node on this radio: it never goes on the air

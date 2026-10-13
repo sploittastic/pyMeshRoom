@@ -119,6 +119,40 @@ Other messages:
 
 **ping**: `{"type": "ping", "id": 1}`
 
+### Route questions
+
+Any key may ask these. They come from what the room has learned of the mesh. The answers are routes from this
+radio, which is where your packets go out.
+
+**near**: which repeaters hear a node, meaning its first hop into the mesh, and each one's share. It is learned from
+the floods the radio hears from that node, faded over hours. At most 4 repeaters are kept per node. `node` is its
+public key in hex; the first 8 bytes are enough. `limit` is 1 to 10, default 4.
+
+```json
+{"type": "near", "id": "q1", "node": "a1b2c3d4e5f60718"}
+{"type": "near_result", "id": "q1", "node": "a1b2c3d4e5f60718",
+ "repeaters": [{"id": "44c3", "name": "Seaside", "share": 0.62}, {"id": "55b2", "name": null, "share": 0.25},
+               {"direct": true, "share": 0.13}]}
+```
+
+`{"direct": true}` means this radio hears the node itself. An unknown node gets an empty list.
+
+**routes**: the best known routes from this radio to a repeater, best first. They are learned from flood paths, and
+scored by how often each was seen and whether the room's pushes over it were delivered. `repeater` is its public key
+or id in hex; the first 2 bytes are enough. `limit` is 1 to 10, default 3.
+
+```json
+{"type": "routes", "id": "q2", "repeater": "44c3"}
+{"type": "routes_result", "id": "q2", "repeater": "44c3", "name": "Seaside",
+ "routes": [{"path_len": 66, "path": "55b244c3", "hops": ["55b2", "44c3"], "names": [null, "Seaside"],
+             "confidence": 0.81}]}
+```
+
+The repeater is the last hop. `path_len` and `path` go straight into a direct packet's header and path. Together the
+two answers give a route to a node you have no path for: send direct along the best route to the repeater that hears
+it most. A first hop that is this radio's own virtual repeater is dropped when the packet is sent, as the room does.
+Bad input gets `{"type": "error", "id": ..., "error": ...}`. Questions share the 4-at-a-time limit with sends.
+
 ## Sending rules
 
 * **3 packets in any 20 s per key** (`kaas_send_burst`, `kaas_send_window_s`), a rolling window, so a bot can send a

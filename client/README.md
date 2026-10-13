@@ -38,6 +38,18 @@ for pkt in client.packets():                 # every packet, heard ("rx") or sen
 Each key may send 3 packets in any 20 s. ACKs and path returns are exempt. All API clients together share an
 airtime cap, 5% by default.
 
+## Route questions
+
+The server has learned which repeaters hear each node, and good routes from its radio to each repeater:
+
+```python
+client.near(pub)          # [{"id": "44c3", "name": "Seaside", "share": 0.62}, ..., {"direct": True, "share": 0.13}]
+client.routes("44c3")     # [{"path_len": 66, "path": "55b244c3", "hops": [...], "names": [...], "confidence": 0.81}]
+
+best = client.routes(client.near(pub)[0]["id"])[0]
+pkt = Packet.direct(ptype, payload, bytes.fromhex(best["path"]), best["path_len"])
+```
+
 ## A chat node: adverts, DMs, channels and rooms
 
 `Node` does what a MeshCore companion does:

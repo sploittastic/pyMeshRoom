@@ -13,6 +13,15 @@ log = logging.getLogger("meshroom_kaas")
 FINAL = ("sent", "local", "dropped")
 
 
+def _hex(x):
+    x = getattr(x, "pub", x)                # (a Contact)
+    return x.hex() if isinstance(x, (bytes, bytearray)) else str(x)
+
+
+class RequestError(Exception):
+    """The server couldn't answer a request (the message says why)."""
+
+
 class SendResult(dict):
     """{"status": "queued" | "sent" | "local" | "dropped", "reason": ..., "retry_after": ...}.
     sent: it went on the air. local: it was only for a node on the server's radio (a room there, say), which
@@ -34,6 +43,7 @@ class KaasClient:
         self.hello = None
         self.callbacks = []
         self.waiting = {}
+        self.queries = {}                   # request id -> (Event, box): near / routes
         self.ids = itertools.count(1)
         self.lock = threading.Lock()
         self.inbox = None
@@ -85,6 +95,32 @@ class KaasClient:
             return SendResult(box.get("last") or {"status": "queued"})
         return SendResult(box["final"])
 
+    def near(self, node, limit=4, timeout=10.0):
+        """The repeaters that hear a node (its first hop into the mesh), most first: a list of
+        {"id": hex, "name", "share": 0..1}, or {"direct": True, "share"} when the server's radio hears it directly.
+        node: its public key (bytes or hex; the first 8 bytes are enough). Up to 4 are known per node."""
+        return self._request("near", timeout, node=_hex(node), limit=limit)["repeaters"]
+
+    def routes(self, repeater, limit=3, timeout=10.0):
+        """The server's best routes to a repeater, best first: a list of {"path_len", "path" (hex), "hops", "names",
+        "confidence": 0..1}. path_len and path go straight into Packet.direct(..., bytes.fromhex(path), path_len);
+        the repeater is the last hop. repeater: its public key or id (bytes or hex; the first 2 bytes are enough)."""
+        return self._request("routes", timeout, repeater=_hex(repeater), limit=limit)["routes"]
+
+    def _request(self, t, timeout, **fields):
+        rid = "q%d" % next(self.ids)
+        ev, box = threading.Event(), {}
+        with self.lock:
+            self.queries[rid] = (ev, box)
+        self.ws.send_text(json.dumps(dict(type=t, id=rid, **fields)))
+        if not ev.wait(timeout):
+            with self.lock:
+                self.queries.pop(rid, None)
+            raise RequestError("no answer from the server")
+        if box["msg"].get("type") == "error":
+            raise RequestError(box["msg"].get("error"))
+        return box["msg"]
+
     def close(self):
         if self.ws is not None:
             self.ws.close()
@@ -128,6 +164,12 @@ class KaasClient:
                         if msg.get("status") in FINAL:
                             w[1]["final"] = msg
                             w[0].set()
+                elif t in ("near_result", "routes_result", "error") and msg.get("id") in self.queries:
+                    with self.lock:
+                        q = self.queries.pop(msg.get("id"), None)
+                    if q:
+                        q[1]["msg"] = msg
+                        q[0].set()
                 elif t == "dropped":
                     self.dropped += msg.get("count", 0)
                     log.warning("the server dropped %s packets: this client is reading too slowly", msg.get("count"))
@@ -141,6 +183,10 @@ class KaasClient:
         finally:
             with self.lock:
                 waiting, self.waiting = self.waiting, {}
+                queries, self.queries = self.queries, {}
+            for ev, box in queries.values():
+                box["msg"] = {"type": "error", "error": "connection closed"}
+                ev.set()
             for ev, box, _ in waiting.values():
                 box["final"] = {"status": "dropped", "reason": "connection closed"}
                 ev.set()

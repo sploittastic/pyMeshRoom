@@ -38,6 +38,14 @@ channels:
         $ref: "#/components/messages/send"
       ping:
         $ref: "#/components/messages/ping"
+      near:
+        $ref: "#/components/messages/near"
+      nearResult:
+        $ref: "#/components/messages/nearResult"
+      routes:
+        $ref: "#/components/messages/routes"
+      routesResult:
+        $ref: "#/components/messages/routesResult"
 operations:
   receive:
     action: receive
@@ -50,6 +58,8 @@ operations:
       - $ref: "#/channels/kaas/messages/dropped"
       - $ref: "#/channels/kaas/messages/pong"
       - $ref: "#/channels/kaas/messages/error"
+      - $ref: "#/channels/kaas/messages/nearResult"
+      - $ref: "#/channels/kaas/messages/routesResult"
   send:
     action: send
     channel:
@@ -57,6 +67,8 @@ operations:
     messages:
       - $ref: "#/channels/kaas/messages/send"
       - $ref: "#/channels/kaas/messages/ping"
+      - $ref: "#/channels/kaas/messages/near"
+      - $ref: "#/channels/kaas/messages/routes"
 components:
   securitySchemes:
     apiKey:
@@ -159,3 +171,57 @@ components:
         properties:
           type: {const: ping}
           id: {type: [string, integer]}
+    near:
+      summary: Which repeaters hear a node (its first hop into the mesh), and each one's share.
+      payload:
+        type: object
+        required: [type, node]
+        properties:
+          type: {const: near}
+          id: {type: [string, integer]}
+          node: {type: string, description: "public key, hex (at least 8 bytes)"}
+          limit: {type: integer, minimum: 1, maximum: 10, default: 4}
+    nearResult:
+      payload:
+        type: object
+        properties:
+          type: {const: near_result}
+          id: {type: [string, integer, "null"]}
+          node: {type: string}
+          repeaters:
+            type: array
+            items:
+              type: object
+              properties:
+                id: {type: string, description: "2-byte repeater id, hex (absent when direct)"}
+                name: {type: [string, "null"]}
+                direct: {type: boolean, description: this radio hears the node itself}
+                share: {type: number}
+    routes:
+      summary: The best known routes from this radio to a repeater.
+      payload:
+        type: object
+        required: [type, repeater]
+        properties:
+          type: {const: routes}
+          id: {type: [string, integer]}
+          repeater: {type: string, description: "public key or id, hex (at least 2 bytes)"}
+          limit: {type: integer, minimum: 1, maximum: 10, default: 3}
+    routesResult:
+      payload:
+        type: object
+        properties:
+          type: {const: routes_result}
+          id: {type: [string, integer, "null"]}
+          repeater: {type: string}
+          name: {type: [string, "null"]}
+          routes:
+            type: array
+            items:
+              type: object
+              properties:
+                path_len: {type: integer, description: the packet header's path_len byte}
+                path: {type: string, description: "hex; the repeater is the last hop"}
+                hops: {type: array, items: {type: string}}
+                names: {type: array, items: {type: [string, "null"]}}
+                confidence: {type: number}

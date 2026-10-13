@@ -167,8 +167,8 @@ def free_port():
     return port
 
 
-class EndToEndTests(unittest.TestCase):
-    """The dashboard's key endpoints and the Python client, over a real websocket to a room on a fake radio."""
+class WebTestCase(unittest.TestCase):
+    """A room on a fake radio with its dashboard on a free port: the key endpoints and a real websocket."""
 
     def setUp(self):
         self.port = free_port()
@@ -203,6 +203,10 @@ class EndToEndTests(unittest.TestCase):
         self.assertEqual(code, 200, d)
         self.h.pump(lambda: self.h.room.kaas.find(d["token"]) is not None, 5)
         return d["token"]
+
+
+class EndToEndTests(WebTestCase):
+    """The dashboard's key endpoints and the Python client, over a real websocket."""
 
     def test_keys_need_the_admin(self):
         self.assertEqual(self.http("GET", "/api/v1/kaas/keys")[0], 401)
@@ -280,6 +284,39 @@ class EndToEndTests(unittest.TestCase):
         self.assertEqual(heard, [("#bots", "BotA", "beep")])
         a_client.close()
         b_client.close()
+
+
+class RouteQueryTests(WebTestCase):
+    def test_near_and_routes(self):
+        room = self.h.room
+        node = os.urandom(32)
+        a, b = bytes.fromhex("44c3"), bytes.fromhex("55b2")
+        for _ in range(3):
+            room.observe_near(node, a)
+        room.observe_near(node, b)
+        room.observe_near(node, b"")
+        room.repeaters[a + os.urandom(30)] = dict(name="Seaside", lat=0, lon=0, adv_ts=0, last_advert=1)
+        room.build_rpt_index()
+        rr = mr.RptRoute(0x42, b + a, mr.now_s())
+        rr.w = 5.0
+        room.rroutes[a] = {(0x42, b + a): rr}
+        self.http("POST", "/api/login", {"password": "adminpw"})
+        token = self.make_key(receive=False, send=True)        # any key may ask
+        c = kc.KaasClient(self.url, token)
+        self.h.run_client(c.connect)
+        near = self.h.run_client(lambda: c.near(node.hex()))
+        self.assertEqual([(x.get("id"), x.get("name"), x.get("direct", False)) for x in near],
+                         [("44c3", "Seaside", False), ("55b2", None, False), (None, None, True)])
+        self.assertAlmostEqual(near[0]["share"], 0.6, places=2)
+        self.assertEqual(len(self.h.run_client(lambda: c.near(node, limit=1))), 1)
+        routes = self.h.run_client(lambda: c.routes("44c3"))
+        self.assertEqual(len(routes), 1)
+        self.assertEqual((routes[0]["path_len"], routes[0]["hops"], routes[0]["names"]), (0x42, ["55b2", "44c3"], [None, "Seaside"]))
+        self.assertEqual(bytes.fromhex(routes[0]["path"]), b + a)
+        self.assertEqual(self.h.run_client(lambda: c.routes("99aa")), [])
+        with self.assertRaises(kc.RequestError):
+            self.h.run_client(lambda: c.near("abcd"))
+        c.close()
 
 
 class ClientIdentityTests(unittest.TestCase):

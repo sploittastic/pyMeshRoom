@@ -452,7 +452,8 @@ sends. A **Send** key can also send raw packets:
 * within a 5% airtime cap shared by all keys
 * at the lowest priority, after everything the room, its repeater and its pushes send
 
-Clients do all MeshCore crypto themselves.
+Clients do all MeshCore crypto themselves. They can also ask the room what it has learned of the mesh: which
+repeaters hear a node, and the best routes from this radio to a repeater.
 
 The main admin makes keys on the **KaaS** card: Receive and/or Send, a description and an optional expiry date. Each key
 is shown once, when it's saved. The config keeps only its hash, so a lost key can only be revoked and replaced. The
