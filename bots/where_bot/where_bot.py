@@ -44,6 +44,34 @@ def parse(text):
     return ("name", arg) if arg else ("bad", USAGE)
 
 
+def parse_suggest(text):
+    """("5b98", "ec43") from "!suggest 5b98 to ec43" (two repeaters' 2-byte ids), else None."""
+    m = re.fullmatch(r"\s*!suggest\s+([0-9a-fA-F]{4})\s+to\s+([0-9a-fA-F]{4})\s*", text, re.I)
+    return (m.group(1).lower(), m.group(2).lower()) if m else None
+
+
+def suggest_answer(result, budget):
+    """The reply to a !suggest, at most budget bytes. result: KaasClient.route()'s answer."""
+    ends = [(r.get("repeater") or r.get("node") or "?", r.get("name") or "") for r in (result["from"], result["to"])]
+
+    def label(rid, name, cut):
+        if cut is not None and len(name) > cut:
+            name = name[:cut - 1].rstrip() + "~" if cut > 1 else ""
+        return name or rid
+
+    def head(cut):
+        return "Suggested routes: %s to %s" % tuple(label(rid, name, cut) for rid, name in ends)
+    lines = ["%s (%s)" % (",".join(rt["hops"]), ("%.2f" % rt["score"]).lstrip("0")) for rt in result["routes"]]
+    if not lines:
+        return fit("No known route from %s to %s yet" % tuple(label(rid, name, 20) for rid, name in ends), budget)
+    for n in range(len(lines), 0, -1):      # names down to 12 characters first, then the weakest routes go
+        for cut in (None, 20, 16, 12):
+            text = "\n".join([head(cut)] + lines[:n])
+            if len(text.encode()) <= budget:
+                return text
+    return fit("\n".join([head(0)] + lines[:1]), budget)
+
+
 def fit(text, limit):
     """At most limit bytes of UTF-8."""
     b = text.encode()[:limit]
@@ -86,11 +114,21 @@ def answer(kind, asked, result, budget):
 def handle(client, node, channel, sender, text):
     if sender == node.name:
         return
+    budget = MAX_TEXT_LEN - len((node.name + ": ").encode())
+    ends = parse_suggest(text)
     q = parse(text)
-    if q is None:
+    if ends is None and q is None:
+        return
+    if ends is not None:
+        try:
+            reply = suggest_answer(client.route(*ends, limit=5), budget)
+        except RequestError as e:
+            log.warning("route %s -> %s failed: %s", ends[0], ends[1], e)
+            reply = "Sorry, I couldn't look that up just now"
+        log.info("%s %s: %s -> %s", channel.name, sender, text, reply)
+        node.send_channel(channel, reply)
         return
     kind, arg = q
-    budget = MAX_TEXT_LEN - len((node.name + ": ").encode())
     if kind == "bad":
         reply = arg
     else:

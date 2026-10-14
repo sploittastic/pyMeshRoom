@@ -10,7 +10,7 @@ try:
     import where_bot as wb
 except ImportError:                                        # needs pyyaml
     wb = None
-from test_kaas import WebTestCase, kc
+from test_kaas import WebTestCase, kc, mr
 
 NEAR = [{"id": "44c3", "name": "Seaside", "share": 0.62}, {"id": "55b2", "name": None, "share": 0.25},
         {"direct": True, "id": "9a1f", "name": "pyMeshRoom Virtual Repeater", "share": 0.13}]
@@ -55,6 +55,26 @@ class ReplyTests(unittest.TestCase):
 
 
 @unittest.skipIf(wb is None, "needs pyyaml")
+class SuggestTests(unittest.TestCase):
+    def test_parse(self):
+        self.assertEqual(wb.parse_suggest("!suggest 5B98 to ec43"), ("5b98", "ec43"))
+        for text in ("!suggest 5b98 ec43", "!suggest 5b9 to ec43", "!suggest @[a] to ec43", "!where 5b98"):
+            self.assertIsNone(wb.parse_suggest(text))
+
+    def test_answers(self):
+        ends = {"from": {"repeater": "5b98", "name": "Seaside"}, "to": {"repeater": "ec43", "name": None}}
+        routes = [{"hops": ["5b98", "ec43"], "score": 0.87}, {"hops": ["5b98", "beef", "ec43"], "score": 0.391}]
+        self.assertEqual(wb.suggest_answer(dict(ends, routes=routes), BUDGET),
+                         "Suggested routes: Seaside to ec43\n5b98,ec43 (.87)\n5b98,beef,ec43 (.39)")
+        self.assertEqual(wb.suggest_answer(dict(ends, routes=[]), BUDGET), "No known route from Seaside to ec43 yet")
+        many = [{"hops": ["5b98"] + ["%04x" % (i * 7 + j) for j in range(4)] + ["ec43"], "score": 0.5} for i in range(5)]
+        text = wb.suggest_answer(dict(ends, routes=many), BUDGET)
+        self.assertLessEqual(len(text.encode()), BUDGET)
+        self.assertTrue(text.startswith("Suggested routes: Seaside to ec43\n"), text)
+        self.assertLess(text.count("\n"), 5, "the weakest routes go")
+
+
+@unittest.skipIf(wb is None, "needs pyyaml")
 class WhereBotEndToEnd(WebTestCase):
     def test_where_on_a_hashtag_channel(self):
         room = self.h.room
@@ -85,6 +105,12 @@ class WhereBotEndToEnd(WebTestCase):
             self.h.run_client(lambda: user.send_channel(ch, ask))
             self.assertTrue(self.h.pump(lambda: heard, 15), ask)
             self.assertEqual(heard, [("WhereBot", want)])
+        now = mr.now_s()
+        room.edges[(bytes.fromhex("5b98"), bytes.fromhex("ec43"))] = [3.0, now, None]
+        heard.clear()
+        self.h.run_client(lambda: user.send_channel(ch, "!suggest 5b98 to ec43"))
+        self.assertTrue(self.h.pump(lambda: heard, 15))
+        self.assertEqual(heard, [("WhereBot", "Suggested routes: 5b98 to ec43\n5b98,ec43 (.88)")])
         self.assertTrue(bot_ch)
         bot_c.close()
         user_c.close()
