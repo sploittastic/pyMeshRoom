@@ -121,6 +121,7 @@ The admin-only **Welcome DMs** card lets an operator enable or disable the first
    * Admin tools: resync, route suggestions with autocomplete, kick, ban/unban, and a chat box that posts as the room.
    * Messages: configurable welcome (with an advert reminder), plus kick/ban notices.
    * Passively collects SNR and Route data from traces as they pass by.
+* KaaS: the radio as a websocket API for bots and integrations, with hashed API keys and a Python client (see below).
 
 # Core capability detail
 
@@ -440,6 +441,31 @@ How it fits together:
 * All rooms share one radio and its airtime: they take turns pushing posts, and messages between rooms, the virtual
   companion and the virtual repeater on this radio never go on the air.
 * Without any tenant rooms, nothing changes for an existing installation.
+
+## Optional KaaS API
+
+KaaS ("KISS radio as an API service") lets bots and other integrations use the radio over a websocket at
+`/api/v1/kaas` on the dashboard's port. A client with a **Receive** key gets every packet the radio hears and
+sends. A **Send** key can also send raw packets:
+
+* 3 in any 20 s per key (ACKs and path returns excepted)
+* within a 5% airtime cap shared by all keys
+* at the lowest priority, after everything the room, its repeater and its pushes send
+
+Clients do all MeshCore crypto themselves. They can also ask the room what it has learned of the mesh: which
+repeaters hear a node, and the best routes from this radio to a repeater.
+
+The main admin makes keys on the **KaaS** card: Receive and/or Send, a description and an optional expiry date. Each key
+is shown once, when it's saved. The config keeps only its hash, so a lost key can only be revoked and replaced. The
+card lists every key with its last use, live connections, and packets received, packets sent and errors (24 h and
+total), and **Revoke** disconnects a key's clients at once.
+
+* Protocol: [docs/api.md](docs/api.md), and [docs/asyncapi.yaml](docs/asyncapi.yaml) for tools.
+* Python client: [client/](client/README.md). It works with raw packets, or as a full chat node: adverts, contacts,
+  DMs, hashtag and private channels, and joining rooms.
+
+With no keys, nothing can connect and nothing changes. The dashboard serves plain HTTP, so give remote clients `wss://`
+through an HTTPS reverse proxy.
 
 ## Operations, upgrades, and rollback
 

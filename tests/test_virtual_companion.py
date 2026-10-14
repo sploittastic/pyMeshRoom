@@ -90,6 +90,8 @@ class Harness:
                     self.room.room_say(ev[1])
                 elif kind.startswith("t_"):
                     self.room.tenant_event(ev)
+                elif kind.startswith("kaas_"):
+                    self.room.kaas.event(ev)
                 elif kind == "rxraw":
                     self.room.on_rx(ev[1], 6.0, -90)
                 try:
