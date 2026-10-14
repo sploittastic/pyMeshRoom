@@ -23,6 +23,16 @@ I am not familiar with that name. You can try lookup by public key
 I am not familiar with that public key
 ```
 
+`!suggest <id> to <id>` with two repeaters' 2-byte ids asks the room for up to 5 routes between them (the KaaS
+`route` request), each scored 0 to 1:
+
+```
+!suggest 5b98 to ec43
+Suggested routes: Seaside to Williams Hill
+5b98,ec43 (.87)
+5b98,beef,ec43 (.39)
+```
+
 A key needs at least its first 16 hex characters. Shares are how often each repeater carried the node's floods.
 Each line is a repeater's 2-byte id, its name if known, and its share. When the room's own radio hears the node
 directly, that line is the room's virtual repeater (or the room itself when the virtual repeater is off). A reply has
