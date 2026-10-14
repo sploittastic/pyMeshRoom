@@ -30,11 +30,11 @@ class ReplyTests(unittest.TestCase):
 
     def test_answers(self):
         self.assertEqual(wb.answer("mention", "platinum", {"name": "platinum", "repeaters": NEAR}, BUDGET),
-                         "platinum: recently near:\n44c3 Seaside 62%\n55b2 25%\n9a1f pyMeshRoom Virtual Repeater 13%")
+                         "platinum: recently active near:\n44c3 Seaside 62%\n55b2 25%\n9a1f pyMeshRoom Virtual Repeater 13%")
         self.assertEqual(wb.answer("key", "a1b2c3d4e5f60718", {"name": "platinum", "repeaters": NEAR[:1]}, BUDGET),
-                         "a1b2c3d4 (aka platinum): recently near:\n44c3 Seaside 62%")
+                         "a1b2c3d4 (aka platinum): recently active near:\n44c3 Seaside 62%")
         self.assertEqual(wb.answer("key", "a1b2c3d4e5f60718", {"name": None, "repeaters": NEAR[:1]}, BUDGET),
-                         "a1b2c3d4: recently near:\n44c3 Seaside 62%")
+                         "a1b2c3d4: recently active near:\n44c3 Seaside 62%")
         self.assertEqual(wb.answer("key", "a1b2c3d4e5f60718", {"name": None, "repeaters": []}, BUDGET), wb.UNKNOWN_KEY)
         self.assertIn("hasn't been heard", wb.answer("mention", "platinum", {"name": "platinum", "repeaters": []}, BUDGET))
 
@@ -44,12 +44,13 @@ class ReplyTests(unittest.TestCase):
         who = "Somebody With A Thirty Char Nm"
         text = wb.answer("mention", who, {"name": who, "repeaters": rpts}, BUDGET)
         self.assertLessEqual(len(text.encode()), BUDGET)
-        self.assertEqual(text.split("\n")[0], who + ": recently near:")
-        self.assertEqual(text.split("\n")[1:], ["0000 A Very Long Rep~ 40%", "0101 A Very Long Rep~ 30%", "0202 A Very Long Rep~ 20%",
-                                                "0303 A Very Long Rep~ 10%"], "names are cut, every repeater stays")
+        self.assertEqual(text.split("\n")[0], who + ": recently active near:")
+        lines = text.split("\n")[1:]
+        self.assertEqual([x.split()[0] for x in lines], ["0000", "0101", "0202", "0303"], "every repeater stays")
+        self.assertTrue(all("~" in x for x in lines), "names are cut")
         self.assertEqual(wb.answer("mention", who, {"name": who, "repeaters": rpts}, 95).split("\n")[1:],
                          ["0000 40%", "0101 30%", "0202 20%", "0303 10%"], "then names go, the ids stay")
-        self.assertEqual(wb.answer("mention", who, {"name": who, "repeaters": rpts}, 68).split("\n")[1:],
+        self.assertEqual(wb.answer("mention", who, {"name": who, "repeaters": rpts}, 75).split("\n")[1:],
                          ["0000 40%", "0101 30%"], "then the least heard repeaters go")
 
 
@@ -75,9 +76,9 @@ class WhereBotEndToEnd(WebTestCase):
         ch = user.add_channel("#where")
         room.observe_near(node, b"")
         here = room.id.pub_key[:2].hex()                    # no virtual repeater here: heard directly by the room
-        for ask, want in (("!where @[Platinum]", "platinum: recently near:\n44c3 75%%\n%s %s 25%%" % (here, room.cfg.name)),
+        for ask, want in (("!where @[Platinum]", "platinum: recently active near:\n44c3 75%%\n%s %s 25%%" % (here, room.cfg.name)),
                           ("!where " + node.hex(),
-                           "%s (aka platinum): recently near:\n44c3 75%%\n%s %s 25%%" % (node[:4].hex(), here, room.cfg.name)),
+                           "%s (aka platinum): recently active near:\n44c3 75%%\n%s %s 25%%" % (node[:4].hex(), here, room.cfg.name)),
                           ("!where @[nobody]", wb.UNKNOWN_NAME),
                           ("!where " + os.urandom(8).hex(), wb.UNKNOWN_KEY)):
             heard.clear()

@@ -5,13 +5,13 @@ Answers `!where` on hashtag channels with the repeaters that usually hear a node
 
 ```
 !where @[platinum]
-platinum: recently near:
+platinum: recently active near:
 44c3 Seaside 62%
 55b2 25%
 9a1f pyMeshRoom Virtual Repeater 13%
 
 !where a1b2c3d4e5f60718
-a1b2c3d4 (aka platinum): recently near:
+a1b2c3d4 (aka platinum): recently active near:
 44c3 Seaside 62%
 55b2 Williams Hill 25%
 9a1f pyMeshRoom Virtual Repeater 13%

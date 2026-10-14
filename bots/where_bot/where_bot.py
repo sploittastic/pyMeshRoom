@@ -72,7 +72,7 @@ def answer(kind, asked, result, budget):
         if kind == "key" and not result.get("name"):
             return UNKNOWN_KEY
         return fit("%s hasn't been heard through a repeater lately" % who, budget)
-    head = "%s: recently near:" % who
+    head = "%s: recently active near:" % who
     while True:
         for cut in NAME_CUTS:               # shorten the repeater names first, then leave out the least heard
             text = "\n".join([head] + [describe(r, cut) for r in rpts])
