@@ -108,10 +108,15 @@ class KaasClient:
         {"id": hex, "name", "share": 0..1}, or {"direct": True, "share"} when the server's radio hears it directly.
         node: its public key (bytes or hex; the first 8 bytes are enough), or its advertised name, plain or as a
         mention like "@[platinum]" (ignoring case). Up to 4 are known per node."""
+        return self.lookup(node, limit, timeout)["repeaters"]
+
+    def lookup(self, node, limit=4, timeout=10.0):
+        """near(), with the node too: {"node": hex (as given, or its first 8 bytes when asked by name),
+        "name": its advertised name or None, "repeaters": [...]}."""
         node = _hex(node)
-        if _is_key(node):
-            return self._request("near", timeout, node=node, limit=limit)["repeaters"]
-        return self._request("near", timeout, name=node, limit=limit)["repeaters"]
+        field = "node" if _is_key(node) else "name"
+        msg = self._request("near", timeout, limit=limit, **{field: node})
+        return {"node": msg.get("node"), "name": msg.get("name"), "repeaters": msg["repeaters"]}
 
     def routes(self, repeater, limit=3, timeout=10.0):
         """The server's best routes to a repeater, best first: a list of {"path_len", "path" (hex), "hops", "names",

@@ -1,0 +1,9 @@
+# WhereBot: copy to where_bot.yaml and fill in.
+name: WhereBot                       # the name its channel messages go out under
+private_key: 0123...                 # hex: a 64-byte MeshCore private key (as the apps export it) or a 32-byte seed
+api_endpoint: ws://meshroom.local:8081/api/v1/kaas
+api_key: kaas_...                    # a KaaS key with Receive and Send, from the dashboard's KaaS card
+channels:                            # hashtag channels to answer !where on
+  - "#where"
+  - "#bots"
+# direct_label: the room radio       # how a node heard directly by the room's radio is described
