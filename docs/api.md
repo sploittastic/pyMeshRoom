@@ -20,7 +20,14 @@ The main admin makes keys on the dashboard's **KaaS** card:
 can't be recovered: revoke it and make a new one.
 
 The list on the card shows each key's description, access, expiry, last use and current connections. The key itself
-is never shown again. **Revoke** deletes the key and disconnects its clients at once. When a key expires, its clients are
+is never shown again. It also shows each key's counts, for the last 24 hours and in total:
+
+* **Received**: packets streamed to it.
+* **Sent**: packets it sent that were accepted.
+* **Errors**: refused sends and bad requests.
+
+The counts are kept in `kaas_stats.json` in `data_dir`, saved every 5 minutes and at shutdown. Revoking a key deletes
+its counts. **Revoke** deletes the key and disconnects its clients at once. When a key expires, its clients are
 disconnected within a second.
 
 Admin endpoints use the dashboard's admin login cookie:

@@ -159,6 +159,38 @@ class SendTests(unittest.TestCase):
         self.assertEqual((reader.msgs[-1]["dir"], reader.msgs[-1]["snr"], reader.msgs[-1]["rssi"]), ("rx", 7.5, -88))
 
 
+class KeyStatsTests(unittest.TestCase):
+    def test_counts_per_key_24h_and_total_and_saved(self):
+        h = Harness()
+        try:
+            hub = h.room.kaas
+            _, key = hub.new_key(mr.kaas_key_spec({"receive": True, "send": True}))
+            hub.event(("kaas_key_add", key))
+            conn = mr.KaasConn(hub, None, None, key, "test")
+            hub.conns = [conn]
+            for _ in range(3):
+                hub.publish("rx", flood(mr.PT_ADVERT, os.urandom(120)), 5.0, -90)
+            conn.inflight = 2
+            hub.send(conn, flood(mr.PT_GRP_TXT, os.urandom(40)), 1)       # accepted: sent
+            hub.send(conn, b"\x01", 2)                                    # refused: an error
+            hub.on_message(conn, {"type": "bogus"})                       # an error
+            self.assertEqual(hub.key_stats(key["id"]), {"rx": [3, 3], "tx": [1, 1], "err": [2, 2]})
+            old = int(time.time() // 3600) - 30                           # a day and more ago: total only
+            hub.kstats[key["id"]]["hours"][old] = [10, 0, 0]
+            hub.kstats[key["id"]]["total"][0] += 10
+            self.assertEqual(hub.key_stats(key["id"])["rx"], [3, 13])
+            row = hub.key_rows()[0]
+            self.assertEqual(row["stats"]["err"], [2, 2])
+            hub.save_stats()
+            again = mr.KaasHub(h.room)
+            self.assertEqual(again.key_stats(key["id"]), {"rx": [3, 13], "tx": [1, 1], "err": [2, 2]})
+            self.assertNotIn(old, again.kstats[key["id"]]["hours"], "old hours are pruned when saved")
+            hub.event(("kaas_key_del", key["id"]))
+            self.assertNotIn(key["id"], hub.kstats, "a revoked key's stats go with it")
+        finally:
+            h.close()
+
+
 def free_port():
     s = socket.socket()
     s.bind(("127.0.0.1", 0))

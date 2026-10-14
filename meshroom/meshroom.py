@@ -6790,6 +6790,8 @@ KAAS_MAX_MESSAGE = 4096               # largest message a client may send
 KAAS_MAX_INFLIGHT = 4                 # a client's sends waiting for the main loop
 KAAS_AIR_WINDOW_S = 600               # the airtime cap is a share of this rolling window
 KAAS_PING_S = 30                      # websocket ping this often; nothing heard for 3 of these closes the connection
+KAAS_STATS = ("rx", "tx", "err")      # per key: packets streamed to it, packets it sent (accepted), errors it got
+KAAS_STATS_SAVE_S = 300
 KAAS_PRIO = 9                         # (and they go out after everything of the room's, the repeater's and pushes)
 WS_GUID = b"258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
 
@@ -6916,6 +6918,11 @@ class KaasConn:
             self.cv.notify()
 
     def send_json(self, obj):
+        t = obj.get("type")
+        if t == "error" or (t == "send_result" and obj.get("status") == "dropped"):
+            self.hub.count(self.key_id, "err")
+        elif t == "send_result" and obj.get("status") in ("queued", "local"):
+            self.hub.count(self.key_id, "tx")
         self.put(json.dumps(obj, separators=(",", ":")))
 
     def close(self, code=1000, reason=""):
@@ -7013,6 +7020,56 @@ class KaasHub:
         self.air = collections.deque()      # (monotonic, airtime ms) of clients' transmissions: the shared cap
         self.stats = dict(rx=0, tx=0, sent=0, local=0, dropped=0)
         self.next_check = 0.0
+        self.slock = threading.Lock()
+        self.kstats = {}                    # key id -> {"total": [rx, tx, err], "hours": {hour: [rx, tx, err]}}
+        self.kstats_path = os.path.join(room.cfg.data_dir, "kaas_stats.json")
+        self.kstats_dirty, self.next_save = False, time.monotonic() + KAAS_STATS_SAVE_S
+        try:
+            with open(self.kstats_path) as f:
+                for kid, st in json.load(f).items():
+                    self.kstats[kid] = {"total": [int(x) for x in st["total"]][:3],
+                                        "hours": {int(h): [int(x) for x in v][:3] for h, v in st["hours"].items()}}
+        except FileNotFoundError:
+            pass
+        except (ValueError, KeyError, TypeError, AttributeError, OSError) as e:
+            log.warning("KaaS stats in %s not read: %s", self.kstats_path, e)
+
+    # ---------------------------------------------------------------- per-key stats
+
+    def count(self, kid, field, n=1):
+        """Any thread. Hourly buckets for the last 24 h, plus a running total."""
+        i, hour = KAAS_STATS.index(field), int(time.time() // 3600)
+        with self.slock:
+            st = self.kstats.setdefault(kid, {"total": [0, 0, 0], "hours": {}})
+            st["total"][i] += n
+            st["hours"].setdefault(hour, [0, 0, 0])[i] += n
+            self.kstats_dirty = True
+
+    def key_stats(self, kid):
+        """{"rx": [last 24 h, total], "tx": [...], "err": [...]}"""
+        since = int(time.time() // 3600) - 23
+        with self.slock:
+            st = self.kstats.get(kid) or {"total": [0, 0, 0], "hours": {}}
+            day = [sum(v[i] for h, v in st["hours"].items() if h >= since) for i in range(3)]
+            return {f: [day[i], st["total"][i]] for i, f in enumerate(KAAS_STATS)}
+
+    def save_stats(self):
+        since = int(time.time() // 3600) - 23
+        with self.slock:
+            if not self.kstats_dirty:
+                return
+            for st in self.kstats.values():
+                for h in [h for h in st["hours"] if h < since]:
+                    del st["hours"][h]
+            data = json.dumps(self.kstats)
+            self.kstats_dirty = False
+        tmp = self.kstats_path + ".tmp"
+        try:
+            with open(tmp, "w") as f:
+                f.write(data)
+            os.replace(tmp, self.kstats_path)
+        except OSError as e:
+            log.warning("KaaS stats not saved: %s", e)
 
     # ---------------------------------------------------------------- keys
 
@@ -7049,7 +7106,7 @@ class KaasHub:
                      receive=bool(k.get("receive")), send=bool(k.get("send")), expires=k.get("expires"),
                      created=k.get("created"), expired=not self.valid(k),
                      last_used=max(self.last_used.get(k["id"]) or 0, k.get("last_used") or 0) or None,
-                     connected=sum(1 for c in conns if c.key_id == k["id"]))
+                     connected=sum(1 for c in conns if c.key_id == k["id"]), stats=self.key_stats(k["id"]))
                 for k in self.keys()]
 
     def event(self, ev):
@@ -7068,6 +7125,9 @@ class KaasHub:
             for c in self.conns:
                 if c.key_id == ev[1]:
                     c.close(4001, "key revoked")
+            with self.slock:
+                if self.kstats.pop(ev[1], None) is not None:
+                    self.kstats_dirty = True
         elif kind == "kaas_used":
             cfg.set("kaas_keys", [dict(k, last_used=ev[2]) if k["id"] == ev[1] else k for k in self.keys()])
         self.room.web_dirty = True
@@ -7089,6 +7149,7 @@ class KaasHub:
     def close_all(self):
         for c in self.conns:
             c.close(1001, "server shutting down")
+        self.save_stats()
 
     def hello(self, key):
         room = self.room
@@ -7216,6 +7277,7 @@ class KaasHub:
         text = json.dumps(msg, separators=(",", ":"))
         for c in conns:
             c.put(text)
+            self.count(c.key_id, "rx")
 
     def send(self, conn, raw, rid):
         """A client's packet: checked, rate-limited, offered to the nodes on this radio, then queued for the air at the
@@ -7276,8 +7338,11 @@ class KaasHub:
         conn.send_json({"type": "send_result", "id": rid, "status": "sent"})
 
     def periodic(self):
-        """Close connections whose key was revoked or has expired."""
+        """Close connections whose key was revoked or has expired; save the per-key stats now and then."""
         now = time.monotonic()
+        if now >= self.next_save:
+            self.next_save = now + KAAS_STATS_SAVE_S
+            self.save_stats()
         if now < self.next_check or not self.conns:
             return
         self.next_check = now + 1.0
@@ -7527,10 +7592,13 @@ async function loadKaas(){if(!MAINADM)return;let d;try{const r=await fetch("api/
  KK_ROWS=d.keys||[];$("kk_url").textContent=(location.protocol==="https:"?"wss://":"ws://")+location.host+d.path;$("kk_burst").textContent=d.send_burst;$("kk_win").textContent=d.send_window_s;$("kk_air").textContent=d.airtime_pct;
  const t=$("kklist");if(!KK_ROWS.length){t.innerHTML='<tr><td class="dim">No API keys yet.</td></tr>';return}
  const day=x=>x?new Date(x*1000).toLocaleDateString():"never";
- t.innerHTML="<tr><th>Description</th><th>Access</th><th>Expires</th><th>Last used</th><th>Connected</th><th></th></tr>"+KK_ROWS.map(k=>
+ t.innerHTML="<tr><th>Description</th><th>Access</th><th>Expires</th><th>Last used</th><th>Connected</th>"+
+  '<th title="packets streamed to this key: last 24 h / total">Received <span class=\"dim small\">24h / total</span></th><th title="packets this key sent: last 24 h / total">Sent <span class=\"dim small\">24h / total</span></th>'+
+  '<th title="refused sends and other errors: last 24 h / total">Errors <span class=\"dim small\">24h / total</span></th><th></th></tr>'+KK_ROWS.map(k=>
   `<tr><td>${esc(k.description)||'<span class="dim">(no description)</span>'}</td><td>${[k.receive?"Receive":"",k.send?"Send":""].filter(Boolean).join(" + ")}</td>`+
   `<td class="${k.expired?"poor":""}">${k.expired?"expired "+day(k.expires):day(k.expires)}</td><td>${k.last_used?ago(k.last_used)+" ago":"never"}</td>`+
   `<td>${k.connected?'<span class="mqdot on"></span> '+k.connected:'<span class="dim">no</span>'}</td>`+
+  ["rx","tx","err"].map(f=>{const v=(k.stats||{})[f]||[0,0];return `<td class="${f==="err"&&v[0]?"poor":""}">${v[0].toLocaleString()} <span class="dim">/ ${v[1].toLocaleString()}</span></td>`}).join("")+
   `<td><button data-id="${esc(k.id)}" data-name="${esc(k.description||"(no description)")}" onclick="kkRevoke(this)">Revoke</button></td></tr>`).join("")}
 async function kkCreate(btn){const v=$("kk_exp").value;const o={receive:$("kk_receive").checked,send:$("kk_send").checked,description:$("kk_desc").value.trim(),
  expires:v?Math.floor(new Date(v+"T23:59:59").getTime()/1000):null};

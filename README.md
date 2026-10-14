@@ -457,7 +457,8 @@ repeaters hear a node, and the best routes from this radio to a repeater.
 
 The main admin makes keys on the **KaaS** card: Receive and/or Send, a description and an optional expiry date. Each key
 is shown once, when it's saved. The config keeps only its hash, so a lost key can only be revoked and replaced. The
-card lists every key with its last use and live connections, and **Revoke** disconnects a key's clients at once.
+card lists every key with its last use, live connections, and packets received, packets sent and errors (24 h and
+total), and **Revoke** disconnects a key's clients at once.
 
 * Protocol: [docs/api.md](docs/api.md), and [docs/asyncapi.yaml](docs/asyncapi.yaml) for tools.
 * Python client: [client/](client/README.md). It works with raw packets, or as a full chat node: adverts, contacts,
