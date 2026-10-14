@@ -382,12 +382,19 @@ class RouteSuggestTests(WebTestCase):
         self.assertEqual(routes[0]["names"], [None, "Seaside", None])
         self.assertEqual((routes[0]["path_len"], routes[0]["path"]), (0x43, "a1a1b2b2d4d4"))
         self.assertGreater(routes[0]["score"], routes[1]["score"])
-        self.assertAlmostEqual(routes[0]["score"], (1 - 0.5 ** 3) ** 2, places=2)
+        self.assertAlmostEqual(routes[0]["score"], ((1 - 0.5 ** 3) * mr.ROUTE_HOP_COST) ** 2, places=2)
         self.assertEqual(len(self.h.run_client(lambda: c.route(src, dst, limit=1))["routes"]), 1)
         # repeater ids work as ends; a link only seen the other way still counts, at half
         res = self.h.run_client(lambda: c.route("d4d4", "a1a1"))
         self.assertEqual(res["routes"][0]["hops"], ["d4d4", "b2b2", "a1a1"])
         self.assertEqual(self.h.run_client(lambda: c.route("a1a1", "a1a1"))["routes"][0]["hops"], ["a1a1"])
+        # busy links don't all max out: what counts is how a link compares with its repeater's strongest one
+        room.edges.update({(A, B): [400.0, now, None], (A, C): [100.0, now, None], (B, D): [300.0, now, None],
+                           (C, D): [300.0, now, None]})
+        busy = self.h.run_client(lambda: c.route("a1a1", "d4d4"))["routes"]
+        self.assertEqual([r["hops"] for r in busy], [["a1a1", "b2b2", "d4d4"], ["a1a1", "c3c3", "d4d4"]])
+        self.assertAlmostEqual(busy[0]["score"], mr.ROUTE_HOP_COST ** 2, places=2)
+        self.assertAlmostEqual(busy[1]["score"], 0.5 * mr.ROUTE_HOP_COST ** 2, places=2)
         for bad in (("@[nobody]", dst), (os.urandom(8), dst), (src, "zz")):
             with self.assertRaises(kc.RequestError):
                 self.h.run_client(lambda: c.route(*bad))

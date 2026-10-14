@@ -110,7 +110,7 @@ class WhereBotEndToEnd(WebTestCase):
         heard.clear()
         self.h.run_client(lambda: user.send_channel(ch, "!suggest 5b98 to ec43"))
         self.assertTrue(self.h.pump(lambda: heard, 15))
-        self.assertEqual(heard, [("WhereBot", "Suggested routes: 5b98 to ec43\n5b98,ec43 (.88)")])
+        self.assertEqual(heard, [("WhereBot", "Suggested routes: 5b98 to ec43\n5b98,ec43 (.83)")])
         self.assertTrue(bot_ch)
         bot_c.close()
         user_c.close()

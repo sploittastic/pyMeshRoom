@@ -179,9 +179,11 @@ flood paths this radio heard, plus links the MQTT observers reported, faded over
 ```
 
 The path runs from the `from` end: its first hop is a repeater that hears the source, its last one a repeater the
-destination hears. `score` (0 to 1) is how likely the ends use those repeaters times each link's confidence. A link
-seen 3 times counts 0.88, once 0.5. Weak links (below 0 dB SNR) count for less, down to half at -15 dB. A link seen
-only in the other direction counts at half. Routes use 2-byte ids, at most 10 hops. This radio is a hop only while its
+destination hears. `score` (0 to 1) is how likely the ends use those repeaters times each link's confidence. A busy
+link is seen hundreds of times, so a link counts by how it compares with its repeater's strongest link: the
+strongest scores 1, one with a quarter of that traffic 0.5. A link seen only once counts half again. Weak links
+(below 0 dB SNR, where known) count for less, down to half at -15 dB. A link seen only in the other direction counts
+at half, and every hop costs 5%, so shorter routes win ties. Routes use 2-byte ids, at most 10 hops. This radio is a hop only while its
 virtual repeater relays. A node with no recent location (it hasn't flood-adverted lately) is an error, and so is an
 unknown name. An empty list means no chain of seen links joins the two ends.
 Bad input gets `{"type": "error", "id": ..., "error": ...}`. Questions share the 4-at-a-time limit with sends.
