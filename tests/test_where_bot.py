@@ -47,9 +47,9 @@ class ReplyTests(unittest.TestCase):
         self.assertEqual(text.split("\n")[0], who + " is recently active near:")
         self.assertEqual(text.split("\n")[1:], ["0000 A Very Long~ 40%", "0101 A Very Long~ 30%", "0202 A Very Long~ 20%",
                                                 "0303 A Very Long~ 10%"], "names are cut, every repeater stays")
-        self.assertEqual(wb.answer("mention", who, {"name": who, "repeaters": rpts}, 90).split("\n")[1:],
+        self.assertEqual(wb.answer("mention", who, {"name": who, "repeaters": rpts}, 95).split("\n")[1:],
                          ["0000 40%", "0101 30%", "0202 20%", "0303 10%"], "then names go, the ids stay")
-        self.assertEqual(wb.answer("mention", who, {"name": who, "repeaters": rpts}, 70).split("\n")[1:],
+        self.assertEqual(wb.answer("mention", who, {"name": who, "repeaters": rpts}, 75).split("\n")[1:],
                          ["0000 40%", "0101 30%"], "then the least heard repeaters go")
 
 
