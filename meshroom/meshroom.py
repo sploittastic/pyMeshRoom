@@ -2568,24 +2568,32 @@ class RoomServer:
 
     def link_graph(self):
         """Repeater links for route suggestions: a -> {b: confidence 0..1} (b hears a). From what this radio traced
-        and what the observers reported; a link seen only the other way counts at half. b"" is this radio, a usable
-        hop only while its virtual repeater relays."""
+        and what the observers reported. A busy link is seen hundreds of times, so what counts is how it compares
+        with a's other links: a's strongest link scores 1, one with a quarter of its traffic 0.5. Links seen only once
+        or twice, weak ones (SNR below 0 dB, where known) and ones seen only the other way count for less, and every
+        hop costs a little, so shorter routes win ties. b"" is this radio, a usable hop only while its virtual
+        repeater relays."""
         now, th = now_s(), self.thalf()
-        seen = {}
+        seen = {}                                           # (a, b) -> [weight, snr]
         for tab in (self.edges, self.obs_edges):
             for (a, b), e in tab.items():
                 w = fade(e[0], e[1], now, th)
                 if w < 0.05 or a == b or len(a) not in (0, 2) or len(b) not in (0, 2):
                     continue                                # (suggested paths use 2-byte ids)
-                c = 1.0 - 0.5 ** w                          # 1 sighting 0.5, 3 sightings 0.88
-                if e[2] is not None and e[2] < 0:           # weak links count for less, down to half at -15 dB
-                    c *= max(0.5, 1.0 + e[2] / 30.0)
-                seen[(a, b)] = max(seen.get((a, b), 0.0), c)
+                old = seen.get((a, b))
+                if old is None or w > old[0]:
+                    seen[(a, b)] = [w, e[2] if e[2] is not None else (old[1] if old else None)]
+        strongest = {}
+        for (a, b), (w, snr) in seen.items():
+            strongest[a] = max(strongest.get(a, 0.0), w)
         relay = self.vr is not None and self.cfg.repeater_relay
         g = {}
-        for (a, b), c in seen.items():
+        for (a, b), (w, snr) in seen.items():
             if not relay and b"" in (a, b):
                 continue
+            c = (1.0 - 0.5 ** w) * math.sqrt(w / strongest[a]) * ROUTE_HOP_COST
+            if snr is not None and snr < 0:
+                c *= max(0.5, 1.0 + snr / 30.0)
             g.setdefault(a, {})[b] = max(g.get(a, {}).get(b, 0.0), c)
             if (b, a) not in seen:
                 g.setdefault(b, {})[a] = max(g.get(b, {}).get(a, 0.0), c * 0.5)
@@ -6893,6 +6901,7 @@ KAAS_MAX_CLIENTS = 16
 KAAS_QUEUE_MAX = 512                  # messages waiting for a slow client; past that the oldest are dropped (and counted)
 KAAS_MAX_MESSAGE = 4096               # largest message a client may send
 KAAS_MAX_INFLIGHT = 4                 # a client's sends waiting for the main loop
+ROUTE_HOP_COST = 0.95                 # each hop of a suggested route scores this much less
 KAAS_MAX_ROUTES = 5                   # route suggestions per request
 KAAS_AIR_WINDOW_S = 600               # the airtime cap is a share of this rolling window
 KAAS_PING_S = 30                      # websocket ping this often; nothing heard for 3 of these closes the connection
