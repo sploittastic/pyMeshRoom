@@ -338,7 +338,7 @@ class RouteQueryTests(WebTestCase):
         self.h.run_client(c.connect)
         near = self.h.run_client(lambda: c.near(node.hex()))
         self.assertEqual([(x.get("id"), x.get("name"), x.get("direct", False)) for x in near],
-                         [("44c3", "Seaside", False), ("55b2", None, False), (None, None, True)])
+                         [("44c3", "Seaside", False), ("55b2", None, False), (room.id.pub_key[:2].hex(), room.cfg.name, True)])
         self.assertAlmostEqual(near[0]["share"], 0.6, places=2)
         self.assertEqual(len(self.h.run_client(lambda: c.near(node, limit=1))), 1)
         routes = self.h.run_client(lambda: c.routes("44c3"))

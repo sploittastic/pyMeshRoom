@@ -19,7 +19,7 @@ from meshroom_kaas import Identity, KaasClient, Node, RequestError  # noqa: E402
 log = logging.getLogger("where_bot")
 
 MAX_TEXT_LEN = 160          # a channel message, "BotName: " included
-NAME_CUTS = (None, 20, 16, 12)   # if a reply is too long, repeater names are cut to these lengths in turn
+NAME_CUTS = (None, 20, 16, 12, 8, 0)   # if a reply is too long, repeater names are cut to these lengths in turn
 MIN_SHARE = 0.05            # repeaters heard less than this are left out
 KEY_SHOWN = 8               # hex characters of a public key in replies
 
@@ -50,14 +50,16 @@ def fit(text, limit):
     return b.decode(errors="ignore")
 
 
-def describe(rpt, direct_label, cut=None):
-    if rpt.get("direct"):
-        return direct_label
-    name = rpt.get("name") or rpt.get("id", "?")
-    return name if cut is None or len(name) <= cut else name[:cut - 1].rstrip() + "~"
+def describe(rpt, cut=None):
+    """ "44c3 Seaside 62%": the repeater's 2-byte id, its name (cut to cut characters; 0 leaves it out) and share."""
+    rid = rpt.get("id") or "direct"         # (a server too old to name what hears a node directly)
+    name = rpt.get("name") or ""
+    if cut is not None and len(name) > cut:
+        name = name[:cut - 1].rstrip() + "~" if cut > 1 else ""
+    return " ".join(x for x in (rid, name, "%d%%" % round(rpt["share"] * 100)) if x)
 
 
-def answer(kind, asked, result, budget, direct_label="the room radio"):
+def answer(kind, asked, result, budget):
     """The reply to a !where, at most budget bytes. result: KaasClient.lookup()'s answer."""
     if kind == "key":
         who = asked[:KEY_SHOWN]
@@ -70,10 +72,10 @@ def answer(kind, asked, result, budget, direct_label="the room radio"):
         if kind == "key" and not result.get("name"):
             return UNKNOWN_KEY
         return fit("%s hasn't been heard through a repeater lately" % who, budget)
-    head = "%s is usually near: " % who
+    head = "%s is usually near:" % who
     while True:
         for cut in NAME_CUTS:               # shorten the repeater names first, then leave out the least heard
-            text = head + ", ".join("%s %d%%" % (describe(r, direct_label, cut), round(r["share"] * 100)) for r in rpts)
+            text = "\n".join([head] + [describe(r, cut) for r in rpts])
             if len(text.encode()) <= budget:
                 return text
         if len(rpts) == 1:
@@ -81,7 +83,7 @@ def answer(kind, asked, result, budget, direct_label="the room radio"):
         rpts = rpts[:-1]                    # they come most heard first
 
 
-def handle(client, node, channel, sender, text, direct_label):
+def handle(client, node, channel, sender, text):
     if sender == node.name:
         return
     q = parse(text)
@@ -93,7 +95,7 @@ def handle(client, node, channel, sender, text, direct_label):
         reply = arg
     else:
         try:
-            reply = answer(kind, arg, client.lookup(arg), budget, direct_label)
+            reply = answer(kind, arg, client.lookup(arg), budget)
         except RequestError as e:
             if kind != "key" and "no node named" in str(e):
                 reply = SHORT_KEY if kind == "name" and re.fullmatch(r"[0-9a-fA-F]+", arg) else UNKNOWN_NAME
@@ -106,7 +108,6 @@ def handle(client, node, channel, sender, text, direct_label):
 
 def run(cfg):
     ident = Identity(cfg["private_key"])
-    direct_label = cfg.get("direct_label", "the room radio")
     while True:
         client = KaasClient(cfg["api_endpoint"], cfg["api_key"])
         try:
@@ -119,7 +120,7 @@ def run(cfg):
         channels = [node.add_channel(c if c.startswith("#") else "#" + c) for c in cfg["channels"]]
         log.info("connected as %s (%s), listening on %s", cfg["name"], ident.pub[:4].hex(),
                  ", ".join(c.name for c in channels))
-        node.on_channel(lambda ch, sender, text, ts: handle(client, node, ch, sender, text, direct_label))
+        node.on_channel(lambda ch, sender, text, ts: handle(client, node, ch, sender, text))
         log.info("connection closed: %s", client.wait())
         time.sleep(10)
 

@@ -105,7 +105,7 @@ class KaasClient:
 
     def near(self, node, limit=4, timeout=10.0):
         """The repeaters that hear a node (its first hop into the mesh), most first: a list of
-        {"id": hex, "name", "share": 0..1}, or {"direct": True, "share"} when the server's radio hears it directly.
+        {"id": hex, "name", "share": 0..1}, with "direct": True when the server's radio hears it directly (id and name are then its virtual repeater, or the room).
         node: its public key (bytes or hex; the first 8 bytes are enough), or its advertised name, plain or as a
         mention like "@[platinum]" (ignoring case). Up to 4 are known per node."""
         return self.lookup(node, limit, timeout)["repeaters"]

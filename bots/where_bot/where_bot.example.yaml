@@ -6,4 +6,3 @@ api_key: kaas_...                    # a KaaS key with Receive and Send, from th
 channels:                            # hashtag channels to answer !where on
   - "#where"
   - "#bots"
-# direct_label: the room radio       # how a node heard directly by the room's radio is described

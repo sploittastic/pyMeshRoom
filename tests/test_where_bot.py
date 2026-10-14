@@ -13,7 +13,7 @@ except ImportError:                                        # needs pyyaml
 from test_kaas import WebTestCase, kc
 
 NEAR = [{"id": "44c3", "name": "Seaside", "share": 0.62}, {"id": "55b2", "name": None, "share": 0.25},
-        {"direct": True, "share": 0.13}]
+        {"direct": True, "id": "9a1f", "name": "pyMeshRoom Virtual Repeater", "share": 0.13}]
 BUDGET = 160 - len("WhereBot: ")
 
 
@@ -30,11 +30,11 @@ class ReplyTests(unittest.TestCase):
 
     def test_answers(self):
         self.assertEqual(wb.answer("mention", "platinum", {"name": "platinum", "repeaters": NEAR}, BUDGET),
-                         "platinum is usually near: Seaside 62%, 55b2 25%, the room radio 13%")
+                         "platinum is usually near:\n44c3 Seaside 62%\n55b2 25%\n9a1f pyMeshRoom Virtual Repeater 13%")
         self.assertEqual(wb.answer("key", "a1b2c3d4e5f60718", {"name": "platinum", "repeaters": NEAR[:1]}, BUDGET),
-                         "a1b2c3d4 (aka platinum) is usually near: Seaside 62%")
+                         "a1b2c3d4 (aka platinum) is usually near:\n44c3 Seaside 62%")
         self.assertEqual(wb.answer("key", "a1b2c3d4e5f60718", {"name": None, "repeaters": NEAR[:1]}, BUDGET),
-                         "a1b2c3d4 is usually near: Seaside 62%")
+                         "a1b2c3d4 is usually near:\n44c3 Seaside 62%")
         self.assertEqual(wb.answer("key", "a1b2c3d4e5f60718", {"name": None, "repeaters": []}, BUDGET), wb.UNKNOWN_KEY)
         self.assertIn("hasn't been heard", wb.answer("mention", "platinum", {"name": "platinum", "repeaters": []}, BUDGET))
 
@@ -44,13 +44,13 @@ class ReplyTests(unittest.TestCase):
         who = "Somebody With A Thirty Char Nm"
         text = wb.answer("mention", who, {"name": who, "repeaters": rpts}, BUDGET)
         self.assertLessEqual(len(text.encode()), BUDGET)
-        self.assertTrue(text.startswith(who + " is usually near: A Very Long"), text)
-        self.assertIn("40%", text)
-        self.assertIn("Repeate~ 10%", text, "names are cut before a repeater is left out")
-        short = wb.answer("mention", who, {"name": who, "repeaters": rpts}, 100)
-        self.assertLessEqual(len(short.encode()), 100)
-        self.assertIn("40%", short)
-        self.assertNotIn("10%", short, "the least heard repeater goes first")
+        self.assertEqual(text.split("\n")[0], who + " is usually near:")
+        self.assertEqual(text.split("\n")[1:], ["0000 A Very Long~ 40%", "0101 A Very Long~ 30%", "0202 A Very Long~ 20%",
+                                                "0303 A Very Long~ 10%"], "names are cut, every repeater stays")
+        self.assertEqual(wb.answer("mention", who, {"name": who, "repeaters": rpts}, 90).split("\n")[1:],
+                         ["0000 40%", "0101 30%", "0202 20%", "0303 10%"], "then names go, the ids stay")
+        self.assertEqual(wb.answer("mention", who, {"name": who, "repeaters": rpts}, 70).split("\n")[1:],
+                         ["0000 40%", "0101 30%"], "then the least heard repeaters go")
 
 
 @unittest.skipIf(wb is None, "needs pyyaml")
@@ -69,12 +69,15 @@ class WhereBotEndToEnd(WebTestCase):
         bot = kc.Node(bot_c, kc.Identity.generate(), "WhereBot")
         user = kc.Node(user_c, kc.Identity.generate(), "Jeff")
         bot_ch = bot.add_channel("#where")
-        bot.on_channel(lambda ch, sender, text, ts: wb.handle(bot_c, bot, ch, sender, text, "the room radio"))
+        bot.on_channel(lambda ch, sender, text, ts: wb.handle(bot_c, bot, ch, sender, text))
         heard = []
         user.on_channel(lambda ch, sender, text, ts: heard.append((sender, text)))
         ch = user.add_channel("#where")
-        for ask, want in (("!where @[Platinum]", "platinum is usually near: 44c3 100%"),
-                          ("!where " + node.hex(), "%s (aka platinum) is usually near: 44c3 100%%" % node[:4].hex()),
+        room.observe_near(node, b"")
+        here = room.id.pub_key[:2].hex()                    # no virtual repeater here: heard directly by the room
+        for ask, want in (("!where @[Platinum]", "platinum is usually near:\n44c3 75%%\n%s %s 25%%" % (here, room.cfg.name)),
+                          ("!where " + node.hex(),
+                           "%s (aka platinum) is usually near:\n44c3 75%%\n%s %s 25%%" % (node[:4].hex(), here, room.cfg.name)),
                           ("!where @[nobody]", wb.UNKNOWN_NAME),
                           ("!where " + os.urandom(8).hex(), wb.UNKNOWN_KEY)):
             heard.clear()
