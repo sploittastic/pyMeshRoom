@@ -124,6 +124,14 @@ class KaasClient:
         the repeater is the last hop. repeater: its public key or id (bytes or hex; the first 2 bytes are enough)."""
         return self._request("routes", timeout, repeater=_hex(repeater), limit=limit)["routes"]
 
+    def route(self, src, dst, limit=3, timeout=10.0):
+        """Suggested routes from one node to another through the repeaters the server has seen linked, best first:
+        {"from", "to", "routes": [{"path_len", "path" (hex), "hops", "names", "score": 0..1}]}. path_len and path go
+        straight into Packet.direct(...) for a packet from src to dst. src, dst: a node's public key (bytes or hex,
+        at least 8 bytes), its advertised name or "@[name]", or a repeater's 2-byte id in hex. limit: 1 to 5."""
+        msg = self._request("route", timeout, limit=limit, **{"from": _hex(src), "to": _hex(dst)})
+        return {"from": msg["from"], "to": msg["to"], "routes": msg["routes"]}
+
     def _request(self, t, timeout, **fields):
         rid = "q%d" % next(self.ids)
         ev, box = threading.Event(), {}
@@ -181,7 +189,7 @@ class KaasClient:
                         if msg.get("status") in FINAL:
                             w[1]["final"] = msg
                             w[0].set()
-                elif t in ("near_result", "routes_result", "error") and msg.get("id") in self.queries:
+                elif t in ("near_result", "routes_result", "route_result", "error") and msg.get("id") in self.queries:
                     with self.lock:
                         q = self.queries.pop(msg.get("id"), None)
                     if q:

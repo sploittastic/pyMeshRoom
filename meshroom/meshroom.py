@@ -23,6 +23,7 @@ Usage:
 import argparse
 import hashlib
 import heapq
+import itertools
 import hmac
 import collections
 import gzip
@@ -2565,6 +2566,98 @@ class RoomServer:
         scored = sorted(((rr, rr.confidence(now, self.thalf())) for rr in tab.values()), key=lambda x: -x[1])
         return scored[:n]
 
+    def link_graph(self):
+        """Repeater links for route suggestions: a -> {b: confidence 0..1} (b hears a). From what this radio traced
+        and what the observers reported; a link seen only the other way counts at half. b"" is this radio, a usable
+        hop only while its virtual repeater relays."""
+        now, th = now_s(), self.thalf()
+        seen = {}
+        for tab in (self.edges, self.obs_edges):
+            for (a, b), e in tab.items():
+                w = fade(e[0], e[1], now, th)
+                if w < 0.05 or a == b or len(a) not in (0, 2) or len(b) not in (0, 2):
+                    continue                                # (suggested paths use 2-byte ids)
+                c = 1.0 - 0.5 ** w                          # 1 sighting 0.5, 3 sightings 0.88
+                if e[2] is not None and e[2] < 0:           # weak links count for less, down to half at -15 dB
+                    c *= max(0.5, 1.0 + e[2] / 30.0)
+                seen[(a, b)] = max(seen.get((a, b), 0.0), c)
+        relay = self.vr is not None and self.cfg.repeater_relay
+        g = {}
+        for (a, b), c in seen.items():
+            if not relay and b"" in (a, b):
+                continue
+            g.setdefault(a, {})[b] = max(g.get(a, {}).get(b, 0.0), c)
+            if (b, a) not in seen:
+                g.setdefault(b, {})[a] = max(g.get(b, {}).get(a, 0.0), c * 0.5)
+        return g
+
+    def suggest_routes(self, src, dst, k=3, max_hops=10):
+        """The k best repeater chains from a node near the src repeaters to one near the dst repeaters.
+        src, dst: {repeater hash (b"" = this radio): share}. Returns [(hops, score 0..1)], best first: a score is the
+        chance the ends use those repeaters times each link's confidence. Yen's k shortest paths over -log(score)."""
+        g = self.link_graph()
+        relay = self.vr is not None and self.cfg.repeater_relay
+        src = {h: s for h, s in src.items() if s > 0 and (h or relay)}
+        dst = {h: s for h, s in dst.items() if s > 0 and (h or relay)}
+        S, T = ("src",), ("dst",)                           # virtual ends
+
+        def nbrs(u, banned_nodes, banned_edges):
+            if u == S:
+                items = src.items()
+            else:
+                items = list(g.get(u, {}).items()) + ([(T, dst[u])] if u in dst else [])
+            for v, c in items:
+                if v not in banned_nodes and (u, v) not in banned_edges and c > 0:
+                    yield v, -math.log(c)
+
+        def shortest(start, banned_nodes, banned_edges, depth0):
+            dist, prev, n_hops = {start: 0.0}, {}, {start: depth0}
+            heap, seq = [(0.0, 0, start)], itertools.count(1)
+            while heap:
+                d, _, u = heapq.heappop(heap)
+                if u == T:
+                    path = [u]
+                    while path[-1] != start:
+                        path.append(prev[path[-1]])
+                    return d, path[::-1]
+                if d > dist.get(u, float("inf")):
+                    continue
+                for v, w in nbrs(u, banned_nodes, banned_edges):
+                    hops = n_hops[u] + (0 if v == T else 1)
+                    if hops > max_hops:
+                        continue
+                    if d + w < dist.get(v, float("inf")):
+                        dist[v], prev[v], n_hops[v] = d + w, u, hops
+                        heapq.heappush(heap, (d + w, next(seq), v))
+            return None
+
+        def cost(path):
+            return sum(dict(nbrs(u, (), ()))[v] for u, v in zip(path, path[1:]))
+        first = shortest(S, set(), set(), 0)
+        if first is None:
+            return []
+        found, cands = [first[1]], []
+        while len(found) < k:
+            last = found[-1]
+            for i in range(len(last) - 2):                  # spur from each node but the last real hop
+                root = last[:i + 1]
+                banned_edges = {(p[i], p[i + 1]) for p in found if p[:i + 1] == root}
+                spur = shortest(root[-1], set(root[:-1]), banned_edges, i)
+                if spur is None:
+                    continue
+                path = root[:-1] + spur[1]
+                if path not in found and all(path != c[1] for c in cands):
+                    cands.append((cost(path), path))
+            if not cands:
+                break
+            cands.sort(key=lambda x: x[0])
+            found.append(cands.pop(0)[1])
+        out = []
+        for path in found:
+            hops = path[1:-1]
+            out.append(([(self.vr.pub[:2] if h == b"" else h) for h in hops], math.exp(-cost(path))))
+        return out
+
     def best_rpt_route(self, target):
         tab = self.rroutes.get(target)
         if not tab:
@@ -2647,7 +2740,11 @@ class RoomServer:
 
     def member_locations(self, m):
         """[(repeater hash or b"", share 0..1)] most likely first."""
-        tab = self.mrpts.get(m.pub[:8])
+        return self.locations(m.pub[:8])
+
+    def locations(self, k8):
+        """Where a companion is: [(repeater hash or b"", share 0..1)] most likely first."""
+        tab = self.mrpts.get(k8)
         if not tab:
             return []
         now = now_s()
@@ -6796,6 +6893,7 @@ KAAS_MAX_CLIENTS = 16
 KAAS_QUEUE_MAX = 512                  # messages waiting for a slow client; past that the oldest are dropped (and counted)
 KAAS_MAX_MESSAGE = 4096               # largest message a client may send
 KAAS_MAX_INFLIGHT = 4                 # a client's sends waiting for the main loop
+KAAS_MAX_ROUTES = 5                   # route suggestions per request
 KAAS_AIR_WINDOW_S = 600               # the airtime cap is a share of this rolling window
 KAAS_PING_S = 30                      # websocket ping this often; nothing heard for 3 of these closes the connection
 KAAS_STATS = ("rx", "tx", "err")      # per key: packets streamed to it, packets it sent (accepted), errors it got
@@ -6899,6 +6997,23 @@ def ws_read(rf, max_len, masked=True, on_control=None):
         parts.append(data)
         if fin:
             return first, b"".join(parts)
+
+
+def kaas_endpoint(x):
+    """One end of a route request: ("key", bytes), ("repeater", 2-3 bytes) or ("name", str); None if it's none."""
+    if not isinstance(x, str):
+        return None
+    x = x.strip()
+    try:
+        b = bytes.fromhex(x)
+    except ValueError:
+        b = None
+    if b is not None and 8 <= len(b) <= 32:
+        return "key", b
+    if b is not None and 2 <= len(b) <= 3 and not x.startswith("@"):
+        return "repeater", b
+    n = kaas_mention_name(x)
+    return None if n is None else ("name", n)
 
 
 def kaas_mention_name(x):
@@ -7191,10 +7306,10 @@ class KaasHub:
             rid = None
         if t == "ping":
             return conn.send_json({"type": "pong", "id": rid})
-        if t in ("near", "routes"):
+        if t in ("near", "routes", "route"):
             return self.ask(conn, t, msg, rid)
         if t != "send":
-            return conn.send_json({"type": "error", "id": rid, "error": "unknown message type: use send, near, routes or ping"})
+            return conn.send_json({"type": "error", "id": rid, "error": "unknown message type: use send, near, routes, route or ping"})
 
         def drop(reason):
             self.stats["dropped"] += 1
@@ -7231,9 +7346,16 @@ class KaasHub:
             return err("node: its public key in hex (at least the first 8 bytes), or name: its advertised name")
         if t == "routes" and not 2 <= len(key) <= 32:
             return err("repeater: its public key in hex (at least the first 2 bytes)")
+        if t == "route":
+            key = (kaas_endpoint(msg.get("from")), kaas_endpoint(msg.get("to")))
+            for end, spec in zip(("from", "to"), key):
+                if spec is None:
+                    return err(end + ": a node's public key in hex (at least 8 bytes), its name or @[name], "
+                               "or a repeater's 2-byte id in hex")
         limit = msg.get("limit", 4 if t == "near" else 3)
-        if isinstance(limit, bool) or not isinstance(limit, int) or not 1 <= limit <= 10:
-            return err("limit: 1 to 10")
+        top = KAAS_MAX_ROUTES if t == "route" else 10
+        if isinstance(limit, bool) or not isinstance(limit, int) or not 1 <= limit <= top:
+            return err("limit: 1 to %d" % top)
         with conn.cv:
             if conn.inflight >= KAAS_MAX_INFLIGHT:
                 return err("too many requests waiting: wait for their answers")
@@ -7260,12 +7382,10 @@ class KaasHub:
                 conn.send_json({"type": "error", "id": rid, "error": "no node named %s has been heard" % key})
                 return
             key = k8
+        if t == "route":
+            return self.route(conn, key, limit, rid, name)
         if t == "near":
-            tab = r.mrpts.get(key[:8]) or {}
-            now = now_s()
-            ws = {k: fade(v[0], v[1], now, r.rhalf()) for k, v in tab.items()}
-            tot = sum(ws.values()) or 1.0
-            rows = sorted(((k, w / tot) for k, w in ws.items() if w > 0.01), key=lambda x: -x[1])[:limit]
+            rows = r.locations(key[:8])[:limit]
             nm = r.names.get(key[:8])
             # heard with no hops: by this radio itself, so name its virtual repeater (what relays for it), else the room
             here = ({"id": r.vr.pub[:2].hex(), "name": r.cfg.repeater_name} if r.vr is not None else
@@ -7283,6 +7403,31 @@ class KaasHub:
             rows.append({"path_len": rr.plen, "path": rr.path.hex(), "hops": [h.hex() for h in hops],
                          "names": [name(h) for h in hops], "confidence": round(conf, 3)})
         conn.send_json({"type": "routes_result", "id": rid, "repeater": target.hex(), "name": name(target), "routes": rows})
+
+    def route(self, conn, ends, limit, rid, name):
+        """route: suggested repeater chains from one node (or repeater) to another, through the links the room
+        has seen, best first and scored."""
+        r = self.room
+        sides = []
+        for spec in ends:
+            kind, v = spec
+            if kind == "repeater":
+                sides.append(({"repeater": v.hex(), "name": name(v)}, {v[:2]: 1.0}))
+                continue
+            k8 = r.node_by_name(v) if kind == "name" else v[:8]
+            if k8 is None:
+                return conn.send_json({"type": "error", "id": rid, "error": "no node named %s has been heard" % v})
+            nm = r.names.get(k8)
+            locs = dict(r.locations(k8))
+            if not locs:
+                return conn.send_json({"type": "error", "id": rid, "error": "no recent location for %s: it hasn't "
+                                       "flood-adverted lately" % (nm[1] if nm else k8.hex())})
+            sides.append(({"node": k8.hex(), "name": nm[1] if nm else None}, locs))
+        rows = []
+        for hops, score in r.suggest_routes(sides[0][1], sides[1][1], limit):
+            rows.append({"path_len": 0x40 | len(hops), "path": b"".join(hops).hex(), "hops": [h.hex() for h in hops],
+                         "names": [name(h) for h in hops], "score": round(score, 3)})
+        conn.send_json({"type": "route_result", "id": rid, "from": sides[0][0], "to": sides[1][0], "routes": rows})
 
     def own_keys(self):
         r = self.room

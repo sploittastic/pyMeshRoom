@@ -162,6 +162,28 @@ or id in hex; the first 2 bytes are enough. `limit` is 1 to 10, default 3.
 The repeater is the last hop. `path_len` and `path` go straight into a direct packet's header and path. Together the
 two answers give a route to a node you have no path for: send direct along the best route to the repeater that hears
 it most. A first hop that is this radio's own virtual repeater is dropped when the packet is sent, as the room does.
+
+**route**: suggested routes between any two nodes, not just from this radio. `from` and `to` are each a node's public
+key in hex (at least 8 bytes), its name or `@[name]`, or a repeater's 2-byte id. The room takes the repeaters near
+each end (as in `near`) and finds the best chains between them through the repeater links it has seen: links in the
+flood paths this radio heard, plus links the MQTT observers reported, faded over a day. `limit` is 1 to 5, default 3.
+
+```json
+{"type": "route", "id": "q3", "from": "a1b2c3d4e5f60718", "to": "@[platinum]"}
+{"type": "route_result", "id": "q3", "from": {"node": "a1b2c3d4e5f60718", "name": "Jeff"},
+ "to": {"node": "0f1e2d3c4b5a6978", "name": "platinum"},
+ "routes": [{"path_len": 67, "path": "a1a1b2b2d4d4", "hops": ["a1a1", "b2b2", "d4d4"],
+             "names": ["Hilltop", "Seaside", null], "score": 0.62},
+            {"path_len": 67, "path": "a1a1c3c3d4d4", "hops": ["a1a1", "c3c3", "d4d4"],
+             "names": ["Hilltop", "Ridge", null], "score": 0.19}]}
+```
+
+The path runs from the `from` end: its first hop is a repeater that hears the source, its last one a repeater the
+destination hears. `score` (0 to 1) is how likely the ends use those repeaters times each link's confidence. A link
+seen 3 times counts 0.88, once 0.5. Weak links (below 0 dB SNR) count for less, down to half at -15 dB. A link seen
+only in the other direction counts at half. Routes use 2-byte ids, at most 10 hops. This radio is a hop only while its
+virtual repeater relays. A node with no recent location (it hasn't flood-adverted lately) is an error, and so is an
+unknown name. An empty list means no chain of seen links joins the two ends.
 Bad input gets `{"type": "error", "id": ..., "error": ...}`. Questions share the 4-at-a-time limit with sends.
 
 ## Sending rules
