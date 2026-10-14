@@ -35,6 +35,7 @@ import math
 import os
 import queue
 import random
+import re
 import signal
 import sqlite3
 import struct
@@ -3717,6 +3718,13 @@ class RoomServer:
         self.names[k8] = (ts, name)
         self.mark_dirty()
 
+    def node_by_name(self, name):
+        """key8 of the node advertising this name (ignoring case). Several: the one with known repeaters, then the
+        newest advert."""
+        want = name.casefold()
+        hits = [k for k, (ts, nm) in self.names.items() if nm.strip().casefold() == want]
+        return max(hits, key=lambda k: (bool(self.mrpts.get(k)), self.names[k][0]), default=None)
+
     def dashboard_advert(self, flood):
         """The dashboard's advert buttons: the room's advert, and the virtual repeater's too when it's on."""
         self.send_advert(flood)
@@ -6893,6 +6901,17 @@ def ws_read(rf, max_len, masked=True, on_control=None):
             return first, b"".join(parts)
 
 
+def kaas_mention_name(x):
+    """A node name from a near request: "platinum" or the mention form "@[platinum]". None if it can't be a name."""
+    if not isinstance(x, str):
+        return None
+    x = x.strip()
+    m = re.fullmatch(r"@\[(.*)\]", x, re.S)
+    if m:
+        x = m.group(1).strip()
+    return x if 1 <= len(x.encode()) <= 32 else None
+
+
 class KaasConn:
     """One websocket client. Its HTTP thread reads; its own writer thread drains a bounded outbox, so a slow client
     never holds up the radio (past KAAS_QUEUE_MAX waiting, the oldest are dropped and the client is told how many)."""
@@ -7204,8 +7223,12 @@ class KaasHub:
             key = bytes.fromhex(str(msg.get("node" if t == "near" else "repeater", "")))
         except ValueError:
             key = b""
-        if t == "near" and not 8 <= len(key) <= 32:
-            return err("node: its public key in hex (at least the first 8 bytes)")
+        if t == "near" and "name" in msg and "node" not in msg:
+            key = kaas_mention_name(msg["name"])
+            if key is None:
+                return err("name: the node's advertised name, or a mention like @[name]")
+        elif t == "near" and not 8 <= len(key) <= 32:
+            return err("node: its public key in hex (at least the first 8 bytes), or name: its advertised name")
         if t == "routes" and not 2 <= len(key) <= 32:
             return err("repeater: its public key in hex (at least the first 2 bytes)")
         limit = msg.get("limit", 4 if t == "near" else 3)
@@ -7231,13 +7254,20 @@ class KaasHub:
         def name(h):
             hit = r.rpt_lookup(h)
             return hit[1]["name"] if hit and hit[1].get("name") else None
+        if t == "near" and isinstance(key, str):
+            k8 = r.node_by_name(key)
+            if k8 is None:
+                conn.send_json({"type": "error", "id": rid, "error": "no node named %s has been heard" % key})
+                return
+            key = k8
         if t == "near":
             tab = r.mrpts.get(key[:8]) or {}
             now = now_s()
             ws = {k: fade(v[0], v[1], now, r.rhalf()) for k, v in tab.items()}
             tot = sum(ws.values()) or 1.0
             rows = sorted(((k, w / tot) for k, w in ws.items() if w > 0.01), key=lambda x: -x[1])[:limit]
-            conn.send_json({"type": "near_result", "id": rid, "node": key.hex(),
+            nm = r.names.get(key[:8])
+            conn.send_json({"type": "near_result", "id": rid, "node": key.hex(), "name": nm[1] if nm else None,
                             "repeaters": [{"direct": True, "share": round(share, 3)} if h == b"" else
                                           {"id": h.hex(), "name": name(h), "share": round(share, 3)}
                                           for h, share in rows]})

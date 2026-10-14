@@ -133,11 +133,14 @@ radio, which is where your packets go out.
 
 **near**: which repeaters hear a node, meaning its first hop into the mesh, and each one's share. It is learned from
 the floods the radio hears from that node, faded over hours. At most 4 repeaters are kept per node. `node` is its
-public key in hex; the first 8 bytes are enough. `limit` is 1 to 10, default 4.
+public key in hex; the first 8 bytes are enough. Instead of `node` you can send `name`: the name the node
+advertises, plain or as a mention like `@[platinum]`, ignoring case. If several nodes advertise that name, the one
+with known repeaters wins, then the newest advert. An unheard name is an error. `limit` is 1 to 10, default 4.
 
 ```json
 {"type": "near", "id": "q1", "node": "a1b2c3d4e5f60718"}
-{"type": "near_result", "id": "q1", "node": "a1b2c3d4e5f60718",
+{"type": "near", "id": "q2", "name": "@[platinum]"}
+{"type": "near_result", "id": "q1", "node": "a1b2c3d4e5f60718", "name": "platinum",
  "repeaters": [{"id": "44c3", "name": "Seaside", "share": 0.62}, {"id": "55b2", "name": null, "share": 0.25},
                {"direct": true, "share": 0.13}]}
 ```

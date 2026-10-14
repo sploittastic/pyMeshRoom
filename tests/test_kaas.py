@@ -348,6 +348,12 @@ class RouteQueryTests(WebTestCase):
         self.assertEqual(self.h.run_client(lambda: c.routes("99aa")), [])
         with self.assertRaises(kc.RequestError):
             self.h.run_client(lambda: c.near("abcd"))
+        room.learn_name(os.urandom(32), 5, "Platinum")         # an older namesake nobody routes through
+        room.learn_name(node, 10, "Platinum")
+        for name in ("@[platinum]", "platinum", " @[ PLATINUM ] "):
+            self.assertEqual(self.h.run_client(lambda: c.near(name)), near)
+        with self.assertRaises(kc.RequestError):
+            self.h.run_client(lambda: c.near("@[nobody]"))
         c.close()
 
 

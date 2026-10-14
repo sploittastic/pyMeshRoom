@@ -18,6 +18,14 @@ def _hex(x):
     return x.hex() if isinstance(x, (bytes, bytearray)) else str(x)
 
 
+def _is_key(s):
+    """A public key (or at least its first 8 bytes) in hex, rather than a name."""
+    try:
+        return 8 <= len(bytes.fromhex(s)) <= 32
+    except ValueError:
+        return False
+
+
 class RequestError(Exception):
     """The server couldn't answer a request (the message says why)."""
 
@@ -98,8 +106,12 @@ class KaasClient:
     def near(self, node, limit=4, timeout=10.0):
         """The repeaters that hear a node (its first hop into the mesh), most first: a list of
         {"id": hex, "name", "share": 0..1}, or {"direct": True, "share"} when the server's radio hears it directly.
-        node: its public key (bytes or hex; the first 8 bytes are enough). Up to 4 are known per node."""
-        return self._request("near", timeout, node=_hex(node), limit=limit)["repeaters"]
+        node: its public key (bytes or hex; the first 8 bytes are enough), or its advertised name, plain or as a
+        mention like "@[platinum]" (ignoring case). Up to 4 are known per node."""
+        node = _hex(node)
+        if _is_key(node):
+            return self._request("near", timeout, node=node, limit=limit)["repeaters"]
+        return self._request("near", timeout, name=node, limit=limit)["repeaters"]
 
     def routes(self, repeater, limit=3, timeout=10.0):
         """The server's best routes to a repeater, best first: a list of {"path_len", "path" (hex), "hops", "names",
