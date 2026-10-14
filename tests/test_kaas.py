@@ -357,6 +357,45 @@ class RouteQueryTests(WebTestCase):
         c.close()
 
 
+class RouteSuggestTests(WebTestCase):
+    def test_route_between_two_nodes(self):
+        room = self.h.room
+        A, B, C, D, E = (bytes.fromhex(x) for x in ("a1a1", "b2b2", "c3c3", "d4d4", "e5e5"))
+        src, dst = os.urandom(32), os.urandom(32)
+        room.observe_near(src, A)
+        room.observe_near(dst, D)
+        room.learn_name(dst, 10, "Platinum")
+        now = mr.now_s()
+        room.edges.update({(A, B): [3.0, now, 5.0], (B, D): [3.0, now, 5.0],     # strong, both ways seen
+                           (A, C): [1.0, now, -12.0], (C, D): [1.0, now, None],  # weak, low SNR
+                           (E, D): [3.0, now, None]})                            # A -> E never seen
+        room.edges[(B, A)] = [3.0, now, None]
+        room.repeaters[B + os.urandom(30)] = dict(name="Seaside", lat=0, lon=0, adv_ts=0, last_advert=1)
+        room.build_rpt_index()
+        self.http("POST", "/api/login", {"password": "adminpw"})
+        c = kc.KaasClient(self.url, self.make_key(receive=False, send=True))
+        self.h.run_client(c.connect)
+        res = self.h.run_client(lambda: c.route(src, "@[platinum]"))
+        self.assertEqual(res["to"], {"node": dst[:8].hex(), "name": "Platinum"})
+        routes = res["routes"]
+        self.assertEqual([r["hops"] for r in routes], [["a1a1", "b2b2", "d4d4"], ["a1a1", "c3c3", "d4d4"]])
+        self.assertEqual(routes[0]["names"], [None, "Seaside", None])
+        self.assertEqual((routes[0]["path_len"], routes[0]["path"]), (0x43, "a1a1b2b2d4d4"))
+        self.assertGreater(routes[0]["score"], routes[1]["score"])
+        self.assertAlmostEqual(routes[0]["score"], (1 - 0.5 ** 3) ** 2, places=2)
+        self.assertEqual(len(self.h.run_client(lambda: c.route(src, dst, limit=1))["routes"]), 1)
+        # repeater ids work as ends; a link only seen the other way still counts, at half
+        res = self.h.run_client(lambda: c.route("d4d4", "a1a1"))
+        self.assertEqual(res["routes"][0]["hops"], ["d4d4", "b2b2", "a1a1"])
+        self.assertEqual(self.h.run_client(lambda: c.route("a1a1", "a1a1"))["routes"][0]["hops"], ["a1a1"])
+        for bad in (("@[nobody]", dst), (os.urandom(8), dst), (src, "zz")):
+            with self.assertRaises(kc.RequestError):
+                self.h.run_client(lambda: c.route(*bad))
+        with self.assertRaises(kc.RequestError):
+            self.h.run_client(lambda: c.route(src, dst, limit=6))
+        c.close()
+
+
 class ClientIdentityTests(unittest.TestCase):
     def test_identity_matches_the_server(self):
         seed = os.urandom(32)
