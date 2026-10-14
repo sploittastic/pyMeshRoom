@@ -7267,8 +7267,11 @@ class KaasHub:
             tot = sum(ws.values()) or 1.0
             rows = sorted(((k, w / tot) for k, w in ws.items() if w > 0.01), key=lambda x: -x[1])[:limit]
             nm = r.names.get(key[:8])
+            # heard with no hops: by this radio itself, so name its virtual repeater (what relays for it), else the room
+            here = ({"id": r.vr.pub[:2].hex(), "name": r.cfg.repeater_name} if r.vr is not None else
+                    {"id": r.id.pub_key[:2].hex(), "name": r.cfg.name})
             conn.send_json({"type": "near_result", "id": rid, "node": key.hex(), "name": nm[1] if nm else None,
-                            "repeaters": [{"direct": True, "share": round(share, 3)} if h == b"" else
+                            "repeaters": [dict(here, direct=True, share=round(share, 3)) if h == b"" else
                                           {"id": h.hex(), "name": name(h), "share": round(share, 3)}
                                           for h, share in rows]})
             return

@@ -142,10 +142,11 @@ with known repeaters wins, then the newest advert. An unheard name is an error. 
 {"type": "near", "id": "q2", "name": "@[platinum]"}
 {"type": "near_result", "id": "q1", "node": "a1b2c3d4e5f60718", "name": "platinum",
  "repeaters": [{"id": "44c3", "name": "Seaside", "share": 0.62}, {"id": "55b2", "name": null, "share": 0.25},
-               {"direct": true, "share": 0.13}]}
+               {"direct": true, "id": "9a1f", "name": "pyMeshRoom Virtual Repeater", "share": 0.13}]}
 ```
 
-`{"direct": true}` means this radio hears the node itself. An unknown node gets an empty list.
+`"direct": true` means this radio hears the node itself. Its `id` and `name` are then this radio's virtual repeater,
+which is what relays for that node, or the room when the virtual repeater is off. An unknown node gets an empty list.
 
 **routes**: the best known routes from this radio to a repeater, best first. They are learned from flood paths, and
 scored by how often each was seen and whether the room's pushes over it were delivered. `repeater` is its public key

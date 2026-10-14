@@ -195,7 +195,7 @@ components:
             items:
               type: object
               properties:
-                id: {type: string, description: "2-byte repeater id, hex (absent when direct)"}
+                id: {type: string, description: "2-byte repeater id, hex (when direct: this radio's virtual repeater, else the room)"}
                 name: {type: [string, "null"]}
                 direct: {type: boolean, description: this radio hears the node itself}
                 share: {type: number}
