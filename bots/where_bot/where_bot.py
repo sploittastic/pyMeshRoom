@@ -144,8 +144,22 @@ def handle(client, node, channel, sender, text):
     node.send_channel(channel, reply)
 
 
+def advertise(node, every_s, last):
+    """A flood advert if one is due (every_s after the last; 0 = never). Returns when the last one went."""
+    if every_s <= 0 or time.time() - last < every_s:
+        return last
+    try:
+        res = node.advert(flood=True)
+        log.info("flood advert: %s", res.status if res is not None else "sent")
+    except Exception as e:
+        log.warning("flood advert failed: %s", e)
+    return time.time()
+
+
 def run(cfg):
     ident = Identity(cfg["private_key"])
+    every_s = float(cfg.get("advert_hours", 12)) * 3600
+    last_advert = 0.0                       # (kept across reconnects, so a reconnect doesn't advert again)
     while True:
         client = KaasClient(cfg["api_endpoint"], cfg["api_key"])
         try:
@@ -159,6 +173,11 @@ def run(cfg):
         log.info("connected as %s (%s), listening on %s", cfg["name"], ident.pub[:4].hex(),
                  ", ".join(c.name for c in channels))
         node.on_channel(lambda ch, sender, text, ts: handle(client, node, ch, sender, text))
+        while True:                         # a flood advert now, then every advert_hours, while connected
+            last_advert = advertise(node, every_s, last_advert)
+            wait = every_s - (time.time() - last_advert) if every_s > 0 else None
+            if client.closed.wait(max(wait, 60) if wait is not None else None):
+                break
         log.info("connection closed: %s", client.wait())
         time.sleep(10)
 

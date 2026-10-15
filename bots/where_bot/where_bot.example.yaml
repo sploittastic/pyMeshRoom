@@ -6,3 +6,4 @@ api_key: kaas_...                    # a KaaS key with Receive and Send, from th
 channels:                            # hashtag channels to answer !where on
   - "#where"
   - "#bots"
+advert_hours: 12                     # a flood advert at startup and then this often (0 = never)

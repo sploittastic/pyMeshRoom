@@ -55,6 +55,24 @@ class ReplyTests(unittest.TestCase):
 
 
 @unittest.skipIf(wb is None, "needs pyyaml")
+class AdvertTests(unittest.TestCase):
+    def test_flood_advert_when_due(self):
+        sent = []
+
+        class FakeNode:
+            def advert(self, flood=False):
+                sent.append(flood)
+        node, day = FakeNode(), 12 * 3600
+        last = wb.advertise(node, day, 0.0)
+        self.assertEqual(sent, [True], "at startup")
+        self.assertEqual(wb.advertise(node, day, last), last, "not again before 12 hours")
+        self.assertGreater(wb.advertise(node, day, last - day), last - day)
+        self.assertEqual(sent, [True, True])
+        self.assertEqual(wb.advertise(node, 0, 0.0), 0.0, "advert_hours 0 never adverts")
+        self.assertEqual(len(sent), 2)
+
+
+@unittest.skipIf(wb is None, "needs pyyaml")
 class SuggestTests(unittest.TestCase):
     def test_parse(self):
         self.assertEqual(wb.parse_suggest("!suggest 5B98 to ec43"), ("5b98", "ec43"))
