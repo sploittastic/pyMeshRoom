@@ -47,4 +47,5 @@ cp where_bot.example.yaml where_bot.yaml     # then fill it in
 python3 where_bot.py where_bot.yaml
 ```
 
-The API key needs Receive and Send. The bot reconnects on its own if the connection drops.
+The bot sends a flood advert when it starts and every 12 hours after that (`advert_hours`, 0 to turn it off), so
+people's apps learn its name and key. The API key needs Receive and Send. The bot reconnects on its own if the connection drops.
