@@ -9,6 +9,7 @@ import logging
 import os
 import re
 import sys
+import threading
 import time
 
 import yaml
@@ -19,6 +20,7 @@ from meshroom_kaas import Identity, KaasClient, Node, RequestError  # noqa: E402
 log = logging.getLogger("where_bot")
 
 MAX_TEXT_LEN = 160          # a channel message, "BotName: " included
+MAX_ROOM_POST_LEN = 151     # a room post (rooms keep 9 bytes of a message for the author and timestamp)
 NAME_CUTS = (None, 20, 16, 12, 8, 0)   # if a reply is too long, repeater names are cut to these lengths in turn
 MIN_SHARE = 0.05            # repeaters heard less than this are left out
 KEY_SHOWN = 8               # hex characters of a public key in replies
@@ -111,37 +113,65 @@ def answer(kind, asked, result, budget):
         rpts = rpts[:-1]                    # they come most heard first
 
 
-def handle(client, node, channel, sender, text):
-    if sender == node.name:
-        return
-    budget = MAX_TEXT_LEN - len((node.name + ": ").encode())
+def respond(client, text, budget):
+    """The reply to a !where or !suggest, at most budget bytes, or None if the text is neither."""
     ends = parse_suggest(text)
     q = parse(text)
-    if ends is None and q is None:
-        return
     if ends is not None:
         try:
-            reply = suggest_answer(client.route(*ends, limit=5), budget)
+            return suggest_answer(client.route(*ends, limit=5), budget)
         except RequestError as e:
             log.warning("route %s -> %s failed: %s", ends[0], ends[1], e)
-            reply = "Sorry, I couldn't look that up just now"
-        log.info("%s %s: %s -> %s", channel.name, sender, text, reply)
-        node.send_channel(channel, reply)
-        return
+            return "Sorry, I couldn't look that up just now"
+    if q is None:
+        return None
     kind, arg = q
     if kind == "bad":
-        reply = arg
-    else:
+        return arg
+    try:
+        return answer(kind, arg, client.lookup(arg), budget)
+    except RequestError as e:
+        if kind != "key" and "no node named" in str(e):
+            return SHORT_KEY if kind == "name" and re.fullmatch(r"[0-9a-fA-F]+", arg) else UNKNOWN_NAME
+        log.warning("lookup %r failed: %s", arg, e)
+        return "Sorry, I couldn't look that up just now"
+
+
+def handle(client, node, channel, sender, text):
+    """A channel message: answered on the same channel ("BotName: " counts toward the message's length)."""
+    if sender == node.name:
+        return
+    reply = respond(client, text, MAX_TEXT_LEN - len((node.name + ": ").encode()))
+    if reply is not None:
+        log.info("%s %s: %s -> %s", channel.name, sender, text, reply)
+        node.send_channel(channel, reply)
+
+
+def handle_room(client, node, room, author, text):
+    """A room post: answered with a post in the same room. author: the first 4 bytes of the poster's key."""
+    if bytes(author) == node.id.pub[:4]:
+        return
+    reply = respond(client, text, MAX_ROOM_POST_LEN)
+    if reply is not None:
+        log.info("room %s %s: %s -> %s", room.name or room.pub[:4].hex(), bytes(author).hex(), text, reply)
+        if not room.post(reply):
+            log.warning("room %s didn't ACK the reply", room.name or room.pub[:4].hex())
+
+
+def join_rooms(client, node, rooms):
+    """Log in to each configured room; its posts then go to handle_room. key omitted: the room on the KaaS radio."""
+    joined = []
+    for spec in rooms:
+        key = spec.get("key") or client.hello["nodes"]["room"]
         try:
-            reply = answer(kind, arg, client.lookup(arg), budget)
-        except RequestError as e:
-            if kind != "key" and "no node named" in str(e):
-                reply = SHORT_KEY if kind == "name" and re.fullmatch(r"[0-9a-fA-F]+", arg) else UNKNOWN_NAME
-            else:
-                log.warning("lookup %r failed: %s", arg, e)
-                reply = "Sorry, I couldn't look that up just now"
-    log.info("%s %s: %s -> %s", channel.name, sender, text, reply)
-    node.send_channel(channel, reply)
+            room = node.join_room(key, str(spec.get("password", "")))
+        except Exception as e:
+            log.warning("couldn't join room %s: %s", key[:8], e)
+            continue
+        room.on_post(lambda r, author, text, ts: handle_room(client, node, r, author, text))
+        joined.append(room)
+        log.info("joined room %s", key[:8])
+    return joined
 
 
 def advertise(node, every_s, last):
@@ -173,6 +203,8 @@ def run(cfg):
         log.info("connected as %s (%s), listening on %s", cfg["name"], ident.pub[:4].hex(),
                  ", ".join(c.name for c in channels))
         node.on_channel(lambda ch, sender, text, ts: handle(client, node, ch, sender, text))
+        if cfg.get("rooms"):
+            threading.Thread(target=join_rooms, args=(client, node, cfg["rooms"]), daemon=True).start()
         while True:                         # a flood advert now, then every advert_hours, while connected
             last_advert = advertise(node, every_s, last_advert)
             wait = every_s - (time.time() - last_advert) if every_s > 0 else None
@@ -185,11 +217,15 @@ def run(cfg):
 def load_config(path):
     with open(path) as f:
         cfg = yaml.safe_load(f) or {}
-    missing = [k for k in ("name", "private_key", "api_endpoint", "api_key", "channels") if not cfg.get(k)]
+    missing = [k for k in ("name", "private_key", "api_endpoint", "api_key") if not cfg.get(k)]
+    if not cfg.get("channels") and not cfg.get("rooms"):
+        missing.append("channels or rooms")
     if missing:
         raise SystemExit("%s: missing %s" % (path, ", ".join(missing)))
-    if isinstance(cfg["channels"], str):
+    if isinstance(cfg.get("channels"), str):
         cfg["channels"] = [cfg["channels"]]
+    cfg["channels"] = cfg.get("channels") or []
+    cfg["rooms"] = [r if isinstance(r, dict) else {"key": str(r)} for r in (cfg.get("rooms") or [])]
     return cfg
 
 

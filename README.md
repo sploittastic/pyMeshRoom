@@ -116,7 +116,7 @@ The admin-only **Welcome DMs** card lets an operator enable or disable the first
 * Web dashboard, public to view with an admin login, and isolated so it can't slow the radio.
    * Members table: delivery score, current TX/RX routes, and up to 5 alternates each way.
    * Repeater map with links, and a detail pane for every repeater (key, position, routes, neighbors with SNR).
-   * Best-neighbor table: discovery every 15 minutes plus idle-time traces, ranked by packet loss, with SNR both ways.
+   * Best-neighbor table: discovery every 15 minutes plus idle-time traces, ranked by reliability (100% minus trace packet loss), with SNR both ways.
    * Stats: CPU and memory (now and 10-minute average), modem voltage, noise floor, channel use, packets/min, and pushes/min with delivery %.
    * Admin tools: resync, route suggestions with autocomplete, kick, ban/unban, and a chat box that posts as the room.
    * Messages: configurable welcome (with an advert reminder), plus kick/ban notices.
