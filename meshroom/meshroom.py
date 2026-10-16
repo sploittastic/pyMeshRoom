@@ -7703,7 +7703,7 @@ A key is shown once, when it is made: only a hash of it is kept, so a lost key c
 <div class="chatin"><input id="chatmsg" maxlength="400" placeholder="Message everyone in the room (sent as the room)" autocomplete="off">
 <span id="chatleft" class="dim small"></span><button id="chatsend" onclick="sendChat()">Send</button></div>
 <div id="chaterr" class="poor small"></div></div>
-<div class="card" id="bestcard"><h2>Best neighbour repeaters <span class="dim small">(by trace packet loss)</span></h2><table id="toplinks"></table></div>
+<div class="card" id="bestcard"><h2>Best neighbour repeaters <span class="dim small">(by trace reliability)</span></h2><table id="toplinks"></table></div>
 <div class="card" id="memberscard"><h2>Members <span class="hdesc">Room members &middot; tap a row for details</span></h2><table id="members"></table></div>
 <div class="card" id="suspendedcard"><h2>Suspended <span class="hdesc">Inactive members, will be returned to member list when they are heard on the mesh</span></h2><table id="suspended"></table></div>
 <div class="card" id="banscard"><h2>Banned <span class="hdesc">Room members who FAFO'd</span></h2><table id="bans"></table></div>
@@ -8036,9 +8036,9 @@ async function load(){
  }
  if(changed("toplinks",{t:st.top_links,d:st.discovery_min})){
  const TL=st.top_links||[], sn2=(a,b)=>`${a==null?"-":(a>0?"+":"")+a}<span class="dim"> / ${b==null?"-":(b>0?"+":"")+b}</span>`;
- $("toplinks").innerHTML=TL.length?"<tr><th>Repeater</th><th>Packet loss</th><th>SNR in (last / avg)</th><th>SNR out (last / avg)</th><th>Round trip</th><th>Last reply</th></tr>"+
+ $("toplinks").innerHTML=TL.length?"<tr><th>Repeater</th><th>Reliability</th><th>SNR in (last / avg)</th><th>SNR out (last / avg)</th><th>Round trip</th><th>Last reply</th></tr>"+
   TL.map(r=>{const c=r.loss==null?"dim":r.loss<=5?"good":r.loss<=20?"mid":"poor";
-   return `<tr><td>${esc(r.name)}</td><td>${r.virtual?'<span class="good">0%</span> <span class="dim small">same radio</span>':r.loss==null?'<span class="dim">not traced yet</span>':`<span class="${c}">${r.loss.toFixed(1)}%</span> <span class="dim small">${r.traces} trace${r.traces==1?"":"s"}${r.few?" &middot; few traces":""}</span>`}</td>`+
+   return `<tr><td>${esc(r.name)}</td><td>${r.virtual?'<span class="good">100%</span> <span class="dim small">same radio</span>':r.loss==null?'<span class="dim">not traced yet</span>':`<span class="${c}">${(100-r.loss).toFixed(1)}%</span> <span class="dim small">${r.traces} trace${r.traces==1?"":"s"}${r.few?" &middot; few traces":""}</span>`}</td>`+
    `<td>${sn2(r.in_last,r.in_avg)}</td><td>${sn2(r.out_last,r.out_avg)}</td><td>${r.rtt!=null?r.rtt+" ms":"-"}</td><td>${r.last_ok?ago(r.last_ok)+" ago":"never"}</td></tr>`}).join("")
   :`<tr><td class="dim">no neighbours yet: the room discovers its direct repeaters every ${st.discovery_min||15} minutes</td></tr>`;
  }

@@ -134,5 +134,31 @@ class WhereBotEndToEnd(WebTestCase):
         user_c.close()
 
 
+@unittest.skipIf(wb is None, "needs pyyaml")
+class WhereBotRoomTests(WebTestCase):
+    def test_where_in_a_room(self):
+        room = self.h.room
+        node = os.urandom(32)
+        for _ in range(3):
+            room.observe_near(node, bytes.fromhex("44c3"))
+        room.learn_name(node, 10, "platinum")
+        self.http("POST", "/api/login", {"password": "adminpw"})
+        token = self.make_key()
+        bot_c, user_c = kc.KaasClient(self.url, token), kc.KaasClient(self.url, token)
+        self.h.run_client(bot_c.connect)
+        self.h.run_client(user_c.connect)
+        bot = kc.Node(bot_c, kc.Identity.generate(), "WhereBot")
+        user = kc.Node(user_c, kc.Identity.generate(), "Jeff")
+        self.assertEqual(len(self.h.run_client(lambda: wb.join_rooms(bot_c, bot, [{"password": "hello"}]))), 1)
+        user_room = self.h.run_client(lambda: user.join_room(room.id.pub_key, "hello"))
+        posts = []
+        user_room.on_post(lambda r, author, text, ts: posts.append((bytes(author), text)))
+        self.assertTrue(self.h.run_client(lambda: user_room.post("!where @[platinum]")))
+        want = (bot.id.pub[:4], "platinum: recently active near:\n44c3 100%")
+        self.assertTrue(self.h.pump(lambda: want in posts, 30), posts)
+        bot_c.close()
+        user_c.close()
+
+
 if __name__ == "__main__":
     unittest.main()
