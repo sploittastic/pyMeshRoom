@@ -44,8 +44,14 @@ dropped, and only then are the least heard repeaters left out.
 ```
 pip install cryptography pyyaml
 cp where_bot.example.yaml where_bot.yaml     # then fill it in
-python3 where_bot.py where_bot.yaml
+python3 where_bot.py                         # or: python3 where_bot.py some_other.yaml
 ```
+
+With no argument it uses `where_bot.yaml` from the current directory, or else the one next to `where_bot.py`.
+
+To run it in the background, `./start-wherebot.sh` starts it with nohup (logging to `where_bot.log`, its pid in
+`where_bot.pid`, both in this directory) and `./stop-wherebot.sh` stops it. Both work from any directory, and
+`start-wherebot.sh` also takes a config path.
 
 It answers the same commands in rooms: list them under `rooms:` by public `key`, with their passwords. It joins
 only the rooms listed there (an entry without a `key` is skipped). It logs in on every connect and replies with a post, at most 151 bytes.
