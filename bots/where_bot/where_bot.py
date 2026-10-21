@@ -3,7 +3,7 @@
 hear that node, from the room's KaaS API.
 
     pip install cryptography pyyaml
-    python3 where_bot.py where_bot.yaml
+    python3 where_bot.py [where_bot.yaml]       # default: where_bot.yaml in the current directory, else next to this file
 """
 import logging
 import os
@@ -236,6 +236,13 @@ def load_config(path):
     return cfg
 
 
+def default_config_path():
+    """where_bot.yaml in the current directory if there is one, else the one next to this file."""
+    if os.path.exists("where_bot.yaml"):
+        return "where_bot.yaml"
+    return os.path.join(os.path.dirname(os.path.abspath(__file__)), "where_bot.yaml")
+
+
 if __name__ == "__main__":
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
-    run(load_config(sys.argv[1] if len(sys.argv) > 1 else "where_bot.yaml"))
+    run(load_config(sys.argv[1] if len(sys.argv) > 1 else default_config_path()))
