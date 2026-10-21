@@ -43,6 +43,14 @@ def free_port():
 
 
 class TenantSpecTests(unittest.TestCase):
+    def test_location(self):
+        self.assertEqual((spec()["lat"], spec()["lon"]), (0.0, 0.0))
+        s = spec(lat="37.7749", lon=" -122.4194 ")
+        self.assertEqual((s["lat"], s["lon"]), (37.7749, -122.4194))
+        for bad in (dict(lat="37"), dict(lat="91", lon="0"), dict(lat="x", lon="1")):
+            with self.assertRaises(ValueError):
+                spec(**bad)
+
     def test_off_by_default(self):
         self.assertEqual(DEFAULT_CONFIG["tenant_rooms"], [])
 
@@ -223,7 +231,7 @@ class TenantWebTests(unittest.TestCase):
         self.assertEqual(self.req(admin, "/api/login", dict(password="adminpw"))[0], 200)
         self.assertEqual(self.req(admin, "/api/tenants", dict(form, path="api"))[0], 400)
         self.assertEqual(self.req(admin, "/api/tenants", form)[0], 200)
-        self.assertEqual(self.req(admin, "/api/tenants", dict(form, name="Other", path="other"))[0], 200)
+        self.assertEqual(self.req(admin, "/api/tenants", dict(form, name="Other", path="other", lat="10", lon="20"))[0], 200)
         self.assertTrue(self.wait(lambda: len(room.tenants) == 2))
         t = room.web_tenants["hiking"]
         rows = json.loads(self.req(admin, "/api/tenants")[1])["rooms"]
@@ -249,6 +257,15 @@ class TenantWebTests(unittest.TestCase):
         self.assertEqual(self.req(tenant, "/api/chat", dict(text="x"))[0], 401)
         self.assertEqual(self.req(tenant, "/other/api/chat", dict(text="x"))[0], 401)
         self.assertEqual(self.req(other_tenant, "/hiking/api/chat", dict(text="x"))[0], 401)
+        # the main admin sets its location: saved, listed, and in its adverts
+        self.assertEqual(self.req(admin, "/api/tenants/%s/location" % t.key, dict(lat="45.5", lon="-122.6"))[0], 200)
+        self.assertEqual(self.req(admin, "/api/tenants/%s/location" % t.key, dict(lat="45.5"))[0], 400)
+        self.assertEqual(self.req(tenant, "/api/tenants/%s/location" % t.key, dict(lat="1", lon="1"))[0], 401)
+        self.assertTrue(self.wait(lambda: (t.cfg.lat, t.cfg.lon) == (45.5, -122.6)))
+        row = [r for r in json.loads(self.req(admin, "/api/tenants")[1])["rooms"] if r["path"] == "hiking"][0]
+        self.assertEqual((row["lat"], row["lon"]), (45.5, -122.6))
+        adv = t.make_advert().payload
+        self.assertEqual(struct.unpack_from("<ii", adv, 101), (45500000, -122600000))
         # the main admin may act on a tenant's page
         self.assertEqual(self.req(admin, "/hiking/api/advert", dict(flood=False))[0], 200)
         # reset the tenant's web password: its sessions end

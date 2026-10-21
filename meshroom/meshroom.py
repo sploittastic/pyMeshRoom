@@ -3376,6 +3376,8 @@ class RoomServer:
         tcfg = TenantConfig(self.cfg, store)
         for k in ("name", "path", "room_password", "admin_password", "web_password_hash"):
             tcfg.set(k, spec[k])
+        tcfg.set("lat", float(spec.get("lat") or 0.0))
+        tcfg.set("lon", float(spec.get("lon") or 0.0))
         tcfg.set("private_key", key.hex())
         t = TenantRoom(self, store, tcfg)
         t.next_zero_advert, t.next_flood_advert = time.monotonic() + 3, time.monotonic() + 10   # announce it now
@@ -3404,7 +3406,7 @@ class RoomServer:
         self.tenants_changed()
 
     def tenant_event(self, ev):
-        """t_create / t_delete / t_webpw from the main admin, t_act / t_say / t_advert from a tenant's page."""
+        """t_create / t_delete / t_webpw / t_loc from the main admin, t_act / t_say / t_advert from a tenant's page."""
         kind = ev[0]
         if kind == "t_create":
             return self.tenant_create(ev[1])
@@ -3416,6 +3418,13 @@ class RoomServer:
         elif kind == "t_webpw":
             t.cfg.set("web_password_hash", ev[2])
             log.info("tenant room %r: web UI password reset", t.cfg.name)
+        elif kind == "t_loc":
+            t.cfg.set("lat", ev[2])
+            t.cfg.set("lon", ev[3])
+            now = time.monotonic()                          # tell neighbours and the maps soon
+            t.next_zero_advert, t.next_flood_advert = min(t.next_zero_advert, now + 3), min(t.next_flood_advert, now + 10)
+            self.tenants_changed()
+            log.info("tenant room %r: location set to %s, %s", t.cfg.name, ev[2], ev[3])
         elif kind == "t_say":
             t.room_say(ev[2])
         elif kind == "t_advert":
@@ -6255,6 +6264,25 @@ def check_web_password(pw, stored):
     return hmac.compare_digest(got, h)
 
 
+def tenant_location(body):
+    """A tenant room's advertised position from the dashboard: (lat, lon), both blank = none (0, 0). Raises ValueError."""
+    def num(k, lim):
+        v = body.get(k)
+        if v is None or (isinstance(v, str) and not v.strip()):
+            return None
+        try:
+            f = float(v)
+        except (TypeError, ValueError):
+            raise ValueError("%s: a number" % k)
+        if not -lim <= f <= lim or f != f:
+            raise ValueError("%s: -%d to %d" % (k, lim, lim))
+        return round(f, 6)
+    lat, lon = num("lat", 90), num("lon", 180)
+    if (lat is None) != (lon is None):
+        raise ValueError("location: give both latitude and longitude, or neither")
+    return (lat or 0.0, lon or 0.0)
+
+
 def tenant_spec(body, taken_paths=(), taken_keys=()):
     """Dashboard 'create tenant room' form -> validated spec. The web password is hashed here (it never reaches the
     main loop or the database in the clear). Raises ValueError with a readable message."""
@@ -6289,6 +6317,7 @@ def tenant_spec(body, taken_paths=(), taken_keys=()):
     if len(wp) < 6:
         raise ValueError("web UI password: at least 6 characters")
     out["web_password_hash"] = hash_web_password(wp)
+    out["lat"], out["lon"] = tenant_location(body)
     return out
 
 
@@ -6481,6 +6510,7 @@ class TenantRoom(RoomServer):
 
     def admin_row(self):
         return dict(name=self.cfg.name, path=self.cfg.path, key=self.key, id=hexs(self.id.pub_key[:2]),
+                    lat=float(self.cfg.lat or 0.0), lon=float(self.cfg.lon or 0.0),
                     members=sum(1 for m in self.members.values() if not m.given_up),
                     suspended=sum(1 for m in self.members.values() if m.given_up),
                     posts=sum(1 for p in self.posts if p[3] is None))
@@ -7678,11 +7708,14 @@ Messages between the companion and this room or its repeater never go on the air
 <label>Private key <input id="tn_key" type="password" autocomplete="new-password" size="22" placeholder="blank = random"></label></div>
 <div class="rprow"><label>Join password <input id="tn_join" type="password" autocomplete="new-password" maxlength="15" size="12" placeholder="blank = open room"></label>
 <label>Admin password <input id="tn_admin" type="password" autocomplete="new-password" maxlength="15" size="12" placeholder="blank = no RF admin"></label>
-<label>Web UI password <input id="tn_web" type="password" autocomplete="new-password" size="12" placeholder="6+ characters"></label>
+<label>Web UI password <input id="tn_web" type="password" autocomplete="new-password" size="12" placeholder="6+ characters"></label></div>
+<div class="rprow"><label>Latitude <input id="tn_lat" size="10" placeholder="blank = none" autocomplete="off"></label>
+<label>Longitude <input id="tn_lon" size="10" placeholder="blank = none" autocomplete="off"></label>
 <button onclick="tnCreate(this)">Create</button><span id="tnmsg" class="small"></span></div>
 <div class="hint" style="margin-left:26px">If no private key is entered, one is generated randomly. Each room gets its own page at its path, where its
 admins (web UI password) see its members and the map, chat, advert, resync, suggest routes, kick and ban. The join and admin passwords are what
-people use from their MeshCore apps. Tenant rooms share this radio, its map and its airtime; nothing a tenant does reaches outside its room.</div>
+people use from their MeshCore apps. The location is what the room's adverts put on maps; change it later from the room's Actions.
+Tenant rooms share this radio, its map and its airtime; nothing a tenant does reaches outside its room.</div>
 <table id="tnlist" style="margin-top:8px"></table></div>
 <div class="card" id="kaascard" style="display:none"><h2>KaaS <span class="hdesc">KISS radio as an API service - useful for bots or other integrations</span></h2>
 <div class="rprow"><label><input id="kk_receive" type="checkbox" checked> Receive</label><label><input id="kk_send" type="checkbox"> Send</label>
@@ -7770,10 +7803,11 @@ async function loadTenants(){if(!MAINADM)return;try{const r=await fetch("api/ten
  $("tn_base").textContent=location.host+"/";
  const t=$("tnlist");if(!TN_ROWS.length){t.innerHTML='<tr><td class="dim">No tenant rooms yet.</td></tr>';return}
  if(t.querySelector("select:focus"))return;
- t.innerHTML="<tr><th>Room</th><th>Page</th><th>ID</th><th>Members</th><th>Suspended</th><th>Posts</th><th></th></tr>"+TN_ROWS.map(x=>
+ t.innerHTML="<tr><th>Room</th><th>Page</th><th>ID</th><th>Location</th><th>Members</th><th>Suspended</th><th>Posts</th><th></th></tr>"+TN_ROWS.map(x=>
   `<tr><td>${esc(x.name)}</td><td><a href="${encodeURI(x.path)}/" target="_blank">/${esc(x.path)}/</a></td><td class="mono4" title="${esc(x.key)}">${esc(x.id)}</td>`+
-  `<td>${x.members}</td><td>${x.suspended}</td><td>${x.posts}</td><td><select data-key="${esc(x.key)}" data-name="${esc(x.name)}" onchange="tnAction(this)">`+
-  `<option value="">Actions&hellip;</option><option value="pw">Reset web UI password</option><option value="del">Delete room</option></select></td></tr>`).join("")}
+  `<td>${x.lat||x.lon?x.lat.toFixed(5)+", "+x.lon.toFixed(5):'<span class="dim">none</span>'}</td>`+
+  `<td>${x.members}</td><td>${x.suspended}</td><td>${x.posts}</td><td><select data-key="${esc(x.key)}" data-name="${esc(x.name)}" data-loc="${x.lat||x.lon?x.lat+", "+x.lon:""}" onchange="tnAction(this)">`+
+  `<option value="">Actions&hellip;</option><option value="loc">Set location</option><option value="pw">Reset web UI password</option><option value="del">Delete room</option></select></td></tr>`).join("")}
 let KK_ROWS=[];
 async function loadKaas(){if(!MAINADM)return;let d;try{const r=await fetch("api/v1/kaas/keys");if(!r.ok)return;d=await r.json()}catch(e){return}
  KK_ROWS=d.keys||[];$("kk_url").textContent=(location.protocol==="https:"?"wss://":"ws://")+location.host+d.path;$("kk_burst").textContent=d.send_burst;$("kk_win").textContent=d.send_window_s;$("kk_air").textContent=d.airtime_pct;
@@ -7800,12 +7834,15 @@ async function kkRevoke(b){if(!confirm("Revoke the API key "+b.dataset.name+"? C
 async function tnPost(url,o){const r=await fetch(url,{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(o)});
  let m="";if(!r.ok){m="Failed";try{m=(await r.json()).error||m}catch(e){}}if(r.status===401){m="Your admin session has expired: log in again.";session()}return m}
 async function tnCreate(btn){const o={name:$("tn_name").value.trim(),path:$("tn_path").value.trim(),private_key:$("tn_key").value.trim(),
- room_password:$("tn_join").value,admin_password:$("tn_admin").value,web_password:$("tn_web").value};
+ room_password:$("tn_join").value,admin_password:$("tn_admin").value,web_password:$("tn_web").value,lat:$("tn_lat").value.trim(),lon:$("tn_lon").value.trim()};
  btn.disabled=true;const m=await tnPost("api/tenants",o);btn.disabled=false;
  $("tnmsg").className=m?"poor small":"good small";$("tnmsg").textContent=m?" "+m:" created: /"+o.path.toLowerCase()+"/";
- if(!m){["tn_name","tn_path","tn_key","tn_join","tn_admin","tn_web"].forEach(id=>$(id).value="");setTimeout(loadTenants,700)}}
+ if(!m){["tn_name","tn_path","tn_key","tn_join","tn_admin","tn_web","tn_lat","tn_lon"].forEach(id=>$(id).value="");setTimeout(loadTenants,700)}}
 async function tnAction(sel){const k=sel.dataset.key,n=sel.dataset.name,a=sel.value;sel.value="";if(!a)return;let m;
- if(a==="pw"){const pw=prompt("New web UI password for "+n+" (6+ characters). Anyone logged in to its page is logged out.");if(pw===null)return;
+ if(a==="loc"){const v=prompt("Location of "+n+" as latitude, longitude (e.g. 37.77490, -122.41940). Leave empty for none.",sel.dataset.loc);if(v===null)return;
+  const p=v.split(",").map(x=>x.trim());if(v.trim()&&p.length!==2){alert("Enter latitude, longitude separated by a comma.");return}
+  m=await tnPost("api/tenants/"+k+"/location",v.trim()?{lat:p[0],lon:p[1]}:{lat:"",lon:""});alert(m||"Location of "+n+" saved; it advertises it shortly.")}
+ else if(a==="pw"){const pw=prompt("New web UI password for "+n+" (6+ characters). Anyone logged in to its page is logged out.");if(pw===null)return;
   m=await tnPost("api/tenants/"+k+"/password",{web_password:pw});alert(m||"Web UI password for "+n+" reset.")}
  else if(a==="del"){if(!confirm("Delete the tenant room "+n+"? Its members, posts, settings and key are erased for good."))return;
   const pw=prompt("Your admin (web) password, to confirm deleting "+n+":");if(pw===null)return;
@@ -8567,6 +8604,16 @@ class WebUI:
                         return self._send(400, json.dumps({"error": str(e) or "bad request"}))
                     events.put(("t_create", spec))                  # created by the main loop
                     return self._send(200, json.dumps({"ok": True, "path": spec["path"]}))
+                if len(parts) == 4 and parts[:2] == ["api", "tenants"] and parts[3] == "location":
+                    key = parts[2].upper()
+                    if not any(x.key == key for x in room.web_tenants.values()):
+                        return self._send(404, '{"error":"no such tenant room"}')
+                    try:
+                        lat, lon = tenant_location(self._body() or {})
+                    except ValueError as e:
+                        return self._send(400, json.dumps({"error": str(e)}))
+                    events.put(("t_loc", key, lat, lon))
+                    return self._send(200, json.dumps({"ok": True, "lat": lat, "lon": lon}))
                 if len(parts) == 4 and parts[:2] == ["api", "tenants"] and parts[3] in ("delete", "password"):
                     key = parts[2].upper()
                     if not any(x.key == key for x in room.web_tenants.values()):
