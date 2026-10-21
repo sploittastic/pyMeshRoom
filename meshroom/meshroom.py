@@ -7336,7 +7336,9 @@ class KaasHub:
                 "nodes": {"room": hexs(room.id.pub_key),
                           "tenants": [hexs(t.id.pub_key) for t in list(room.tenants.values())],
                           "repeater": hexs(room.vr.pub) if room.vr is not None else None,
-                          "companion": hexs(room.vc.pub) if room.vc is not None else None}}
+                          "companion": hexs(room.vc.pub) if room.vc is not None else None},
+                "names": dict([(hexs(room.id.pub_key), room.cfg.name)] +
+                              [(hexs(t.id.pub_key), t.cfg.name) for t in list(room.tenants.values())])}
 
     def on_message(self, conn, msg):
         """A client's message (its reader thread). Sends go to the main loop; at most KAAS_MAX_INFLIGHT wait there."""
