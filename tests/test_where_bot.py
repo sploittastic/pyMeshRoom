@@ -149,7 +149,8 @@ class WhereBotRoomTests(WebTestCase):
         self.h.run_client(user_c.connect)
         bot = kc.Node(bot_c, kc.Identity.generate(), "WhereBot")
         user = kc.Node(user_c, kc.Identity.generate(), "Jeff")
-        twice = [{"password": "hello"}, {"key": room.id.pub_key.hex(), "password": "hello"}]   # the same room, listed twice
+        twice = [{"password": "hello"}, {"key": room.id.pub_key.hex(), "password": "hello"},   # no key: skipped
+                 {"key": room.id.pub_key.hex().upper(), "password": "hello"}]                # the same room, listed twice
         self.assertEqual(len(self.h.run_client(lambda: wb.join_rooms(bot_c, bot, twice))), 1)
         user_room = self.h.run_client(lambda: user.join_room(room.id.pub_key, "hello"))
         posts = []
