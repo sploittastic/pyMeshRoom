@@ -259,6 +259,7 @@ class EndToEndTests(WebTestCase):
         c = kc.KaasClient(self.url, token)
         hello = self.h.run_client(c.connect)
         self.assertEqual(hello["nodes"]["room"], mr.hexs(self.h.room.id.pub_key))
+        self.assertEqual(hello["names"], {mr.hexs(self.h.room.id.pub_key): self.h.room.cfg.name})
         self.assertFalse(hello["key"]["send"])
         got = []
         c.on_packet(got.append)

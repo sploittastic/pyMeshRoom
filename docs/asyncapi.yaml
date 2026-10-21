@@ -115,6 +115,10 @@ components:
               tenants: {type: array, items: {type: string}}
               repeater: {type: [string, "null"]}
               companion: {type: [string, "null"]}
+          names:
+            type: object
+            description: The room's and each tenant room's name, by public key (hex).
+            additionalProperties: {type: string}
     packet:
       summary: A packet the radio heard (rx) or sent (tx). Keys that may receive only.
       payload:

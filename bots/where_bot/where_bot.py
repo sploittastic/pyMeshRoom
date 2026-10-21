@@ -158,6 +158,17 @@ def handle_room(client, node, room, author, text):
             log.warning("room %s didn't ACK the reply", room.name or room.pub[:4].hex())
 
 
+def room_name(client, key):
+    """A room's name: from hello when it runs on the KaaS radio, else from the adverts the server has heard."""
+    name = {k.lower(): v for k, v in (client.hello.get("names") or {}).items()}.get(key.lower())
+    if name:
+        return name
+    try:
+        return client.lookup(key).get("name") or ""
+    except Exception:
+        return ""
+
+
 def join_rooms(client, node, rooms):
     """Log in to each room listed in the config (by its public key); its posts then go to handle_room."""
     joined, keys = [], set()
@@ -175,6 +186,8 @@ def join_rooms(client, node, rooms):
         except Exception as e:
             log.warning("couldn't join room %s: %s", key[:8], e)
             continue
+        if not room.name:                   # (until its next advert: the server's name for it, if it has one)
+            room.name = room_name(client, key)
         room.on_post(lambda r, author, text, ts: handle_room(client, node, r, author, text))
         joined.append(room)
         log.info("joined room %s (%s)", room.name or "?", key[:8])

@@ -74,10 +74,12 @@ Close codes from the server:
  "key": {"id": "3f2a9c1b", "receive": true, "send": true, "expires": null},
  "send_burst": 3, "send_window_s": 20, "airtime_pct": 5,
  "radio": {"freq_hz": 910525000, "bw_hz": 62500, "sf": 7, "cr": 5},
- "nodes": {"room": "<64 hex>", "tenants": [], "repeater": null, "companion": null}}
+ "nodes": {"room": "<64 hex>", "tenants": [], "repeater": null, "companion": null},
+ "names": {"<64 hex>": "My Room"}}
 ```
 
-`nodes` lists the public keys of the nodes running on this radio.
+`nodes` lists the public keys of the nodes running on this radio, and `names` gives the room's and each tenant room's
+name by public key.
 
 **packet**: one for every packet the radio hears (`"dir": "rx"`) or sends (`"dir": "tx"`). Keys that may receive only.
 
