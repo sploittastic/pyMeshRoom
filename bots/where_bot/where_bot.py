@@ -159,11 +159,14 @@ def handle_room(client, node, room, author, text):
 
 
 def join_rooms(client, node, rooms):
-    """Log in to each configured room; its posts then go to handle_room. key omitted: the room on the KaaS radio."""
+    """Log in to each room listed in the config (by its public key); its posts then go to handle_room."""
     joined, keys = [], set()
     for spec in rooms:
-        key = str(spec.get("key") or client.hello["nodes"]["room"]).strip().lower()
-        if key in keys:                     # (listed twice, e.g. by key and as the KaaS radio's room: one answer each post)
+        key = str(spec.get("key") or "").strip().lower()
+        if not key:
+            log.warning("a room in the config has no key: skipped (only rooms listed by key are joined)")
+            continue
+        if key in keys:                     # (listed twice: one answer each post)
             log.warning("room %s is listed more than once in the config: joined once", key[:8])
             continue
         keys.add(key)

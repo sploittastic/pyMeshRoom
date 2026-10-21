@@ -6,8 +6,7 @@ api_key: kaas_...                    # a KaaS key with Receive and Send, from th
 channels:                            # hashtag channels to answer !where on
   - "#where"
   - "#bots"
-rooms:                               # rooms to join and answer in (optional)
-  - password: room-password          # no key: the room on the KaaS radio
-#  - key: 0123abcd...                # another room server's public key, hex
+rooms:                               # rooms to join and answer in (optional); only these are joined
+#  - key: 0123abcd...                # the room server's public key, hex
 #    password: secret
 advert_hours: 12                     # a flood advert at startup and then this often (0 = never)

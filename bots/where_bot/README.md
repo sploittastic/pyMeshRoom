@@ -47,8 +47,8 @@ cp where_bot.example.yaml where_bot.yaml     # then fill it in
 python3 where_bot.py where_bot.yaml
 ```
 
-It answers the same commands in rooms: list them under `rooms:` with their passwords (a room without a `key` is
-the room on the KaaS radio). It logs in on every connect and replies with a post, at most 151 bytes.
+It answers the same commands in rooms: list them under `rooms:` by public `key`, with their passwords. It joins
+only the rooms listed there (an entry without a `key` is skipped). It logs in on every connect and replies with a post, at most 151 bytes.
 
 The bot sends a flood advert when it starts and every 12 hours after that (`advert_hours`, 0 to turn it off), so
 people's apps learn its name and key. The API key needs Receive and Send. The bot reconnects on its own if the connection drops.
