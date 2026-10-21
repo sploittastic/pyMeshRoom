@@ -149,13 +149,16 @@ class WhereBotRoomTests(WebTestCase):
         self.h.run_client(user_c.connect)
         bot = kc.Node(bot_c, kc.Identity.generate(), "WhereBot")
         user = kc.Node(user_c, kc.Identity.generate(), "Jeff")
-        self.assertEqual(len(self.h.run_client(lambda: wb.join_rooms(bot_c, bot, [{"password": "hello"}]))), 1)
+        twice = [{"password": "hello"}, {"key": room.id.pub_key.hex(), "password": "hello"}]   # the same room, listed twice
+        self.assertEqual(len(self.h.run_client(lambda: wb.join_rooms(bot_c, bot, twice))), 1)
         user_room = self.h.run_client(lambda: user.join_room(room.id.pub_key, "hello"))
         posts = []
         user_room.on_post(lambda r, author, text, ts: posts.append((bytes(author), text)))
         self.assertTrue(self.h.run_client(lambda: user_room.post("!where @[platinum]")))
         want = (bot.id.pub[:4], "platinum: recently active near:\n44c3 100%")
         self.assertTrue(self.h.pump(lambda: want in posts, 30), posts)
+        self.h.pump(lambda: posts.count(want) > 1, 3)
+        self.assertEqual(posts.count(want), 1)                     # answered once
         bot_c.close()
         user_c.close()
 
