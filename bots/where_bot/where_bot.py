@@ -160,9 +160,13 @@ def handle_room(client, node, room, author, text):
 
 def join_rooms(client, node, rooms):
     """Log in to each configured room; its posts then go to handle_room. key omitted: the room on the KaaS radio."""
-    joined = []
+    joined, keys = [], set()
     for spec in rooms:
-        key = spec.get("key") or client.hello["nodes"]["room"]
+        key = str(spec.get("key") or client.hello["nodes"]["room"]).strip().lower()
+        if key in keys:                     # (listed twice, e.g. by key and as the KaaS radio's room: one answer each post)
+            log.warning("room %s is listed more than once in the config: joined once", key[:8])
+            continue
+        keys.add(key)
         try:
             room = node.join_room(key, str(spec.get("password", "")))
         except Exception as e:
@@ -170,7 +174,7 @@ def join_rooms(client, node, rooms):
             continue
         room.on_post(lambda r, author, text, ts: handle_room(client, node, r, author, text))
         joined.append(room)
-        log.info("joined room %s", key[:8])
+        log.info("joined room %s (%s)", room.name or "?", key[:8])
     return joined
 
 
