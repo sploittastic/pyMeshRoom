@@ -218,6 +218,48 @@ class CompanionUnitTests(unittest.TestCase):
             self.assertEqual(st.queued(), [(qid, b"\x10frame")])
             st.close()
 
+    def test_a_busy_companion_port_is_refused(self):
+        first = mr.CompanionLink("127.0.0.1", 0, lambda ev: None, lambda ip: True)
+        try:
+            with self.assertRaises(OSError):                  # (on Windows SO_REUSEADDR let a second one share it)
+                mr.CompanionLink("127.0.0.1", first.port, lambda ev: None, lambda ip: True).stop()
+        finally:
+            first.stop()
+
+    def test_a_stalled_app_holds_a_send_up_for_three_seconds_at_most(self):
+        link = mr.CompanionLink("127.0.0.1", 0, lambda ev: None, lambda ip: True)
+        app = socket.create_connection(("127.0.0.1", link.port), timeout=2)
+        try:
+            for _ in range(200):
+                if link.client is not None:
+                    break
+                time.sleep(0.01)
+            if os.name == "nt":                               # a DWORD of milliseconds (it was 3 ms)
+                self.assertEqual(link.client.getsockopt(socket.SOL_SOCKET, socket.SO_SNDTIMEO), 3000)
+            else:
+                raw = link.client.getsockopt(socket.SOL_SOCKET, socket.SO_SNDTIMEO, struct.calcsize("ll"))
+                self.assertEqual(struct.unpack("ll", raw), (3, 0))
+        finally:
+            app.close()
+            link.stop()
+
+    def test_a_busy_dashboard_port_is_refused(self):
+        h = Harness(web_bind="127.0.0.1")
+        try:
+            with socket.socket() as s:
+                s.bind(("127.0.0.1", 0))
+                port = s.getsockname()[1]
+            h.cfg.set("web_port", port)
+            web = mr.WebUI(h.room, h.events)
+            try:
+                with self.assertRaises(OSError):
+                    mr.WebUI(h.room, h.events)
+            finally:
+                web.server.shutdown()
+                web.server.server_close()
+        finally:
+            h.close()
+
 
 class CompanionRoomTests(unittest.TestCase):
     def setUp(self):
