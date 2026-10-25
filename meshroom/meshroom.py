@@ -8780,6 +8780,7 @@ class WebUI:
 
         class Server(http.server.ThreadingHTTPServer):
             allow_reuse_address = os.name != "nt"           # (as CompanionLink: on Windows a busy port must refuse)
+            allow_reuse_port = False                        # never share the port, whatever this Python's default
 
             def handle_error(self, request, client_address):
                 # clients disconnecting early is routine: no traceback. Anything else is logged briefly.
