@@ -4932,8 +4932,9 @@ class CompanionLink:
         fam = socket.AF_INET6 if ":" in bind else socket.AF_INET
         self.sock = socket.socket(fam, socket.SOCK_STREAM)
         try:
-            self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-            self.sock.bind((bind, port))
+            if os.name != "nt":                             # (on Windows it would let a second server share a busy
+                self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)   # port silently; restarts work there
+            self.sock.bind((bind, port))                    #  without it)
             self.sock.listen(2)
         except OSError:
             self.sock.close()
@@ -4958,7 +4959,8 @@ class CompanionLink:
             try:
                 conn.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
                 conn.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
-                conn.setsockopt(socket.SOL_SOCKET, socket.SO_SNDTIMEO, struct.pack("ll", 3, 0))  # a stalled app can't block the room
+                conn.setsockopt(socket.SOL_SOCKET, socket.SO_SNDTIMEO,   # a stalled app can't block the room: 3 s
+                                3000 if os.name == "nt" else struct.pack("ll", 3, 0))   # (Windows: ms; else a timeval)
             except (OSError, struct.error):
                 pass
             with self.lock:
@@ -8777,6 +8779,9 @@ class WebUI:
                 self._send(404, '{"error":"not found"}')
 
         class Server(http.server.ThreadingHTTPServer):
+            allow_reuse_address = os.name != "nt"           # (as CompanionLink: on Windows a busy port must refuse)
+            allow_reuse_port = False                        # never share the port, whatever this Python's default
+
             def handle_error(self, request, client_address):
                 # clients disconnecting early is routine: no traceback. Anything else is logged briefly.
                 exc = sys.exc_info()[1]
