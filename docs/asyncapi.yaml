@@ -79,7 +79,10 @@ components:
   securitySchemes:
     apiKey:
       type: httpBearerToken
-      description: "Authorization: Bearer kaas_... (made on the dashboard's KaaS card; shown once)"
+      description: >
+        Authorization: Bearer kaas_... (made on the dashboard's KaaS card; shown once). Browsers, which can't send
+        that header on a websocket, POST it to /api/v1/kaas/ticket for {"ticket": "kt_...", "expires_in": 30} and
+        connect with ?ticket=kt_... instead (one connection, once).
   messages:
     hello:
       summary: First message after connecting.

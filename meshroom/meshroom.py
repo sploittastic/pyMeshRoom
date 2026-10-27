@@ -43,6 +43,7 @@ import struct
 import sys
 import threading
 import time
+import urllib.parse
 
 try:
     import serial
@@ -6926,6 +6927,9 @@ class ObserverFeed:
 
 KAAS_PATH = "/api/v1/kaas"
 KAAS_TOKEN_PREFIX = "kaas_"
+KAAS_TICKET_PREFIX = "kt_"
+KAAS_TICKET_S = 30                    # a websocket ticket (for browsers, which can't send Authorization) lasts this long
+KAAS_MAX_TICKETS = 64                 # tickets waiting to be used, across all keys
 KAAS_MAX_KEYS = 50
 KAAS_MAX_CLIENTS = 16
 KAAS_QUEUE_MAX = 512                  # messages waiting for a slow client; past that the oldest are dropped (and counted)
@@ -7193,6 +7197,7 @@ class KaasHub:
         self.air = collections.deque()      # (monotonic, airtime ms) of clients' transmissions: the shared cap
         self.stats = dict(rx=0, tx=0, sent=0, local=0, dropped=0)
         self.next_check = 0.0
+        self.tickets = {}                   # ticket -> (key id, monotonic expiry): each opens one websocket, once
         self.slock = threading.Lock()
         self.kstats = {}                    # key id -> {"total": [rx, tx, err], "hours": {hour: [rx, tx, err]}}
         self.kstats_path = os.path.join(room.cfg.data_dir, "kaas_stats.json")
@@ -7261,6 +7266,28 @@ class KaasHub:
             if hmac.compare_digest(str(k.get("hash", "")), h):
                 found = k
         return found
+
+    def new_ticket(self, key):
+        """A one-time ticket for a key, or None when too many are waiting. Browsers can't put Authorization on a
+        websocket, so they POST the key to /api/v1/kaas/ticket and open the websocket with ?ticket=. Any thread."""
+        import secrets
+        ticket = KAAS_TICKET_PREFIX + secrets.token_urlsafe(24)
+        now = time.monotonic()
+        with self.lock:
+            for t in [t for t, e in self.tickets.items() if e[1] <= now]:
+                del self.tickets[t]
+            if len(self.tickets) >= KAAS_MAX_TICKETS:
+                return None
+            self.tickets[ticket] = (key["id"], now + KAAS_TICKET_S)
+        return ticket
+
+    def redeem(self, ticket):
+        """The key a ticket was made for, or None (unknown, used or expired). A ticket works once."""
+        with self.lock:
+            e = self.tickets.pop(ticket, None)
+        if e is None or e[1] <= time.monotonic():
+            return None
+        return self.key_by_id(e[0])
 
     @staticmethod
     def valid(k, now=None):
@@ -8368,7 +8395,7 @@ class WebUI:
                 t = room.web_tenants.get(seg.split("?")[0]) if seg else None
                 return t, rest
 
-            def _send(self, code, body, ctype="application/json", cookie=None, gz=False, cache_s=0):
+            def _send(self, code, body, ctype="application/json", cookie=None, gz=False, cache_s=0, headers=None):
                 b = body if isinstance(body, bytes) else body.encode()
                 self.send_response(code)
                 self.send_header("Content-Type", ctype)
@@ -8381,6 +8408,8 @@ class WebUI:
                     self.send_header("Retry-After", "1")
                 if cookie:
                     self.send_header("Set-Cookie", cookie)
+                for k, v in (headers or {}).items():
+                    self.send_header(k, v)
                 self.end_headers()
                 try:
                     self.wfile.write(b)
@@ -8408,7 +8437,8 @@ class WebUI:
                     slots.release()
 
             def _kaas(self):
-                """KaaS: upgrade to a websocket for an API key (Authorization: Bearer ...), then stream packets."""
+                """KaaS: upgrade to a websocket for an API key (Authorization: Bearer ..., or a one-time ?ticket= from
+                POST /api/v1/kaas/ticket for browsers), then stream packets."""
                 hub = room.kaas
                 if (self.headers.get("Upgrade") or "").lower() != "websocket" or \
                         "upgrade" not in (self.headers.get("Connection") or "").lower():
@@ -8419,8 +8449,10 @@ class WebUI:
                 if not slots.acquire(blocking=False):
                     return self._send(503, '{"error":"busy"}')
                 try:
-                    auth = self.headers.get("Authorization") or ""
-                    key = hub.find(auth[7:].strip()) if auth[:7].lower() == "bearer " else None
+                    key = self._kaas_key()
+                    if key is None:
+                        ticket = urllib.parse.parse_qs(urllib.parse.urlsplit(self.path).query).get("ticket", [""])[0]
+                        key = hub.redeem(ticket) if ticket else None
                     if not hub.valid(key):
                         time.sleep(1.0)                     # slow down guessing
                         return self._send(401, '{"error":"missing, unknown, revoked or expired API key"}')
@@ -8440,6 +8472,34 @@ class WebUI:
                 log.info("API client %s connected (key %s)", self.client_address[0], key["id"])
                 conn.run()
                 log.info("API client %s disconnected (key %s)", self.client_address[0], key["id"])
+
+            def _kaas_key(self):
+                auth = self.headers.get("Authorization") or ""
+                return room.kaas.find(auth[7:].strip()) if auth[:7].lower() == "bearer " else None
+
+            def _kaas_ticket(self):
+                """POST /api/v1/kaas/ticket with Authorization: Bearer: a one-time websocket ticket for a browser.
+                No cookies are involved, so any origin may ask (CORS: *); the key is the credential."""
+                cors = {"Access-Control-Allow-Origin": "*"}
+                self._body()                                # (any body is ignored, but read: the connection stays in step)
+                key = self._kaas_key()
+                if not room.kaas.valid(key):
+                    time.sleep(1.0)                         # slow down guessing
+                    return self._send(401, '{"error":"missing, unknown, revoked or expired API key"}', headers=cors)
+                ticket = room.kaas.new_ticket(key)
+                if ticket is None:
+                    return self._send(503, '{"error":"too many tickets waiting: try again shortly"}', headers=cors)
+                return self._send(200, json.dumps({"ticket": ticket, "expires_in": KAAS_TICKET_S}), headers=cors)
+
+            def do_OPTIONS(self):
+                """CORS preflight, for the ticket endpoint only."""
+                if self.path.split("?")[0] != KAAS_PATH + "/ticket":
+                    return self._send(404, '{"error":"not found"}')
+                self._send(204, b"", headers={"Access-Control-Allow-Origin": "*",
+                                              "Access-Control-Allow-Methods": "POST",
+                                              "Access-Control-Allow-Headers": "Authorization, Content-Type",
+                                              "Access-Control-Allow-Private-Network": "true",
+                                              "Access-Control-Max-Age": "600"})
 
             def _get(self):
                 t, rest = self._tenant_of()
@@ -8556,6 +8616,8 @@ class WebUI:
                 t, rest = self._tenant_of()
                 if t is not None:
                     return self._tenant(t, "/" + rest, True)
+                if self.path.split("?")[0] == KAAS_PATH + "/ticket":
+                    return self._kaas_ticket()
                 parts = self.path.strip("/").split("/")
                 if parts == ["api", "login"]:
                     if not cfg.web_password:

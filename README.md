@@ -461,6 +461,8 @@ card lists every key with its last use, live connections, and packets received, 
 total), and **Revoke** disconnects a key's clients at once.
 
 * Protocol: [docs/api.md](docs/api.md), and [docs/asyncapi.yaml](docs/asyncapi.yaml) for tools.
+* Browsers trade the key for a one-time websocket ticket at `/api/v1/kaas/ticket`, since they can't send the
+  `Authorization` header on a websocket.
 * Python client: [client/](client/README.md). It works with raw packets, or as a full chat node: adverts, contacts,
   DMs, hashtag and private channels, and joining rooms.
 

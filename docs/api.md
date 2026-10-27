@@ -50,6 +50,30 @@ Connect to `ws://<server>:<web_port>/api/v1/kaas`, on the dashboard's port. The 
 clients connect over the internet, put pyMeshRoom behind an HTTPS reverse proxy that passes websocket upgrades and
 use `wss://`. Otherwise the key travels unencrypted.
 
+### From a browser
+
+A browser can't put an `Authorization` header on a websocket, so it trades the key for a one-time ticket first:
+
+```
+POST /api/v1/kaas/ticket HTTP/1.1
+Authorization: Bearer kaas_...
+```
+
+```json
+{"ticket": "kt_...", "expires_in": 30}
+```
+
+Then it connects to `wss://<server>/api/v1/kaas?ticket=kt_...` with no header. A ticket opens one connection, within
+30 seconds, as the key it was made for; ask for a new one to reconnect. A missing, unknown, revoked or expired key gets
+401 after a one-second delay, and 503 means too many tickets are waiting (at most 64). The ticket endpoint answers
+CORS preflights for any origin: no cookies are involved, so the key itself is the only credential. Use it over HTTPS.
+
+```js
+const r = await fetch("https://meshroom.example/api/v1/kaas/ticket", {method: "POST", headers: {Authorization: "Bearer " + key}});
+const {ticket} = await r.json();
+const ws = new WebSocket("wss://meshroom.example/api/v1/kaas?ticket=" + encodeURIComponent(ticket));
+```
+
 Failed handshakes return:
 
 * 401: missing, unknown, revoked or expired key, after a one-second delay.
@@ -219,7 +243,7 @@ Bad input gets `{"type": "error", "id": ..., "error": ...}`. Questions share the
 
 Anything that speaks websockets and JSON works. In Python, use the [client](../client/README.md). Otherwise:
 
-1. Connect with the `Authorization` header and read `hello`.
+1. Connect with the `Authorization` header (or, from a browser, a ticket) and read `hello`.
 2. For each `packet`, decode `raw` and de-duplicate on `hash`.
 3. Send `{"type": "send", "raw": ...}` and match `send_result` by `id`.
 
