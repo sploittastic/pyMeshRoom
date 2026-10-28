@@ -96,7 +96,9 @@ answers `{"outcome": ...}`, kept for 5 minutes:
 | `connected` | It opened. |
 | `unknown` | No such ticket (or the server restarted). |
 
-A challenge works once. The host must be one of this server's own names: its address as the connection reached it
+A challenge works once and lasts 60 s; it's signed by the server rather than stored, so asking for any number of them
+uses nothing up. A login makes a one-time ticket (at most 4 waiting per key). The host must be one of this server's
+own names: its address as the connection reached it
 (`ip:port`), or a name listed in `web_hosts`: a domain, or the name a reverse proxy serves it under. The request's
 `Host` or `X-Forwarded-Host` header alone never counts, so another server can't pass its visitors' logins on to this
 one. A login signed for any other name answers 401, and the name is listed on the **Web users** card (the last ten),
@@ -175,6 +177,9 @@ The admin can also set a **page password** on the card (`web_page_password`, sto
 Failed handshakes return:
 
 * 401: missing, unknown, revoked or expired key or ticket, after a one-second delay.
+* 429: too many failed attempts from this address (20 wrong passwords, keys or tickets in 10 minutes); it lifts as
+  they age. Behind a proxy on a private address, the address counted is the one in `X-Forwarded-For`. The dashboard's
+  POSTs answer the same way.
 * 426: not a websocket upgrade (a proxy may have dropped the `Upgrade` and `Connection` headers).
 * 503: too many clients. The limit is 16 connections across all API keys, and `web_max_clients` (32) web sessions on
   top of that.
@@ -290,7 +295,10 @@ their own posts.)
 ### Route questions
 
 Any key may ask these. They come from what the room has learned of the mesh. The answers are routes from this
-radio, which is where your packets go out.
+radio, which is where your packets go out. The radio's main loop answers them, so each key has a budget across its
+connections: 4 `nodes` a minute, and 30 of the others (`near`, `routes`, `route`) a minute; past it, an error says
+so. A web session's `nodes` reaches back at most 31 days. Route answers use a picture of the mesh's links up to 30 s
+old.
 
 **near**: which repeaters hear a node, meaning its first hop into the mesh, and each one's share. It is learned from
 the floods the radio hears from that node, faded over hours. At most 4 repeaters are kept per node. `node` is its

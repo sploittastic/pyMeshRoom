@@ -123,6 +123,176 @@ class HardeningTests(WebHelpers):
         for t in ts:
             t.join()
 
+    def ask(self, c, msg):
+        c.ws.send_text(json.dumps(msg))
+        got = lambda: next((m for m in c.msgs if m.get("id") == msg["id"]), None)
+        self.assertTrue(self.h.pump(lambda: got() is not None, 10), c.msgs)
+        return got()
+
+    def test_query_budget(self):
+        """Queries are answered by the radio's main loop: each key gets a budget, shared by its connections."""
+        self.enable()
+        me = kc.Identity.generate()
+        c = self.connect(self.login(me)[1]["ticket"])
+        self.assertIn("at most 31", self.ask(c, {"type": "nodes", "id": 0, "days": 365})["error"])
+        for i in range(1, 4):
+            self.assertEqual(self.ask(c, {"type": "nodes", "id": i, "days": 7})["type"], "nodes_result")
+        other = self.connect(self.login(me)[1]["ticket"])                         # (the same key, another tab)
+        self.assertEqual(self.ask(other, {"type": "nodes", "id": 9, "days": 7})["type"], "nodes_result")
+        self.assertIn("at most 4 a minute", self.ask(c, {"type": "nodes", "id": 10, "days": 7})["error"])
+        for i in range(11, 41):
+            self.ask(c, {"type": "routes", "id": i, "repeater": "a1a1"})
+        self.assertIn("at most 30 a minute", self.ask(c, {"type": "routes", "id": 41, "repeater": "a1a1"})["error"])
+        fresh = self.connect(self.login(kc.Identity.generate())[1]["ticket"])     # another key: its own budget
+        self.assertEqual(self.ask(fresh, {"type": "nodes", "id": 1, "days": 7})["type"], "nodes_result")
+
+    def test_challenges_cant_be_used_up_or_reused(self):
+        self.enable()
+        for _ in range(600):                                                       # (the old pool held 256)
+            code, d = self.post("/api/v1/web/challenge")
+        self.assertEqual(code, 200)
+        me = kc.Identity.generate()
+        msg = mr.web_login_message(self.host, d["challenge"], me.pub.hex())
+        body = dict(pub=me.pub.hex(), signature=me.sign(msg).hex(), challenge=d["challenge"], host=self.host)
+        self.assertEqual(self.post("/api/v1/web/login", body)[0], 200)
+        self.assertIn("used already", self.post("/api/v1/web/login", body)[1]["error"])
+        hub = self.h.room.kaas
+        forged = d["challenge"][:-4] + ("AAAA" if not d["challenge"].endswith("AAAA") else "BBBB")
+        self.assertIsNone(hub.challenge_expiry(forged))
+        old = struct.pack(">Q", int(time.time()) - 1) + bytes(12)
+        stale = mr.WEB_CHALLENGE_PREFIX + __import__("base64").urlsafe_b64encode(
+            old + __import__("hmac").new(hub.challenge_key, old, "sha256").digest()[:16]).rstrip(b"=").decode()
+        self.assertIsNone(hub.challenge_expiry(stale))
+
+    def test_tickets_per_key(self):
+        self.enable()
+        me = kc.Identity.generate()
+        codes = [self.login(me)[0] for _ in range(mr.KAAS_TICKETS_PER_KEY + 1)]
+        self.assertEqual(codes, [200] * mr.KAAS_TICKETS_PER_KEY + [503])
+        self.assertEqual(self.login(kc.Identity.generate())[0], 200)                 # another key isn't affected
+
+    def test_an_address_with_many_failures_is_locked_out(self):
+        """Counted per address; behind a proxy (a private address) per the address it forwarded for."""
+        def wrong(addr):
+            req = urllib.request.Request(self.base + "/api/login", data=b'{"password":"nope"}', method="POST",
+                                         headers={"Content-Type": "application/json", "X-Forwarded-For": addr})
+            try:
+                urllib.request.urlopen(req, timeout=10)
+            except urllib.error.HTTPError as e:
+                return e.code
+        ts = [threading.Thread(target=wrong, args=("203.0.113.9",)) for _ in range(mr.FAIL_LIMIT)]
+        for t in ts:
+            t.start()
+        for t in ts:
+            t.join()
+        self.assertEqual(wrong("203.0.113.9"), 429)
+        self.assertEqual(wrong("198.51.100.7"), 401)                                # someone else behind the proxy
+
+    def test_stats_of_forgotten_web_keys_are_pruned(self):
+        hub = self.h.room.kaas
+        hub.kstats[mr.WEB_ID_PREFIX + "ab" * 32] = {"total": [1, 0, 0], "hours": {}}
+        hub.kstats_dirty = True
+        hub.save_stats()
+        self.assertNotIn(mr.WEB_ID_PREFIX + "ab" * 32, hub.kstats)
+
+
+class RepeaterTableTests(unittest.TestCase):
+    def test_capped_keeping_the_recent_and_our_own(self):
+        ours = b"\x01" * 32
+        t = mr.RepeaterTable(lambda pub: pub == ours)
+        t[ours] = dict(last_advert=0)
+        for i in range(mr.REPEATERS_MAX + 500):
+            t[i.to_bytes(32, "big")] = dict(last_advert=1000 + i)
+        self.assertLessEqual(len(t), mr.REPEATERS_MAX)
+        self.assertIn(ours, t)                                                     # (its advert is the oldest)
+        newest = (mr.REPEATERS_MAX + 499).to_bytes(32, "big")
+        self.assertIn(newest, t)
+        self.assertNotIn((0).to_bytes(32, "big"), t)
+        t[newest] = dict(last_advert=5)                                            # (an update isn't an addition)
+        self.assertIn(newest, t)
+
+
+class CompanionHardeningTests(unittest.TestCase):
+    """The virtual companion's port has no login (a trusted LAN only), but what reaches it can't forge the node's
+    adverts, stall the radio's main loop, or make the radio flood the mesh."""
+
+    def setUp(self):
+        from test_virtual_companion import Harness, RawClient
+        self.h, self.Raw = Harness(companion_enabled=True, room_password=""), RawClient
+        self.vc = self.h.room.vc
+
+    def tearDown(self):
+        self.h.close()
+
+    def sign(self, c, data):
+        c.call(bytes([mr.CMD_SIGN_START]), mr.RESP_SIGN_START)
+        c.call(bytes([mr.CMD_SIGN_DATA]) + data, mr.RESP_OK, mr.RESP_ERR)
+        return c.call(bytes([mr.CMD_SIGN_FINISH]), mr.RESP_SIGNATURE, mr.RESP_ERR)
+
+    def test_wont_sign_an_advert_or_a_web_login(self):
+        def client():
+            c = self.Raw(self.h.port)
+            self.assertEqual(self.sign(c, b"anything else")[0], mr.RESP_SIGNATURE)
+            advert = self.vc.pub + struct.pack("<I", int(time.time()) + 315360000) + bytes([0x82]) + b"PWNED"
+            self.assertEqual(self.sign(c, advert)[0], mr.RESP_ERR)
+            login = mr.web_login_message("mesh.example.com", "wc_x", self.vc.pub.hex())
+            self.assertEqual(self.sign(c, login)[0], mr.RESP_ERR)
+            c.close()
+        self.h.run_client(client)
+
+    def test_transmissions_are_budgeted(self):
+        def client():
+            c = self.Raw(self.h.port)
+            self.assertEqual(c.call(bytes([mr.CMD_SEND_SELF_ADVERT, 1]), mr.RESP_OK, mr.RESP_ERR)[0], mr.RESP_OK)
+            self.assertEqual(c.call(bytes([mr.CMD_SEND_SELF_ADVERT, 1]), mr.RESP_OK, mr.RESP_ERR)[0], mr.RESP_ERR)
+            sent = [c.call(bytes([mr.CMD_SEND_CHANNEL_TXT_MSG, 0, 0]) + struct.pack("<I", int(time.time())) + b"hi %d" % i,
+                           mr.RESP_OK, mr.RESP_ERR)[0] for i in range(mr.VC_TX_BURST + 3)]
+            self.assertEqual(sent.count(mr.RESP_OK), mr.VC_TX_BURST - 1)            # (the advert took one)
+            c.close()
+        self.h.run_client(client)
+
+    def test_an_app_that_doesnt_read_is_dropped_not_waited_for(self):
+        """Replies are queued for a writer thread: the main loop never waits on the app's socket."""
+        sock = socket.socket()
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 2048)
+        sock.connect(("127.0.0.1", self.h.port))
+        frame = b"<" + struct.pack("<H", 2) + bytes([mr.CMD_DEVICE_QUERY, 3])
+        t0 = time.monotonic()
+
+        def flood():
+            try:
+                sock.sendall(frame * 40000)               # ...and never read a reply (past what socket buffers hold)
+            except OSError:
+                pass
+        threading.Thread(target=flood, daemon=True).start()
+        longest = [0.0]
+        end = time.monotonic() + 40
+        while time.monotonic() < end and (self.vc.link.client is not None or time.monotonic() - t0 < 1):
+            a = time.monotonic()
+            self.h.pump(lambda: False, 0.05)
+            longest[0] = max(longest[0], time.monotonic() - a)
+        self.assertIsNone(self.vc.link.client)                                      # dropped...
+        self.assertLess(longest[0], 1.0)                                            # ...with no main-loop stall
+        sock.close()
+
+    def test_name_and_position_changes_dont_rewrite_the_config_each_time(self):
+        saves = []
+        real = self.h.cfg.save
+        self.h.cfg.save = lambda: (saves.append(1), real())[1]
+
+        def client():
+            c = self.Raw(self.h.port)
+            for i in range(50):
+                c.call(bytes([mr.CMD_SET_ADVERT_NAME]) + b"Name %d" % i, mr.RESP_OK)
+                c.call(bytes([mr.CMD_SET_ADVERT_LATLON]) + struct.pack("<ii", i, i), mr.RESP_OK)
+            c.close()
+        self.h.run_client(client)
+        self.assertLessEqual(len(saves), 2)
+        self.assertEqual(self.h.cfg.companion_name, "Name 49")
+        self.h.room.vc.close()                                                      # (closing saves what's pending)
+        self.assertEqual(mr.Config(self.h.cfg.path).data["companion_name"], "Name 49")
+        self.h.room.vc = None
+
 
 if __name__ == "__main__":
     unittest.main()

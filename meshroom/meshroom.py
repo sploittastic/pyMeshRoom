@@ -25,6 +25,7 @@ import hashlib
 import heapq
 import itertools
 import hmac
+import ipaddress
 import collections
 import gzip
 import json
@@ -198,7 +199,29 @@ DASHBOARD_HEADERS = {
 
 HTTP_TIMEOUT_S = 30                   # a dashboard / API connection idle (or trickling) this long is closed
 HTTP_MAX_BODY = 64 * 1024             # a request body larger than this is refused (413)
+FAIL_LIMIT = 20                       # wrong passwords / keys / tickets from one address within FAIL_WINDOW_S...
+FAIL_WINDOW_S = 600                   # ...and its POSTs and websockets get 429 until the oldest is this old
 HTTP_MAX_THREADS = 400                # connections beyond this many threads in the process are closed at once
+
+REPEATERS_MAX = 2000                  # repeaters known by key (heard, or from MQTT): beyond it the longest silent go
+
+
+class RepeaterTable(dict):
+    """The repeater table: adding a new one past REPEATERS_MAX drops the tenth that advertised longest ago (never the
+    one keep() says is ours), so neither the air nor an MQTT feed can grow it without end."""
+
+    def __init__(self, keep):
+        super().__init__()
+        self.keep = keep
+
+    def __setitem__(self, k, v):
+        new = k not in self
+        super().__setitem__(k, v)
+        if new and len(self) > REPEATERS_MAX:
+            old = sorted((r.get("last_advert") or 0, pub) for pub, r in self.items() if pub != k and not self.keep(pub))
+            for _, pub in old[:len(self) - REPEATERS_MAX + REPEATERS_MAX // 10]:
+                del self[pub]
+
 
 RETIRED_SETTINGS = {"web_trust_observers"}   # settings older versions had: ignored quietly
 
@@ -243,7 +266,8 @@ class Config:
         except KeyError:
             raise AttributeError(k)
 
-    def set(self, k, v):
+    def set(self, k, v, save=True):
+        """Change a setting, and write the file (unless save=False: the caller saves later, see save())."""
         self.data[k] = v
         sec = self.where.get(k)
         if sec is not None and isinstance(self.layout.get(sec), dict):
@@ -251,7 +275,8 @@ class Config:
         else:
             self.layout[k] = v
             self.where[k] = None
-        self.save()
+        if save:
+            self.save()
 
     def save(self):
         tmp = self.path + ".tmp"
@@ -1301,7 +1326,8 @@ class RoomServer:
         self.rroutes = {}                 # target hash -> {(plen, path): RptRoute}
         self.mrpts = {}                   # companion directory, locations: key8 -> {repeater hash (b"" = direct): [w, t]}
         self.edges = {}                   # (a_hash, b_hash) -> [w, t, snr]   b"" = the room
-        self.repeaters = {}               # repeater pubkey -> dict(name, lat, lon, adv_ts, last_advert)
+        self.repeaters = RepeaterTable(lambda pub: self.vr is not None and pub == self.vr.pub)
+        #                                   repeater pubkey -> dict(name, lat, lon, adv_ts, last_advert), at most REPEATERS_MAX
         self.nodes = {}                   # pubkey -> dict(type, name, lat, lon, adv_ts, rf, obs): every node heard
         self.nodes_dirty, self.nodes_gone = set(), set()     # advertising; rf/obs: when, by this radio / an observer
         self.heard = {}                   # repeater hash -> dict(last, w, t, last_direct, snr)
@@ -2616,6 +2642,15 @@ class RoomServer:
         return scored[:n]
 
     def link_graph(self):
+        """link_graph_build(), at most every LINK_GRAPH_TTL_S: rebuilding it on every route question cost tens of ms,
+        and its weights fade over hours (callers only read it)."""
+        now = time.monotonic()
+        cached = getattr(self, "_link_graph", None)
+        if cached is None or now - cached[0] >= LINK_GRAPH_TTL_S:
+            cached = self._link_graph = (now, self.link_graph_build())
+        return cached[1]
+
+    def link_graph_build(self):
         """Repeater links for route suggestions: a -> {b: confidence 0..1} (b hears a). From what this radio traced
         and what the observers reported. A busy link is seen hundreds of times, so what counts is how it compares
         with a's other links: a's strongest link scores 1, one with a quarter of its traffic 0.5. Links seen only once
@@ -4803,6 +4838,13 @@ CMD_SET_FLOOD_SCOPE_KEY, CMD_SEND_CONTROL_DATA, CMD_GET_STATS, CMD_SEND_ANON_REQ
 CMD_SET_AUTOADD_CONFIG, CMD_GET_AUTOADD_CONFIG, CMD_GET_ALLOWED_REPEAT_FREQ, CMD_SET_PATH_HASH_MODE = 58, 59, 60, 61
 CMD_SEND_CHANNEL_DATA, CMD_SET_DEFAULT_FLOOD_SCOPE, CMD_GET_DEFAULT_FLOOD_SCOPE, CMD_SEND_RAW_PACKET = 62, 63, 64, 65
 CMD_RUN_CLI_COMMAND = 66
+VC_TX_CMDS = {CMD_SEND_TXT_MSG, CMD_SEND_CHANNEL_TXT_MSG, CMD_SEND_CHANNEL_DATA, CMD_SEND_SELF_ADVERT, CMD_SEND_LOGIN,
+              CMD_SEND_ANON_REQ, CMD_SEND_STATUS_REQ, CMD_SEND_PATH_DISCOVERY_REQ, CMD_SEND_TELEMETRY_REQ,
+              CMD_SEND_BINARY_REQ, CMD_SEND_TRACE_PATH, CMD_SEND_CONTROL_DATA}   # app commands that transmit
+VC_TX_BURST = 10                      # ...at most this many at once,
+VC_TX_EVERY_S = 3.0                   # then one more every this long (about 20 a minute)
+VC_SAVE_EVERY_S = 30                  # an app's name / position changes reach the config file at most this often
+VC_ADVERT_EVERY_S = 10                # and an advert at most this often (as the dashboard's button)
 
 # companion -> app replies
 RESP_OK, RESP_ERR, RESP_CONTACTS_START, RESP_CONTACT, RESP_END_OF_CONTACTS, RESP_SELF_INFO, RESP_SENT = 0, 1, 2, 3, 4, 5, 6
@@ -5010,6 +5052,17 @@ class CompanionStore:
             pass
 
 
+VC_OUT_MAX_FRAMES = 2048              # replies queued for the app, unread, before it's disconnected...
+VC_OUT_MAX_BYTES = 512 * 1024         # ...or this many bytes of them
+
+
+class _CompanionOut:
+    """Replies waiting for the companion's writer thread."""
+
+    def __init__(self):
+        self.q, self.size, self.cv = collections.deque(), 0, threading.Condition()
+
+
 class CompanionLink:
     """The companion's TCP port, as WiFi companion firmware: one app at a time (a new connection replaces the old one),
     frames "<" + u16 length + payload in and ">" + u16 length + payload out. Accepting and reading run on their own
@@ -5020,7 +5073,7 @@ class CompanionLink:
     def __init__(self, bind, port, put, allowed):
         self.bind, self.port, self.put, self.allowed = bind, port, put, allowed
         self.lock = threading.Lock()
-        self.client, self.peer, self.client_id = None, None, 0
+        self.client, self.peer, self.client_id, self.out = None, None, 0, None
         self.backlog = {}                                   # connection id -> commands handed to the main loop, not yet handled
         self.running = True
         fam = socket.AF_INET6 if ":" in bind else socket.AF_INET
@@ -5055,14 +5108,16 @@ class CompanionLink:
                 conn.setsockopt(socket.SOL_SOCKET, socket.SO_SNDTIMEO, struct.pack("ll", 3, 0))  # a stalled app can't block the room
             except (OSError, struct.error):
                 pass
+            out = _CompanionOut()
             with self.lock:
                 old = self.client
                 cid = self.client_id = next(CompanionLink.ids)
-                self.client, self.peer = conn, ip
+                self.client, self.peer, self.out = conn, ip, out
             if old is not None:
                 self._close(old)
             self.put(("vc_conn", cid, ip))
             threading.Thread(target=self._read, args=(conn, cid), name="companion-read", daemon=True).start()
+            threading.Thread(target=self._write, args=(conn, out), name="companion-write", daemon=True).start()
 
     def _read(self, conn, cid):
         buf = b""
@@ -5117,18 +5172,44 @@ class CompanionLink:
         conn.close()
 
     def send(self, frame):
-        conn = self.client
+        """Queue a reply for the app (the main loop never waits on the socket: a writer thread sends it). An app that
+        lets VC_OUT_MAX_BYTES / VC_OUT_MAX_FRAMES pile up unread is disconnected."""
+        with self.lock:
+            conn, out = self.client, self.out
         if conn is None:
             return False
-        try:
-            conn.sendall(b">" + struct.pack("<H", len(frame)) + frame)
-            return True
-        except OSError:
-            with self.lock:
-                if self.client is conn:
-                    self.client, self.peer = None, None
-            self._close(conn)
+        data = b">" + struct.pack("<H", len(frame)) + frame
+        with out.cv:
+            full = len(out.q) >= VC_OUT_MAX_FRAMES or out.size + len(data) > VC_OUT_MAX_BYTES
+            if not full:
+                out.q.append(data)
+                out.size += len(data)
+                out.cv.notify()
+        if full:
+            log.warning("virtual companion: disconnected %s, which wasn't reading its replies", self.peer)
+            self._drop(conn)
             return False
+        return True
+
+    def _write(self, conn, out):
+        try:
+            while True:
+                with out.cv:
+                    while not out.q and self.client is conn and self.running:
+                        out.cv.wait(1.0)
+                    if self.client is not conn or not self.running:
+                        return
+                    data = out.q.popleft()
+                    out.size -= len(data)
+                conn.sendall(data)                          # (SO_SNDTIMEO: an app stalled 3 s is dropped)
+        except OSError:
+            self._drop(conn)
+
+    def _drop(self, conn):
+        with self.lock:
+            if self.client is conn:
+                self.client, self.peer = None, None
+        self._close(conn)
 
     def stop(self):
         self.running = False
@@ -5224,6 +5305,9 @@ class VirtualCompanion:
         if self.link is not None:
             self.link.stop()
             self.link = None
+        if getattr(self, "cfg_dirty", False):
+            self.cfg_dirty = False
+            self.cfg.save()                                 # (a name / position the app set, not saved yet)
         self.flush()
         self.store.close()
 
@@ -5362,6 +5446,9 @@ class VirtualCompanion:
 
     def service(self):
         now = time.monotonic()
+        if getattr(self, "cfg_dirty", False) and now - getattr(self, "cfg_saved", 0.0) >= VC_SAVE_EVERY_S:
+            self.cfg_dirty, self.cfg_saved = False, now
+            self.cfg.save()
         while self.inbox and self.inbox[0][0] <= now:
             pkt = heapq.heappop(self.inbox)[2]
             pkt.snr, pkt.rssi = VIRTUAL_LINK_SNR, 0
@@ -5826,10 +5913,31 @@ class VirtualCompanion:
         h = self.HANDLERS.get(cmd)
         if h is None:
             return self.err(ERR_UNSUPPORTED_CMD)
+        if cmd in VC_TX_CMDS and not self.tx_allowed(cmd):
+            self.stats["tx_limited"] = self.stats.get("tx_limited", 0) + 1
+            return self.err(ERR_TABLE_FULL)                 # (the app shows the send as failed)
         try:
             h(self, f)
         except (IndexError, struct.error, ValueError):
             self.err(ERR_ILLEGAL_ARG)
+
+    def tx_allowed(self, cmd):
+        """The app's transmissions: a token bucket (VC_TX_BURST, one more every VC_TX_EVERY_S), and adverts at most
+        every VC_ADVERT_EVERY_S, so an app (or anyone on the port) can't make the radio flood the mesh. What the
+        companion sends by itself (ACKs, path returns, auto adverts) isn't counted."""
+        now = time.monotonic()
+        tokens, last = getattr(self, "tx_bucket", (VC_TX_BURST, now))
+        tokens = min(VC_TX_BURST, tokens + (now - last) / VC_TX_EVERY_S)
+        if cmd == CMD_SEND_SELF_ADVERT:
+            if now - getattr(self, "last_app_advert", -1e9) < VC_ADVERT_EVERY_S:
+                self.tx_bucket = (tokens, now)
+                return False
+            self.last_app_advert = now
+        if tokens < 1:
+            self.tx_bucket = (tokens, now)
+            return False
+        self.tx_bucket = (tokens - 1, now)
+        return True
 
     def c_device_query(self, f):
         if len(f) < 2:
@@ -5934,7 +6042,9 @@ class VirtualCompanion:
         name = utf8_cut(f[1:].split(b"\0", 1)[0], 31).decode(errors="ignore").strip()
         if not name:
             return self.err(ERR_ILLEGAL_ARG)
-        self.cfg.set("companion_name", name)
+        if name != self.cfg.companion_name:
+            self.cfg.set("companion_name", name, save=False)
+            self.cfg_dirty = True                           # (saved by service(), at most every VC_SAVE_EVERY_S)
         self.ok()
 
     def c_set_advert_latlon(self, f):
@@ -5943,8 +6053,10 @@ class VirtualCompanion:
         lat, lon = struct.unpack_from("<ii", f, 1)
         if not (-90e6 <= lat <= 90e6 and -180e6 <= lon <= 180e6):
             return self.err(ERR_ILLEGAL_ARG)
-        self.cfg.set("companion_lat", lat / 1e6)
-        self.cfg.set("companion_lon", lon / 1e6)
+        if (lat / 1e6, lon / 1e6) != (self.cfg.companion_lat, self.cfg.companion_lon):
+            self.cfg.set("companion_lat", lat / 1e6, save=False)
+            self.cfg.set("companion_lon", lon / 1e6, save=False)
+            self.cfg_dirty = True
         self.ok()
 
     def c_get_device_time(self, f):
@@ -6205,8 +6317,15 @@ class VirtualCompanion:
     def c_sign_finish(self, f):
         if self.sign_buf is None:
             return self.err(ERR_BAD_STATE)
-        sig = self.id.sign(bytes(self.sign_buf))
+        data = bytes(self.sign_buf)
         self.sign_buf = None
+        if data[:PUB_KEY_SIZE] == self.pub or data.startswith(WEB_LOGIN_LABEL.encode()):
+            # an advert is signed over our key + time + app data, and a MeshCore Web login starts with its label: a
+            # signature over either would let whoever asked impersonate this node (until the key is changed)
+            log.warning("virtual companion: refused to sign an advert or a web login for %s", self.link.peer
+                        if getattr(self, "link", None) else "the app")
+            return self.err(ERR_ILLEGAL_ARG)
+        sig = self.id.sign(data)
         self.write(bytes([RESP_SIGNATURE]) + sig)
 
     def c_send_trace_path(self, f):
@@ -7043,11 +7162,15 @@ KAAS_TOKEN_PREFIX = "kaas_"
 KAAS_TICKET_PREFIX = "kt_"
 KAAS_TICKET_S = 30                    # a websocket ticket (for browsers, which can't send Authorization) lasts this long
 KAAS_TICKET_LOG_S = 300               # what became of a ticket, kept this long for /api/v1/web/ticket to tell its browser
-KAAS_MAX_TICKETS = 64                 # tickets waiting to be used, across all keys
+KAAS_MAX_TICKETS = 1024               # tickets waiting to be used, across all keys
+KAAS_TICKETS_PER_KEY = 4              # ...and per key, so no one key can take them all
 KAAS_MAX_KEYS = 50
 KAAS_MAX_CLIENTS = 16
 KAAS_QUEUE_MAX = 512                  # messages waiting for a slow client; past that the oldest are dropped (and counted)
 KAAS_MAX_MESSAGE = 4096               # largest message a client may send
+KAAS_QUERY_LIMITS = {"nodes": 4, "route": 30}   # queries a minute per key (nodes; near/routes/route)
+NODES_DAYS_WEB = 31                    # a web session's "nodes" reaches back at most this many days
+LINK_GRAPH_TTL_S = 30                  # route questions reuse the repeater link graph this long
 KAAS_MAX_INFLIGHT = 4                 # a client's sends waiting for the main loop
 ROUTE_HOP_COST = 0.95                 # each hop of a suggested route scores this much less
 KAAS_MAX_ROUTES = 5                   # route suggestions per request
@@ -7059,7 +7182,7 @@ KAAS_PRIO = 9                         # (and they go out after everything of the
 WS_GUID = b"258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
 WEB_CHALLENGE_PREFIX = "wc_"
 WEB_CHALLENGE_S = 60                  # a web login's challenge must be signed and sent back within this long
-WEB_MAX_CHALLENGES = 256
+WEB_MAX_USED_CHALLENGES = 20000       # logins in the last minute (each a signed challenge) remembered, so none is reused
 WEB_LOGIN_LABEL = "meshcore-web login v1"   # signed first, so a login signature is never a valid packet signature
 WEB_USERS_MAX = 1000                  # web users remembered for the dashboard (the least recently active go first)
 WEB_ID_PREFIX = "w:"                  # a web session's id in the per-key stats: "w:" + its public key
@@ -7348,8 +7471,10 @@ class KaasHub:
         self.next_check = 0.0
         self.tickets = {}                   # ticket -> (web login's pub hex, monotonic expiry): one websocket, once
         self.ticket_log = {}                # ticket -> (what became of it, monotonic expiry): see ticket_outcome
+        self.qtimes = {}                    # (key id, "nodes" | "route") -> deque of monotonic times: query budget
         self.refused_hosts = {}             # host -> (logins refused, last): names web logins were signed for, not ours
-        self.challenges = {}                # web login challenge -> monotonic expiry
+        self.challenge_key = os.urandom(32)  # signs web login challenges (stateless: no pool to exhaust)
+        self.used_challenges = {}           # challenge -> expiry (time.time): signed ones, so each works once
         self.wusers = {}                    # web user (pub hex) -> {"name", "first", "last"}: shown on the dashboard
         self.wusers_path = os.path.join(room.cfg.data_dir, "web_users.json")
         self.wusers_dirty = False
@@ -7418,6 +7543,8 @@ class KaasHub:
             for st in self.kstats.values():
                 for h in [h for h in st["hours"] if h < since]:
                     del st["hours"][h]
+            for kid in [k for k in self.kstats if k.startswith(WEB_ID_PREFIX) and k[len(WEB_ID_PREFIX):] not in self.wusers]:
+                del self.kstats[kid]                        # (a web key the users list let go: self-made keys are free)
             data = json.dumps(self.kstats)
             self.kstats_dirty = False
         tmp = self.kstats_path + ".tmp"
@@ -7454,7 +7581,8 @@ class KaasHub:
         now = time.monotonic()
         with self.lock:
             self._prune_tickets(now)
-            if len(self.tickets) >= KAAS_MAX_TICKETS:
+            if len(self.tickets) >= KAAS_MAX_TICKETS or \
+                    sum(1 for e in self.tickets.values() if e[0] == key["web"]) >= KAAS_TICKETS_PER_KEY:
                 return None
             self.tickets[ticket] = (key["web"], now + KAAS_TICKET_S)
         return ticket
@@ -7518,16 +7646,24 @@ class KaasHub:
         return dict(id=WEB_ID_PREFIX + pub_hex, receive=True, send=self.web_can_send(pub_hex), expires=None, web=pub_hex)
 
     def new_challenge(self):
-        import secrets
-        ch = WEB_CHALLENGE_PREFIX + secrets.token_urlsafe(24)
-        now = time.monotonic()
-        with self.lock:
-            for c in [c for c, exp in self.challenges.items() if exp <= now]:
-                del self.challenges[c]
-            if len(self.challenges) >= WEB_MAX_CHALLENGES:
-                return None
-            self.challenges[ch] = now + WEB_CHALLENGE_S
-        return ch
+        """A web login challenge: its expiry and a nonce, signed with this run's key. Nothing is stored until a login
+        uses it, so asking for challenges can't use them up."""
+        body = struct.pack(">Q", int(time.time()) + WEB_CHALLENGE_S) + os.urandom(12)
+        mac = hmac.new(self.challenge_key, body, hashlib.sha256).digest()[:16]
+        return WEB_CHALLENGE_PREFIX + base64.urlsafe_b64encode(body + mac).rstrip(b"=").decode()
+
+    def challenge_expiry(self, ch):
+        """A challenge's expiry (time.time) if this server made it and it's still good, else None."""
+        try:
+            raw = base64.urlsafe_b64decode(str(ch)[len(WEB_CHALLENGE_PREFIX):] + "==")
+        except (ValueError, TypeError):
+            return None
+        if not str(ch).startswith(WEB_CHALLENGE_PREFIX) or len(raw) != 36:
+            return None
+        if not hmac.compare_digest(raw[20:], hmac.new(self.challenge_key, raw[:20], hashlib.sha256).digest()[:16]):
+            return None
+        exp = struct.unpack(">Q", raw[:8])[0]
+        return exp if exp > time.time() else None
 
     def web_login(self, body, hosts, ip="?"):
         """POST /api/v1/web/login: {"pub", "signature", "challenge", "host", "name"}, the signature over
@@ -7543,9 +7679,8 @@ class KaasHub:
             pb = sb = b""
         if len(pb) != PUB_KEY_SIZE or len(sb) != SIGNATURE_SIZE:
             return 400, {"error": "pub: a 32-byte public key in hex; signature: 64 bytes in hex"}
-        with self.lock:
-            exp = self.challenges.pop(ch, None)
-        if exp is None or exp <= time.monotonic():
+        exp = self.challenge_expiry(ch)
+        if exp is None:
             return 401, {"error": "unknown or expired challenge: ask for a new one"}
         if host.lower() not in hosts:
             self.web_refused_host(host.lower())
@@ -7553,6 +7688,15 @@ class KaasHub:
                                   "allow it on the Web users card)" % host[:100]}
         if not ed25519_verify(pb, sb, web_login_message(host, ch, pub)):
             return 401, {"error": "the signature doesn't match the key"}
+        now = time.time()
+        with self.lock:                                     # (a challenge works once)
+            if ch in self.used_challenges:
+                return 401, {"error": "that challenge was used already: ask for a new one"}
+            for c in [c for c, e in self.used_challenges.items() if e <= now]:
+                del self.used_challenges[c]
+            if len(self.used_challenges) >= WEB_MAX_USED_CHALLENGES:
+                return 503, {"error": "too many logins at once: try again shortly"}
+            self.used_challenges[ch] = exp
         if pb in self.room.own_node_keys():
             return 403, {"error": "that key belongs to a node on this server"}
         if self.web_banned(pub):
@@ -7928,14 +8072,40 @@ class KaasHub:
         finally:
             conn.replaying = False
 
+    def query_allowed(self, conn, t):
+        """A key's query budget, across its connections: KAAS_QUERY_LIMITS per minute (the main loop answers them)."""
+        kind = "nodes" if t == "nodes" else "route"
+        limit = KAAS_QUERY_LIMITS[kind]
+        now = time.monotonic()
+        with self.lock:
+            q = self.qtimes.setdefault((conn.key_id, kind), collections.deque())
+            while q and now - q[0] >= 60:
+                q.popleft()
+            if len(q) >= limit:
+                return False
+            q.append(now)
+            if len(self.qtimes) > 4096:                     # (keys gone quiet)
+                for k in [k for k, v in self.qtimes.items() if not v or now - v[-1] >= 60]:
+                    del self.qtimes[k]
+        return True
+
     def ask(self, conn, t, msg, rid):
         """A route question: checked here, answered by the main loop (it owns the map). Shares the in-flight cap."""
         def err(e):
             conn.send_json({"type": "error", "id": rid, "error": e})
+        def over_budget():
+            if self.query_allowed(conn, t):
+                return False
+            kind = "nodes" if t == "nodes" else "route"
+            err("too many %s requests: at most %d a minute" % (kind, KAAS_QUERY_LIMITS[kind]))
+            return True
         if t == "nodes":
             days = msg.get("days", 7)
-            if isinstance(days, bool) or not isinstance(days, (int, float)) or not 0 < days <= 365:
-                return err("days: more than 0, at most 365")
+            top = NODES_DAYS_WEB if conn.web else 365
+            if isinstance(days, bool) or not isinstance(days, (int, float)) or not 0 < days <= top:
+                return err("days: more than 0, at most %d" % top)
+            if over_budget():
+                return
             with conn.cv:
                 if conn.inflight >= KAAS_MAX_INFLIGHT:
                     return err("too many requests waiting: wait for their answers")
@@ -7963,6 +8133,8 @@ class KaasHub:
         top = KAAS_MAX_ROUTES if t == "route" else 10
         if isinstance(limit, bool) or not isinstance(limit, int) or not 1 <= limit <= top:
             return err("limit: 1 to %d" % top)
+        if over_budget():
+            return
         with conn.cv:
             if conn.inflight >= KAAS_MAX_INFLIGHT:
                 return err("too many requests waiting: wait for their answers")
@@ -9014,6 +9186,7 @@ class WebUI:
         # threads, not the main loop), cache the history query, and cap concurrent requests
         clock_ = threading.Lock()
         slots = threading.BoundedSemaphore(16)
+        failures, flock = {}, threading.Lock()              # address -> recent failed logins (monotonic): see _locked_out
         last_advert = [float("-inf")]
 
         files = {}                                          # path -> (mtime, raw, gzipped or None)
@@ -9087,9 +9260,43 @@ class WebUI:
                     self._body_bytes = self.rfile.read(n) if 0 < n <= HTTP_MAX_BODY else b""
                 return self._body_bytes
 
+            def _client_ip(self):
+                """Who's asking: the connecting address, or behind a proxy on a private address, the address it says
+                it forwarded for (X-Forwarded-For, last entry). Else everyone behind a proxy would share one lockout."""
+                ip = self.client_address[0]
+                fwd = (self.headers.get("X-Forwarded-For") or "").split(",")[-1].strip()
+                if fwd:
+                    try:
+                        if ipaddress.ip_address(ip.replace("::ffff:", "")).is_private:
+                            return str(ipaddress.ip_address(fwd))
+                    except ValueError:
+                        pass
+                return ip
+
+            def _locked_out(self):
+                """Too many wrong passwords, keys or tickets from this address lately: 429, at once."""
+                ip, now = self._client_ip(), time.monotonic()
+                with flock:
+                    q = failures.get(ip)
+                    while q and now - q[0] >= FAIL_WINDOW_S:
+                        q.popleft()
+                    locked = bool(q) and len(q) >= FAIL_LIMIT
+                if locked:
+                    self.close_connection = True
+                    self._send(429, '{"error":"too many failed attempts from your address: try again in a few minutes"}',
+                               headers={"Retry-After": str(FAIL_WINDOW_S)})
+                return locked
+
             def _penalty(self):
-                """A wrong password, key or ticket: answer a second late, without holding a request slot meanwhile
-                (else 16 bad guesses a second would turn everyone else away)."""
+                """A wrong password, key or ticket: counted against this address (see _locked_out), and answered a
+                second late, without holding a request slot meanwhile (else 16 bad guesses a second would turn
+                everyone else away)."""
+                ip, now = self._client_ip(), time.monotonic()
+                with flock:
+                    failures.setdefault(ip, collections.deque(maxlen=FAIL_LIMIT * 2)).append(now)
+                    if len(failures) > 10000:               # (addresses gone quiet)
+                        for k in [k for k, q in failures.items() if not q or now - q[-1] >= FAIL_WINDOW_S]:
+                            del failures[k]
                 slots.release()
                 try:
                     time.sleep(1.0)
@@ -9279,6 +9486,8 @@ class WebUI:
                 if not 0 <= n <= HTTP_MAX_BODY:
                     self.close_connection = True
                     return self._send(413 if n > 0 else 400, '{"error":"a request body is at most %d bytes"}' % HTTP_MAX_BODY)
+                if self._locked_out():
+                    return
                 self._raw_body()                            # (before a slot: a slow body only holds its own thread)
                 if not slots.acquire(blocking=False):
                     return self._send(503, '{"error":"busy"}')
@@ -9312,6 +9521,8 @@ class WebUI:
                 if not wkey or self.headers.get("Sec-WebSocket-Version") != "13":
                     return refuse(400, "websocket version 13 only", "bad_version", "not a version 13 websocket "
                                   "(Sec-WebSocket-Version: %r)" % self.headers.get("Sec-WebSocket-Version"))
+                if self._locked_out():
+                    return
                 if not slots.acquire(blocking=False):
                     return refuse(503, "busy", "busy", "too many requests at once")
                 try:

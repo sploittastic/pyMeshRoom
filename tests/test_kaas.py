@@ -407,6 +407,7 @@ class RouteSuggestTests(WebTestCase):
         # busy links don't all max out: what counts is how a link compares with its repeater's strongest one
         room.edges.update({(A, B): [400.0, now, None], (A, C): [100.0, now, None], (B, D): [300.0, now, None],
                            (C, D): [300.0, now, None]})
+        room._link_graph = None                                   # (edited by hand: the 30 s cache doesn't know)
         busy = self.h.run_client(lambda: c.route("a1a1", "d4d4"))["routes"]
         self.assertEqual([r["hops"] for r in busy], [["a1a1", "b2b2", "d4d4"], ["a1a1", "c3c3", "d4d4"]])
         self.assertAlmostEqual(busy[0]["score"], mr.ROUTE_HOP_COST ** 2, places=2)

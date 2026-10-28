@@ -408,6 +408,11 @@ companions, so anyone who can reach it can read and delete its messages, read it
 it sign data. Turning it on asks you to confirm that. Never forward the port to the internet; use **Allowed addresses**
 or `companion_bind`.
 
+What reaches the port still can't do everything: the companion won't sign an advert for itself or a MeshCore Web
+login (either would let someone impersonate the node), the app's transmissions are budgeted (10 at once, then one
+every 3 s; an advert at most every 10 s), replies to an app that stops reading are queued (it's disconnected past
+2048 replies or 512 KB) rather than waited for, and name / position changes from the app are saved at most every 30 s.
+
 What the app can do: contacts (auto-add from adverts, add, remove, share, import/export), direct messages with delivery confirmation, Public and hashtag/private channels, logins, status, telemetry and binary requests to repeaters and rooms (including this room), path discovery, traces, adverts, flood scope, message signing and statistics. Messages that arrive while no app is connected are kept until the app collects them.
 
 Settings that belong to the whole radio or to hardware the companion doesn't have are **acknowledged and ignored**: radio frequency/bandwidth/SF/CR, TX power, tuning, path hash mode, the Bluetooth PIN, reboot, factory reset, private key import, setting the clock (the Pi's clock is used) and app CLI commands. The app may show the value it sent until it reconnects and reads the real one. The node name, position, contact, channel, telemetry-permission and auto-add settings from the app are applied.
