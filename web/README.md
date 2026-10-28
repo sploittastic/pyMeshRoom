@@ -30,15 +30,16 @@ dashboard's port, and it reaches the mesh through that radio over the KaaS API. 
 | Private key | A 64-byte MeshCore private key in hex, as the apps export it, or a 32-byte seed. **New** makes one. Keep a copy: a new key is a new node. |
 | Your name | Goes before your messages (`Name: text`) and into your adverts. |
 
-**Remember me** keeps the private key in this browser's `localStorage`, and the page then connects by itself when it
+**Remember me** (ticked to start with) keeps the private key in this browser's `localStorage`, and the page then connects by itself when it
 opens. With a **passphrase**, the key is sealed instead: PBKDF2-HMAC-SHA256 with 50,000 rounds, AES-128-CTR and an
 HMAC. You type the passphrase rather than the key each time. Leave Remember unticked on a shared computer: then only
 the URL and your name are saved.
 
 The server's admin turns web logins on (**Allow web logins** on the dashboard's **Web users** card). Anyone can then
-log in and read. You can **send** once the radio has heard your key advertise, for example from your MeshCore app
-within range, or once the admin allows your key. Until then the page says so, and it switches over by itself when
-that happens. The admin can also disconnect or ban a key.
+log in and read. You can **send** (and use rooms) once the radio itself has heard your key advertise, for example in a
+flood advert from your MeshCore app (an MQTT observer's report doesn't count), or once the admin allows your key.
+Until then the page shows the admin's message (**Unknown key message** on the card), and it switches over by itself
+when that happens. The admin can also disconnect or ban a key.
 
 If the admin set a **page password**, the page pyMeshRoom serves asks for it before showing anything. A copy of the
 page opened from elsewhere asks for it when logging in. With **Remember me**, it's saved like the key (sealed, with a

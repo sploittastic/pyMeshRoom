@@ -124,9 +124,9 @@ function initLogin() {
   $("url-auto").hidden = !served || !!s.otherServer;
   $("url-host").textContent = served ? new URL(served).host : "";
   $("f-name").value = s.name || "";
-  $("f-remember").checked = !!s.remember;
+  $("f-remember").checked = s.remember !== false;            // (on unless they turned it off)
   $("f-pass").value = "";
-  $("pass-box").hidden = !s.remember;
+  $("pass-box").hidden = s.remember === false;
   $("f-priv").value = s.remember && !s.vault ? s.privateKey || "" : "";
   setUnlockMode(!!(s.remember && s.vault));
   $("f-sitepw").value = s.remember && !s.vault ? s.pagePassword || "" : "";
@@ -324,8 +324,8 @@ async function refreshDirectory() {
 }
 
 function loginRooms() {
-  for (const c of app.node.contacts.values())
-    if (c.room && !c.room.loggedIn && (isLocalRoom(c.pubHex) || canSend())) roomLogin(c, c.room.password || "", true);
+  if (!canSend()) return;                                 // (rooms wait until this key may send, on this server too)
+  for (const c of app.node.contacts.values()) if (c.room && !c.room.loggedIn) roomLogin(c, c.room.password || "", true);
 }
 
 // A room on the server we're connected to (its own room, or a tenant room).
@@ -586,8 +586,8 @@ function onState({ state, reason }) {
   if (state === "failed") { text = "Disconnected: " + reason + ". Log out and in again."; bad = true; }
   else if (state === "closed") text = "Disconnected: " + (reason || "connection lost") + ".";
   else if (state === "connecting") text = "Connecting…";
-  else if (key.web && !key.send) text = "You can read, but not send yet: this radio hasn't heard your key. Send an advert " +
-    "from your MeshCore app within range of the radio, or ask the server's admin to allow your key. This updates by itself.";
+  else if (key.web && !key.send) text = "You can read, but not send yet: " +
+    (key.pending_message || "Your key must be heard on RF before you can send messages. Please send a flood advert.");
   banner.textContent = text;
   banner.className = "banner" + (bad ? " bad" : "");
   banner.hidden = !text;
@@ -1354,7 +1354,7 @@ async function joinRoomFromDialog(ev) {
     else return showError("r-error", byName.length ? "Several rooms have that name: use its public key." :
       "No room by that name has been heard. Give its public key (64 hex characters).");
   }
-  if (!canSend() && !isLocalRoom(c.pubHex)) return showError("r-error", "You can't send yet, so you can't log in to a room.");
+  if (!canSend()) return showError("r-error", "You can't send yet, so you can't log in to a room.");
   $("r-go").disabled = true;
   $("r-go").textContent = "Logging in…";
   try {

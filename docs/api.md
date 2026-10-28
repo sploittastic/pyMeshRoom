@@ -102,10 +102,11 @@ sign a login for this server. The label means a login signature can never also b
 signature.
 
 Anyone may log in and receive. A key may **send** once this radio has heard it advertise, or once the admin presses
-**Allow send** for it. An advert sent through this API doesn't count: it has to be heard on the air. With
-`web_trust_observers`, an advert reported by an MQTT observer counts too. Until then the session is **pending**:
-sends are refused, and `{"type": "access", "send": true, "state": "allowed"}` arrives when that changes (it also
-arrives with `false` if the admin takes it back).
+**Allow send** for it. An advert sent through this API doesn't count: it has to be heard on the air, by this radio
+(an MQTT observer's report doesn't count either). Until then the session is **pending**: sends are refused, and so
+are rooms on this server (reading too), and `{"type": "access", "send": true, "state": "allowed"}` arrives when that
+changes (it also arrives with `false` if the admin takes it back). A pending session's hello carries the admin's
+`"pending_message"` for its user (`web_unknown_key_message`, set on the Web users card).
 
 A web session may only send what a chat client needs, and only as itself:
 
@@ -392,7 +393,7 @@ Bad input gets `{"type": "error", "id": ..., "error": ...}`. Questions share the
 | `web_max_clients` | 32 | Web sessions at once, apart from API keys' 16. |
 | `web_approved` | `[]` | Public keys (hex) allowed to send without being heard. Managed from the dashboard. |
 | `web_banned` | `[]` | `{"pub", "name", "ts"}` of banned keys. Managed from the dashboard. |
-| `web_trust_observers` | false | A key heard only by an MQTT observer may send too. |
+| `web_unknown_key_message` | "Your key must be heard on RF before you can send messages. Please send a flood advert." | What a web user whose key may not send yet is told. Set from the dashboard. |
 | `web_hosts` | `[]` | More host names a login may be signed for, behind a proxy elsewhere that rewrites `Host`. |
 | `web_page_password` | `""` | A password for the MeshCore Web page and its logins, hashed. Set from the dashboard. |
 | `web_giphy_key` | `""` | A Giphy API key for MeshCore Web's GIF picker (developers.giphy.com). Set from the dashboard. |

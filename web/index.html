@@ -16,6 +16,9 @@
     <h1>MeshCore Web</h1>
     <p class="sub">Chat on MeshCore channels through a pyMeshRoom radio. Your private key stays in this browser:
       every message is encrypted and signed here.</p>
+    <p class="sub">Anyone can log in and read. You can send once this radio has heard your node on the mesh: the public
+      key that goes with your private key, in an advert from your MeshCore app (a flood advert reaches it from
+      further away).</p>
 
     <p class="server-auto" id="url-auto" hidden>Server: <b id="url-host"></b>
       <button type="button" id="url-change" class="linkish">Use another server</button></p>
@@ -50,7 +53,7 @@
     </div>
 
 
-    <label class="check"><input id="f-remember" type="checkbox"> Remember me on this device, and connect by myself next time</label>
+    <label class="check"><input id="f-remember" type="checkbox" checked> Remember me on this device, and connect by myself next time</label>
     <div id="pass-box" hidden>
       <label for="f-pass">Passphrase <span class="opt">(optional)</span></label>
       <input id="f-pass" type="password" placeholder="Protects the saved key" autocomplete="new-password">

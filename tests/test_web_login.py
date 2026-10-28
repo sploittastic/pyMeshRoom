@@ -394,14 +394,19 @@ class LocalRoomTests(WebHelpers):
         room = r.id.pub_key.hex()
         guest = kc.Identity.generate()
         c = self.connect(self.login(guest)[1]["ticket"])
+        self.assertEqual(c.hello["key"]["pending_message"], mr.DEFAULT_CONFIG["web_unknown_key_message"])
+        self.assertIn("heard on this radio", self.request(c, {"type": "room", "id": 0, "room": room, "password": "hello"},
+                                                         "error")["error"])   # pending: not even reading a room
+        self.assertNotIn(guest.pub, r.members)
+        c.ws.close()
+        self.heard_on_air(guest, "Guest")
+        c = self.connect(self.login(guest)[1]["ticket"])
         self.assertTrue(self.request(c, {"type": "room", "id": 1, "room": room, "password": "nope"}, "error").get("refused"))
         self.assertNotIn(guest.pub, r.members)
         ok = self.request(c, {"type": "room", "id": 2, "room": room, "password": "hello"}, "room_result")
         m = r.members[guest.pub]
         self.assertEqual((ok["can_post"], m.role, m.last_activity), (True, mr.PERM_READ_WRITE, 0))
         self.assertFalse(r.push_eligible(m))                                 # no radio: the room never pushes to it
-        self.assertIn("heard on this radio", self.request(c, {"type": "room_post", "id": 3, "room": room, "text": "hi"},
-                                                         "error")["error"])   # (pending: can read, not post)
         r.bans[guest.pub] = "test"
         self.assertIn("banned", self.request(c, {"type": "room", "id": 4, "room": room}, "error")["error"])
 
@@ -635,13 +640,22 @@ class NodeDirectoryTests(unittest.TestCase):
         finally:
             h.tmp.cleanup()
 
-    def test_observer_reports_count_only_when_trusted(self):
+    def test_an_observer_report_doesnt_let_a_web_key_send(self):
+        """Only this radio hearing the key counts (the old "trust observers" setting is gone, and ignored quietly)."""
+        import tempfile
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "meshroom.json")
+            with open(path, "w") as f:
+                json.dump({"web_trust_observers": True}, f)
+            with self.assertNoLogs("meshroom", "WARNING"):
+                self.assertNotIn("web_trust_observers", mr.Config(path).data)
         h = Harness(mqtt_advert_ingest=True)
         try:
             a = kc.Identity.generate()
             h.room.observer_advert(advert(a, "Far away"), b"")
             self.assertIsNone(h.room.heard_on_rf(a.pub))
-            self.assertIsNotNone(h.room.heard_on_rf(a.pub, trust_observers=True))
+            self.assertIsNotNone(h.room.heard_on_rf(a.pub, trust_observers=True))       # (known: in the directory)
+            self.assertFalse(h.room.kaas.web_can_send(a.pub.hex()))
         finally:
             h.close()
 

@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover, interactive-widget=resizes-content">
-<meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'sha256-34RjzgvcRxKAy1Zq7wnDRduTi+cq/1XjoLS4kHQH5kU=' 'self' https://unpkg.com/leaflet@1.9.4/dist/leaflet.js; style-src 'sha256-H4R3hSzOToYncAmlANpU7VdX8Mx1SfSYzYInLvbD8Xs=' 'self' https://unpkg.com/leaflet@1.9.4/dist/leaflet.css; img-src 'self' data: https://media.giphy.com https://i.giphy.com https://*.tile.openstreetmap.org https://unpkg.com/leaflet@1.9.4/dist/images/; connect-src https: wss: http: ws:; base-uri 'none'; form-action 'none'">
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'sha256-YooSKchCWdXE9ezAqsPfznwB53apRST+daGQc/HnPhg=' 'self' https://unpkg.com/leaflet@1.9.4/dist/leaflet.js; style-src 'sha256-H4R3hSzOToYncAmlANpU7VdX8Mx1SfSYzYInLvbD8Xs=' 'self' https://unpkg.com/leaflet@1.9.4/dist/leaflet.css; img-src 'self' data: https://media.giphy.com https://i.giphy.com https://*.tile.openstreetmap.org https://unpkg.com/leaflet@1.9.4/dist/images/; connect-src https: wss: http: ws:; base-uri 'none'; form-action 'none'">
 <meta name="referrer" content="no-referrer">
 <title>MeshCore Web</title>
 <style>:root {
@@ -2170,9 +2170,9 @@ function initLogin() {
   $("url-auto").hidden = !served || !!s.otherServer;
   $("url-host").textContent = served ? new URL(served).host : "";
   $("f-name").value = s.name || "";
-  $("f-remember").checked = !!s.remember;
+  $("f-remember").checked = s.remember !== false;            // (on unless they turned it off)
   $("f-pass").value = "";
-  $("pass-box").hidden = !s.remember;
+  $("pass-box").hidden = s.remember === false;
   $("f-priv").value = s.remember && !s.vault ? s.privateKey || "" : "";
   setUnlockMode(!!(s.remember && s.vault));
   $("f-sitepw").value = s.remember && !s.vault ? s.pagePassword || "" : "";
@@ -2370,8 +2370,8 @@ async function refreshDirectory() {
 }
 
 function loginRooms() {
-  for (const c of app.node.contacts.values())
-    if (c.room && !c.room.loggedIn && (isLocalRoom(c.pubHex) || canSend())) roomLogin(c, c.room.password || "", true);
+  if (!canSend()) return;                                 // (rooms wait until this key may send, on this server too)
+  for (const c of app.node.contacts.values()) if (c.room && !c.room.loggedIn) roomLogin(c, c.room.password || "", true);
 }
 
 // A room on the server we're connected to (its own room, or a tenant room).
@@ -2632,8 +2632,8 @@ function onState({ state, reason }) {
   if (state === "failed") { text = "Disconnected: " + reason + ". Log out and in again."; bad = true; }
   else if (state === "closed") text = "Disconnected: " + (reason || "connection lost") + ".";
   else if (state === "connecting") text = "Connecting…";
-  else if (key.web && !key.send) text = "You can read, but not send yet: this radio hasn't heard your key. Send an advert " +
-    "from your MeshCore app within range of the radio, or ask the server's admin to allow your key. This updates by itself.";
+  else if (key.web && !key.send) text = "You can read, but not send yet: " +
+    (key.pending_message || "Your key must be heard on RF before you can send messages. Please send a flood advert.");
   banner.textContent = text;
   banner.className = "banner" + (bad ? " bad" : "");
   banner.hidden = !text;
@@ -3400,7 +3400,7 @@ async function joinRoomFromDialog(ev) {
     else return showError("r-error", byName.length ? "Several rooms have that name: use its public key." :
       "No room by that name has been heard. Give its public key (64 hex characters).");
   }
-  if (!canSend() && !isLocalRoom(c.pubHex)) return showError("r-error", "You can't send yet, so you can't log in to a room.");
+  if (!canSend()) return showError("r-error", "You can't send yet, so you can't log in to a room.");
   $("r-go").disabled = true;
   $("r-go").textContent = "Logging in…";
   try {
@@ -3566,6 +3566,9 @@ return {  };
     <h1>MeshCore Web</h1>
     <p class="sub">Chat on MeshCore channels through a pyMeshRoom radio. Your private key stays in this browser:
       every message is encrypted and signed here.</p>
+    <p class="sub">Anyone can log in and read. You can send once this radio has heard your node on the mesh: the public
+      key that goes with your private key, in an advert from your MeshCore app (a flood advert reaches it from
+      further away).</p>
 
     <p class="server-auto" id="url-auto" hidden>Server: <b id="url-host"></b>
       <button type="button" id="url-change" class="linkish">Use another server</button></p>
@@ -3600,7 +3603,7 @@ return {  };
     </div>
 
 
-    <label class="check"><input id="f-remember" type="checkbox"> Remember me on this device, and connect by myself next time</label>
+    <label class="check"><input id="f-remember" type="checkbox" checked> Remember me on this device, and connect by myself next time</label>
     <div id="pass-box" hidden>
       <label for="f-pass">Passphrase <span class="opt">(optional)</span></label>
       <input id="f-pass" type="password" placeholder="Protects the saved key" autocomplete="new-password">

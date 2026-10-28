@@ -175,13 +175,17 @@ DEFAULT_CONFIG = {
     "web_max_clients": 32,          #   web sessions at once (bots' API keys have their own limit)
     "web_approved": [],             #   public keys (hex) the admin let send although never heard on this radio
     "web_banned": [],               #   [{"pub", "name", "ts"}]: may not log in
-    "web_trust_observers": False,   #   a key heard only by an MQTT observer may send too (else: heard on this radio)
+    "web_unknown_key_message":      #   what a web user whose key may not send yet is told
+        "Your key must be heard on RF before you can send messages. Please send a flood advert.",
     "web_hosts": [],                #   other host names logins may sign for (behind a proxy that rewrites Host)
     "web_page_password": "",        #   a password for the MeshCore Web page and its logins (hashed; "" = none)
     "web_giphy_key": "",            #   a Giphy API key for MeshCore Web's GIF picker ("" = no picker; links still show)
     "web_backlog_days": 30,         #   keep channel messages and DMs this many days, so web users catch up (0 = off)
     "web_backlog_mqtt": False,      #   ...including those MQTT observers reported (each packet is kept once)
 }
+
+
+RETIRED_SETTINGS = {"web_trust_observers"}   # settings older versions had: ignored quietly
 
 
 class Config:
@@ -211,6 +215,8 @@ class Config:
             log.warning("created default config %s - edit passwords and serial port", path)
 
     def _take(self, k, v, section):
+        if k in RETIRED_SETTINGS:
+            return                                          # (no longer a setting: left in the file, unused)
         if k not in DEFAULT_CONFIG:
             log.warning("config: '%s'%s is not a setting this version uses (ignored)", k, " in section '%s'" % section if section else "")
         self.data[k] = v
@@ -7486,7 +7492,7 @@ class KaasHub:
         """Heard advertising on this radio (or by an observer, when trusted), or let in by the admin."""
         if pub_hex in (self.room.cfg.web_approved or []):
             return True
-        return self.room.heard_on_rf(bytes.fromhex(pub_hex), bool(self.room.cfg.web_trust_observers)) is not None
+        return self.room.heard_on_rf(bytes.fromhex(pub_hex)) is not None      # (on this radio: an MQTT report won't do)
 
     def web_key(self, pub_hex):
         """A web login as a key: receive always, send once heard or allowed. None while logins are off, or banned."""
@@ -7645,7 +7651,7 @@ class KaasHub:
 
     def web_admin(self, action, pub_hex, name=""):
         """The dashboard's Web users card, in the main loop: allow / unallow sending, kick, ban, unban, forget;
-        or ("settings", {"web_login": bool, "web_trust_observers": bool})."""
+        or ("settings", {"web_login": bool, ...})."""
         cfg = self.room.cfg
         if action == "settings":
             for k, v in pub_hex.items():
@@ -7710,7 +7716,8 @@ class KaasHub:
         return {"type": "hello", "api": 1, "server": FIRMWARE_VERSION,
                 "key": dict({"id": key["id"], "receive": bool(key.get("receive")), "send": bool(key.get("send")),
                              "expires": key.get("expires")},
-                            **({"web": True, "pub": key["web"], "state": "allowed" if key.get("send") else "pending"}
+                            **({"web": True, "pub": key["web"], "state": "allowed" if key.get("send") else "pending",
+                                "pending_message": str(room.cfg.web_unknown_key_message or "")}
                                if key.get("web") else {})),
                 "send_burst": int(room.cfg.kaas_send_burst), "send_window_s": float(room.cfg.kaas_send_window_s),
                 "airtime_pct": float(room.cfg.kaas_airtime_pct),
@@ -7949,6 +7956,8 @@ class KaasHub:
             pub = b""
         if len(pub) != PUB_KEY_SIZE:
             return err("room: the room's public key in hex")
+        if not conn.can_send:                               # (rooms too: nothing for a key not yet allowed)
+            return err("your key hasn't been heard on this radio yet: the admin can let it send")
         if t == "room":
             since, pw = msg.get("since", 0), msg.get("password", "")
             if isinstance(since, bool) or not isinstance(since, int) or since < 0 or not isinstance(pw, str):
@@ -7958,8 +7967,6 @@ class KaasHub:
             text = msg.get("text")
             if not isinstance(text, str) or not text.strip() or len(text.strip().encode()) > MAX_POST_TEXT_LEN:
                 return err("text: 1 to %d bytes" % MAX_POST_TEXT_LEN)
-            if not conn.can_send:
-                return err("your key hasn't been heard on this radio yet: the admin can let it send")
             arg = text.strip()
         with conn.cv:
             if conn.inflight >= KAAS_MAX_INFLIGHT:
@@ -8453,11 +8460,12 @@ A key is shown once, when it is made: only a hash of it is kept, so a lost key c
 <table id="kklist" style="margin-top:8px"></table></div>
 <div class="card" id="webcard" style="display:none"><h2>Web users <span class="hdesc">MeshCore Web: people log in by signing with their node's private key, which never leaves their browser &middot; <a href="meshcore-web/" target="_blank" rel="noopener">open MeshCore Web</a></span></h2>
 <div class="rprow"><label><input id="wb_on" type="checkbox" onchange="wbSettings({web_login:this.checked})"> Allow web logins</label>
-<label title="A key heard only by an MQTT observer, not by this radio, may send too"><input id="wb_obs" type="checkbox" onchange="wbSettings({web_trust_observers:this.checked})"> Trust keys heard by MQTT observers</label>
 <span class="dim small"><span id="wb_conn">0</span> of <span id="wb_max">32</span> sessions in use</span><span id="wbmsg" class="small"></span></div>
 <div class="rprow"><label>Page password <input id="wb_pw" type="password" size="18" maxlength="64" autocomplete="new-password" placeholder="none"></label>
 <button onclick="wbPagePw(this,false)">Set</button><button id="wb_pw_rm" onclick="wbPagePw(this,true)">Remove</button>
 <span class="dim small" id="wb_pw_state"></span></div>
+<div class="rprow"><label title="Shown to a web user whose key may not send yet: not heard advertising on this radio (an MQTT report doesn't count), and not allowed by you">Unknown key message
+<input id="wb_unk" type="text" size="60" maxlength="200" autocomplete="off"></label><button onclick="wbUnknown(this)">Save</button></div>
 <div class="rprow"><label title="For MeshCore Web's GIF picker: a free key from developers.giphy.com (an API key, not an SDK key). Web users' browsers use it to search Giphy">Giphy API key
 <input id="wb_giphy" type="password" size="18" maxlength="64" autocomplete="off" placeholder="none"></label>
 <button onclick="wbGiphy(this,false)">Set</button><button id="wb_giphy_rm" onclick="wbGiphy(this,true)">Remove</button>
@@ -8581,7 +8589,7 @@ async function loadWeb(){if(!MAINADM)return;let d;try{const r=await fetch("api/v
  WB=d;$("wb_on").checked=d.enabled;$("wb_pw_state").textContent=d.page_password?"set: the page and its logins ask for it":"none: anyone who can reach this server can open the page";$("wb_pw_rm").disabled=!d.page_password;
  $("wb_giphy_state").textContent=d.giphy_key?"set: web users get a GIF picker":"none: no GIF picker (Giphy links still show)";$("wb_giphy_rm").disabled=!d.giphy_key;
  {const b=d.backlog||{};if(document.activeElement!==$("wb_days"))$("wb_days").value=b.days;$("wb_bk_mqtt").checked=!!b.mqtt;
-  $("wb_bk_state").textContent=b.days?(b.count||0).toLocaleString()+" packets kept"+(b.oldest?", the oldest from "+ago(b.oldest)+" ago":""):"off: web users don't catch up";}$("wb_obs").checked=d.trust_observers;$("wb_conn").textContent=d.connected;$("wb_max").textContent=d.max;
+  $("wb_bk_state").textContent=b.days?(b.count||0).toLocaleString()+" packets kept"+(b.oldest?", the oldest from "+ago(b.oldest)+" ago":""):"off: web users don't catch up";}if(document.activeElement!==$("wb_unk"))$("wb_unk").value=d.unknown_key_message||"";$("wb_conn").textContent=d.connected;$("wb_max").textContent=d.max;
  $("wb_burst").textContent=$("kk_burst").textContent;$("wb_win").textContent=$("kk_win").textContent;
  const t=$("wblist");if(!d.users.length){t.innerHTML='<tr><td class="dim">'+(d.enabled?"Nobody has logged in yet.":"Web logins are off.")+'</td></tr>'}else{
  const key=p=>`<span class="wbkey" title="${esc(p)}">${esc(p.slice(0,8))}&hellip;</span>`;
@@ -8612,6 +8620,9 @@ async function wbPagePw(btn,remove){const pw=remove?"":$("wb_pw").value;
  if(!remove&&(pw.length<4||pw.length>64)){$("wbmsg").className="poor small";$("wbmsg").textContent=" A page password is 4 to 64 characters.";return}
  if(remove&&!confirm("Remove the MeshCore Web page password? Anyone who can reach this server can then open the page."))return;
  btn.disabled=true;await wbSettings({page_password:pw});btn.disabled=false;$("wb_pw").value=""}
+async function wbUnknown(btn){const t=$("wb_unk").value.trim();
+ if(!t){$("wbmsg").className="poor small";$("wbmsg").textContent=" The unknown key message can't be empty.";return}
+ btn.disabled=true;await wbSettings({unknown_key_message:t});btn.disabled=false}
 async function wbGiphy(btn,remove){const k=remove?"":$("wb_giphy").value.trim();
  if(!remove&&!/^[A-Za-z0-9]{8,64}$/.test(k)){$("wbmsg").className="poor small";$("wbmsg").textContent=" A Giphy API key is letters and digits.";return}
  btn.disabled=true;await wbSettings({giphy_key:k});btn.disabled=false;$("wb_giphy").value=""}
@@ -9383,7 +9394,7 @@ class WebUI:
                         return self._send(401, '{"error":"log in first"}')
                     hub = room.kaas
                     return self._send(200, json.dumps({
-                        "enabled": bool(cfg.web_login), "trust_observers": bool(cfg.web_trust_observers),
+                        "enabled": bool(cfg.web_login), "unknown_key_message": str(cfg.web_unknown_key_message or ""),
                         "page_password": bool(cfg.web_page_password), "giphy_key": bool(cfg.web_giphy_key),
                         "backlog": hub.backlog_info(),
                         "max": int(cfg.web_max_clients), "connected": sum(1 for c in hub.conns if c.web),
@@ -9546,7 +9557,12 @@ class WebUI:
                     return self._send(200, json.dumps({"ok": True, "id": entry["id"], "token": token}))
                 if parts == ["api", "v1", "web", "settings"]:
                     body = self._body() or {}
-                    change = {k: body[k] for k in ("web_login", "web_trust_observers") if isinstance(body.get(k), bool)}
+                    change = {k: body[k] for k in ("web_login",) if isinstance(body.get(k), bool)}
+                    if "unknown_key_message" in body:
+                        t = body["unknown_key_message"]
+                        if not isinstance(t, str) or not t.strip() or len(t) > 200:
+                            return self._send(400, '{"error":"the unknown key message: 1 to 200 characters"}')
+                        change["web_unknown_key_message"] = " ".join(t.split())
                     if "page_password" in body:
                         pw = body["page_password"]
                         if not isinstance(pw, str) or (pw and not 4 <= len(pw) <= 64):

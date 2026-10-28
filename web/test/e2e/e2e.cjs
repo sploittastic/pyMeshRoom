@@ -114,14 +114,23 @@ let b;
   const p = await newPage(b);
   await p.goto(pageUrl);
   ok(await p.isHidden('#f-key'), 'no API key field: logging in takes only the private key and a name');
+  ok(await p.isChecked('#f-remember'), 'remember me: on by default');
+  ok(/heard your node on the mesh/.test(await p.textContent('.login .card')), 'the intro says sending needs the key heard on the mesh');
+  await p.uncheck('#f-remember');                                       // (the tests below start from a key not kept)
   await p.fill('#f-url', SERVER); await p.fill('#f-priv', PRIV); await p.fill('#f-name', 'WebTester');
   await p.waitForFunction(() => document.getElementById('f-pub').textContent.startsWith('Public key:'));
   await p.screenshot({ path: shotPrefix + '-login.png' });
   await p.click('#login-go');
   await p.waitForSelector('#conn-dot.open', { timeout: 10000 });
   ok(true, 'logged in by signing with the private key');
-  ok(/can read, but not send yet/.test(await p.textContent('#banner')), 'a key not heard on the air yet is pending: read only');
+  ok(/can read, but not send yet: Your key must be heard on RF before you can send messages\. Please send a flood advert\./
+    .test(await p.textContent('#banner')), 'a key not heard on the air yet is pending: read only, with the admin\'s message');
   ok(await p.isDisabled('#send') && await p.isDisabled('#advert'), 'pending: can\'t send or advertise');
+  await p.click('#join-room');
+  await p.fill('#r-key', 'ab'.repeat(32));
+  await p.click('#r-go');
+  ok(/can't send yet/.test(await p.textContent('#r-error')), 'pending: can\'t join a room either');
+  await p.click('#dlg-room [data-close]');
   await p.screenshot({ path: shotPrefix + '-pending.png' });
 
   hear(py('--advert', PRIV, 'WebTester'));                   // their MeshCore app adverts within range of the radio
