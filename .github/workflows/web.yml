@@ -29,7 +29,11 @@ jobs:
       - run: node build.mjs
       - name: On a pull request, the committed build must match the source
         if: github.event_name == 'pull_request'
-        run: git diff --exit-code -- ../meshroom/data/meshcore-web.html || (echo "run: cd web && node build.mjs" && exit 1)
+        run: |
+          if ! git diff --exit-code -- ../meshroom/data/meshcore-web.html; then
+            echo "meshroom/data/meshcore-web.html is out of date: cd web && node build.mjs, then commit it"
+            exit 1
+          fi
       - name: Commit meshcore-web.html if it changed
         if: github.event_name != 'pull_request'
         run: |
