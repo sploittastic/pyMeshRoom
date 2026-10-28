@@ -171,6 +171,12 @@ DEFAULT_CONFIG = {
     "kaas_send_burst": 3,           #   per key: at most this many packets...
     "kaas_send_window_s": 20,       #   ...in any this many seconds (ACKs and path returns excepted)
     "kaas_airtime_pct": 5,          #   all API clients together may use at most this share of airtime
+    "web_login": False,             # MeshCore Web: people log in by signing with their node's private key (no API key)
+    "web_max_clients": 32,          #   web sessions at once (bots' API keys have their own limit)
+    "web_approved": [],             #   public keys (hex) the admin let send although never heard on this radio
+    "web_banned": [],               #   [{"pub", "name", "ts"}]: may not log in
+    "web_trust_observers": False,   #   a key heard only by an MQTT observer may send too (else: heard on this radio)
+    "web_hosts": [],                #   other host names logins may sign for (behind a proxy that rewrites Host)
 }
 
 
@@ -284,6 +290,7 @@ RETRY_BEFORE_SUSPEND_S = 60      # one retry (best route + floods) a minute afte
 SUSPENDED_PROBE_S = 6 * 3600     # while suspended: a single flood this often, in case they listen but never transmit
 MAX_NEIGHBOURS = 50
 NAME_CACHE_MAX = 1000
+NODES_MAX = 5000                 # every node heard advertising (any type), kept with its full key: the oldest go first
 
 SLOT_FLOOD = "flood"
 
@@ -776,6 +783,7 @@ class Store:
         "member_inroutes": ("key8 BLOB", "plen INT", "path BLOB", "w REAL", "t INT", "PRIMARY KEY (key8, plen, path)"),
         "edges": ("a BLOB", "b BLOB", "w REAL", "t INT", "snr REAL", "PRIMARY KEY (a, b)"),
         "repeaters": ("pubkey BLOB PRIMARY KEY", "name TEXT", "lat REAL", "lon REAL", "adv_ts INT", "last_advert INT"),
+        "nodes": ("pubkey BLOB PRIMARY KEY", "type INT", "name TEXT", "lat REAL", "lon REAL", "adv_ts INT", "rf INT", "obs INT"),
         "heard": ("hash BLOB PRIMARY KEY", "last INT", "w REAL", "t INT", "last_direct INT", "snr REAL", "disc INT", "out_snr REAL"),
         "bans": ("pubkey BLOB PRIMARY KEY", "name TEXT", "ts INT"),
         "probes": ("hash BLOB PRIMARY KEY", "data TEXT"),
@@ -1265,6 +1273,8 @@ class RoomServer:
         self.mrpts = {}                   # companion directory, locations: key8 -> {repeater hash (b"" = direct): [w, t]}
         self.edges = {}                   # (a_hash, b_hash) -> [w, t, snr]   b"" = the room
         self.repeaters = {}               # repeater pubkey -> dict(name, lat, lon, adv_ts, last_advert)
+        self.nodes = {}                   # pubkey -> dict(type, name, lat, lon, adv_ts, rf, obs): every node heard
+        self.nodes_dirty, self.nodes_gone = set(), set()     # advertising; rf/obs: when, by this radio / an observer
         self.heard = {}                   # repeater hash -> dict(last, w, t, last_direct, snr)
         self.next_topo_flush = time.monotonic() + 60
         self.last_rx_mono = 0.0
@@ -1357,6 +1367,8 @@ class RoomServer:
             self.edges[(bytes(a), bytes(b))] = [w, t, snr]
         for pub, name, lat, lon, adv_ts, last in st.read("SELECT pubkey, name, lat, lon, adv_ts, last_advert FROM repeaters"):
             self.repeaters[bytes(pub)] = dict(name=name, lat=lat, lon=lon, adv_ts=adv_ts, last_advert=last)
+        for pub, typ, name, lat, lon, adv_ts, rf, obs in st.read("SELECT pubkey, type, name, lat, lon, adv_ts, rf, obs FROM nodes"):
+            self.nodes[bytes(pub)] = dict(type=typ, name=name or "", lat=lat, lon=lon, adv_ts=adv_ts or 0, rf=rf, obs=obs)
         for h, last, w, t, last_direct, snr, disc, out_snr in st.read("SELECT hash, last, w, t, last_direct, snr, disc, out_snr FROM heard"):
             self.heard[bytes(h)] = dict(last=last, w=w, t=t, last_direct=last_direct, snr=snr, disc=disc or 0, out_snr=out_snr)
         for m in self.members.values():
@@ -1615,6 +1627,10 @@ class RoomServer:
         self.last_rx_mono = time.monotonic()
         self.rx_airtime_ms += self.airtime_ms(len(raw))
         self.stats["recv_flood" if pkt.is_flood else "recv_direct"] += 1
+        if pkt.ptype == PT_ADVERT:
+            a = self.parse_advert(pkt)
+            if a is not None:
+                self.note_node(a, "rf")                     # heard on the air here (not a packet a node here made)
         consumed = self._room_rx(pkt)
         for t in self.tenants.values():
             if t.wants(pkt):
@@ -3045,6 +3061,7 @@ class RoomServer:
                                            lon=a["lon"] if a["lon"] is not None else old.get("lon"),
                                            adv_ts=a["ts"], last_advert=old.get("last_advert") or now_s())
                 self._rpt_idx = None
+            self.note_node(a, "obs")
             if atype == ADV_TYPE_CHAT:
                 if pkt.hop_count and pkt.hash_size >= 2:
                     self.observe_near(pub, pkt.path[:pkt.hash_size], weight=0.5)
@@ -3833,6 +3850,43 @@ class RoomServer:
         self.names[k8] = (ts, name)
         self.mark_dirty()
 
+    def note_node(self, a, via):
+        """A signed advert (parse_advert's dict), heard on this radio (via "rf") or by an MQTT observer ("obs"):
+        the node directory. Name and position come from its newest advert; rf/obs say when it was last heard."""
+        pub = a["pub"]
+        if pub in self.own_node_keys():
+            return
+        n = self.nodes.get(pub)
+        if n is None:
+            if len(self.nodes) >= NODES_MAX:
+                old = min(self.nodes, key=lambda k: max(self.nodes[k]["rf"] or 0, self.nodes[k]["obs"] or 0))
+                del self.nodes[old]
+                self.nodes_dirty.discard(old)
+                self.nodes_gone.add(old)
+            n = self.nodes[pub] = dict(type=a["type"], name="", lat=None, lon=None, adv_ts=-1, rf=None, obs=None)
+            self.nodes_gone.discard(pub)
+        if a["ts"] >= n["adv_ts"]:
+            n.update(type=a["type"], name=a["name"] or n["name"], adv_ts=a["ts"])
+            if a["lat"] is not None:
+                n["lat"], n["lon"] = a["lat"], a["lon"]
+        n[via] = now_s()
+        self.nodes_dirty.add(pub)
+
+    def own_node_keys(self):
+        keys = {self.id.pub_key} | {t.id.pub_key for t in self.tenants.values()}
+        if self.vr is not None:
+            keys.add(self.vr.pub)
+        if self.vc is not None:
+            keys.add(self.vc.pub)
+        return keys
+
+    def heard_on_rf(self, pub, trust_observers=False):
+        """When this radio last heard the node advertise (or an observer did, if trusted), or None. Any thread."""
+        n = self.nodes.get(bytes(pub))
+        if n is None:
+            return None
+        return n["rf"] or (n["obs"] if trust_observers else None)
+
     def node_by_name(self, name):
         """key8 of the node advertising this name (ignoring case). Several: the one with known repeaters, then the
         newest advert."""
@@ -4030,7 +4084,12 @@ class RoomServer:
         ed_rows = [(a, b, e[0], e[1], e[2]) for (a, b), e in self.edges.items()]
         rp_rows = [(pub, r["name"], r["lat"], r["lon"], r["adv_ts"], r["last_advert"]) for pub, r in self.repeaters.items()]
         hd_rows = [(h, d["last"], d["w"], d["t"], d["last_direct"], d["snr"], d.get("disc", 0), d.get("out_snr")) for h, d in self.heard.items()]
+        nd_rows = [(pub, n["type"], n["name"], n["lat"], n["lon"], n["adv_ts"], n["rf"], n["obs"])
+                   for pub, n in ((k, self.nodes.get(k)) for k in self.nodes_dirty) if n is not None]
+        nd_gone = [(pub,) for pub in self.nodes_gone]
+        self.nodes_dirty, self.nodes_gone = set(), set()
         self.store.execmany([
+            ("DELETE FROM nodes WHERE pubkey = ?", nd_gone), ("INSERT OR REPLACE INTO nodes VALUES (?,?,?,?,?,?,?,?)", nd_rows),
             ("DELETE FROM rpt_routes", None), ("INSERT OR REPLACE INTO rpt_routes VALUES (?,?,?,?,?,?,?)", rr_rows),
             ("DELETE FROM member_rpts", None), ("INSERT OR REPLACE INTO member_rpts VALUES (?,?,?,?)", mr_rows),
             ("DELETE FROM member_inroutes", None), ("INSERT OR REPLACE INTO member_inroutes VALUES (?,?,?,?,?)", ir_rows),
@@ -6926,6 +6985,7 @@ class ObserverFeed:
 # ============================================================================
 
 KAAS_PATH = "/api/v1/kaas"
+WEB_PATH = "/api/v1/web"
 KAAS_TOKEN_PREFIX = "kaas_"
 KAAS_TICKET_PREFIX = "kt_"
 KAAS_TICKET_S = 30                    # a websocket ticket (for browsers, which can't send Authorization) lasts this long
@@ -6943,6 +7003,33 @@ KAAS_STATS = ("rx", "tx", "err")      # per key: packets streamed to it, packets
 KAAS_STATS_SAVE_S = 300
 KAAS_PRIO = 9                         # (and they go out after everything of the room's, the repeater's and pushes)
 WS_GUID = b"258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
+WEB_CHALLENGE_PREFIX = "wc_"
+WEB_CHALLENGE_S = 60                  # a web login's challenge must be signed and sent back within this long
+WEB_MAX_CHALLENGES = 256
+WEB_LOGIN_LABEL = "meshcore-web login v1"   # signed first, so a login signature is never a valid packet signature
+WEB_USERS_MAX = 1000                  # web users remembered for the dashboard (the least recently active go first)
+WEB_ID_PREFIX = "w:"                  # a web session's id in the per-key stats: "w:" + its public key
+# what a web session may send, and the identity each must carry (adverts, logins: the full key; DMs etc.: its hash)
+WEB_SEND_TYPES = (PT_ADVERT, PT_GRP_TXT, PT_TXT_MSG, PT_ACK, PT_PATH, PT_ANON_REQ, PT_REQ, PT_RESPONSE, PT_MULTIPART)
+
+
+def web_login_message(host, challenge, pub_hex):
+    """What a web login signs: the label, the server's host as the browser named it, the challenge, the key."""
+    return ("%s\n%s\n%s\n%s" % (WEB_LOGIN_LABEL, host, challenge, pub_hex)).encode()
+
+
+def web_packet_check(pkt, pub):
+    """None if a web session holding pub may send pkt, else why not."""
+    t, p = pkt.ptype, pkt.payload
+    if t not in WEB_SEND_TYPES:
+        return "web sessions can't send %s packets" % (PT_NAMES[t] if t < len(PT_NAMES) else t)
+    if t == PT_ADVERT and p[:PUB_KEY_SIZE] != pub:
+        return "an advert must be for your own key"
+    if t == PT_ANON_REQ and p[1:1 + PUB_KEY_SIZE] != pub:
+        return "a login must be from your own key"
+    if t in (PT_TXT_MSG, PT_REQ, PT_RESPONSE, PT_PATH) and (len(p) < 2 or p[1] != pub[0]):
+        return "a message must be from your own key"
+    return None
 
 
 def kaas_token_hash(token):
@@ -7077,6 +7164,7 @@ class KaasConn:
     def __init__(self, hub, sock, rfile, key, peer):
         self.hub, self.sock, self.rfile, self.peer = hub, sock, rfile, peer
         self.key_id, self.can_receive, self.can_send = key["id"], bool(key.get("receive")), bool(key.get("send"))
+        self.web = key.get("web")                           # a web login: its public key (hex); None for an API key
         self.out = collections.deque()
         self.cv = threading.Condition()
         self.wlock = threading.Lock()
@@ -7197,7 +7285,11 @@ class KaasHub:
         self.air = collections.deque()      # (monotonic, airtime ms) of clients' transmissions: the shared cap
         self.stats = dict(rx=0, tx=0, sent=0, local=0, dropped=0)
         self.next_check = 0.0
-        self.tickets = {}                   # ticket -> (key id, monotonic expiry): each opens one websocket, once
+        self.tickets = {}                   # ticket -> (key id or ("web", pub hex), monotonic expiry): one websocket, once
+        self.challenges = {}                # web login challenge -> monotonic expiry
+        self.wusers = {}                    # web user (pub hex) -> {"name", "first", "last"}: shown on the dashboard
+        self.wusers_path = os.path.join(room.cfg.data_dir, "web_users.json")
+        self.wusers_dirty = False
         self.slock = threading.Lock()
         self.kstats = {}                    # key id -> {"total": [rx, tx, err], "hours": {hour: [rx, tx, err]}}
         self.kstats_path = os.path.join(room.cfg.data_dir, "kaas_stats.json")
@@ -7211,6 +7303,14 @@ class KaasHub:
             pass
         except (ValueError, KeyError, TypeError, AttributeError, OSError) as e:
             log.warning("KaaS stats in %s not read: %s", self.kstats_path, e)
+        try:
+            with open(self.wusers_path) as f:
+                self.wusers = {k: dict(name=str(v.get("name", ""))[:32], first=int(v["first"]), last=int(v["last"]))
+                               for k, v in json.load(f).items()}
+        except FileNotFoundError:
+            pass
+        except (ValueError, KeyError, TypeError, AttributeError, OSError) as e:
+            log.warning("web users in %s not read: %s", self.wusers_path, e)
 
     # ---------------------------------------------------------------- per-key stats
 
@@ -7232,6 +7332,7 @@ class KaasHub:
             return {f: [day[i], st["total"][i]] for i, f in enumerate(KAAS_STATS)}
 
     def save_stats(self):
+        self.save_web_users()
         since = int(time.time() // 3600) - 23
         with self.slock:
             if not self.kstats_dirty:
@@ -7269,7 +7370,8 @@ class KaasHub:
 
     def new_ticket(self, key):
         """A one-time ticket for a key, or None when too many are waiting. Browsers can't put Authorization on a
-        websocket, so they POST the key to /api/v1/kaas/ticket and open the websocket with ?ticket=. Any thread."""
+        websocket, so they POST the key to /api/v1/kaas/ticket (or log in by signing, /api/v1/web/login) and open the
+        websocket with ?ticket=. Any thread."""
         import secrets
         ticket = KAAS_TICKET_PREFIX + secrets.token_urlsafe(24)
         now = time.monotonic()
@@ -7278,7 +7380,7 @@ class KaasHub:
                 del self.tickets[t]
             if len(self.tickets) >= KAAS_MAX_TICKETS:
                 return None
-            self.tickets[ticket] = (key["id"], now + KAAS_TICKET_S)
+            self.tickets[ticket] = (("web", key["web"]) if key.get("web") else key["id"], now + KAAS_TICKET_S)
         return ticket
 
     def redeem(self, ticket):
@@ -7287,7 +7389,120 @@ class KaasHub:
             e = self.tickets.pop(ticket, None)
         if e is None or e[1] <= time.monotonic():
             return None
+        if isinstance(e[0], tuple):
+            return self.web_key(e[0][1])
         return self.key_by_id(e[0])
+
+    # ---------------------------------------------------------------- web logins (any thread unless noted)
+
+    def web_banned(self, pub_hex):
+        return any(isinstance(b, dict) and b.get("pub") == pub_hex for b in (self.room.cfg.web_banned or []))
+
+    def web_can_send(self, pub_hex):
+        """Heard advertising on this radio (or by an observer, when trusted), or let in by the admin."""
+        if pub_hex in (self.room.cfg.web_approved or []):
+            return True
+        return self.room.heard_on_rf(bytes.fromhex(pub_hex), bool(self.room.cfg.web_trust_observers)) is not None
+
+    def web_key(self, pub_hex):
+        """A web login as a key: receive always, send once heard or allowed. None while logins are off, or banned."""
+        if not self.room.cfg.web_login or self.web_banned(pub_hex):
+            return None
+        return dict(id=WEB_ID_PREFIX + pub_hex, receive=True, send=self.web_can_send(pub_hex), expires=None, web=pub_hex)
+
+    def new_challenge(self):
+        import secrets
+        ch = WEB_CHALLENGE_PREFIX + secrets.token_urlsafe(24)
+        now = time.monotonic()
+        with self.lock:
+            for c in [c for c, exp in self.challenges.items() if exp <= now]:
+                del self.challenges[c]
+            if len(self.challenges) >= WEB_MAX_CHALLENGES:
+                return None
+            self.challenges[ch] = now + WEB_CHALLENGE_S
+        return ch
+
+    def web_login(self, body, hosts):
+        """POST /api/v1/web/login: {"pub", "signature", "challenge", "host", "name"}, the signature over
+        web_login_message(host, challenge, pub). -> (HTTP status, answer): a ticket, and whether this key may send."""
+        if not self.room.cfg.web_login:
+            return 403, {"error": "web logins are off on this server"}
+        body = body if isinstance(body, dict) else {}
+        pub, sig, ch, host = (str(body.get(k, "")).strip() for k in ("pub", "signature", "challenge", "host"))
+        pub = pub.lower()
+        try:
+            pb, sb = bytes.fromhex(pub), bytes.fromhex(sig)
+        except ValueError:
+            pb = sb = b""
+        if len(pb) != PUB_KEY_SIZE or len(sb) != SIGNATURE_SIZE:
+            return 400, {"error": "pub: a 32-byte public key in hex; signature: 64 bytes in hex"}
+        with self.lock:
+            exp = self.challenges.pop(ch, None)
+        if exp is None or exp <= time.monotonic():
+            return 401, {"error": "unknown or expired challenge: ask for a new one"}
+        if host.lower() not in hosts:
+            return 401, {"error": "the login was signed for %s, not this server" % host[:100]}
+        if not ed25519_verify(pb, sb, web_login_message(host, ch, pub)):
+            return 401, {"error": "the signature doesn't match the key"}
+        if pb in self.room.own_node_keys():
+            return 403, {"error": "that key belongs to a node on this server"}
+        if self.web_banned(pub):
+            return 403, {"error": "this key is banned from this server"}
+        name = "".join(c for c in str(body.get("name", "")) if ord(c) >= 0x20)[:32].strip()
+        self.web_seen(pub, name)
+        key = self.web_key(pub)
+        ticket = self.new_ticket(key) if key else None
+        if ticket is None:
+            return 503, {"error": "too many logins at once: try again shortly"}
+        return 200, {"ticket": ticket, "expires_in": KAAS_TICKET_S, "send": key["send"],
+                     "state": "allowed" if key["send"] else "pending"}
+
+    def web_seen(self, pub_hex, name=None):
+        """A web user logged in, or is still connected: the dashboard's list (the least recently active go first)."""
+        now = now_s()
+        with self.slock:
+            u = self.wusers.get(pub_hex)
+            if u is None:
+                if len(self.wusers) >= WEB_USERS_MAX:
+                    keep = set(self.room.cfg.web_approved or [])
+                    cands = [k for k in self.wusers if k not in keep] or list(self.wusers)
+                    del self.wusers[min(cands, key=lambda k: self.wusers[k]["last"])]
+                u = self.wusers[pub_hex] = dict(name="", first=now, last=now)
+            if name:
+                u["name"] = name
+            u["last"] = now
+            self.wusers_dirty = True
+
+    def save_web_users(self):
+        with self.slock:
+            if not self.wusers_dirty:
+                return
+            data = json.dumps(self.wusers)
+            self.wusers_dirty = False
+        tmp = self.wusers_path + ".tmp"
+        try:
+            with open(tmp, "w") as f:
+                f.write(data)
+            os.replace(tmp, self.wusers_path)
+        except OSError as e:
+            log.warning("web users not saved: %s", e)
+
+    def web_rows(self):
+        """The dashboard's Web users card: most recently active first, the connected ones on top."""
+        conns = list(self.conns)
+        approved = set(self.room.cfg.web_approved or [])
+        with self.slock:
+            users = {k: dict(v) for k, v in self.wusers.items()}
+        rows = []
+        for pub, u in users.items():
+            n = self.room.nodes.get(bytes.fromhex(pub)) or {}
+            connected = sum(1 for c in conns if c.web == pub)
+            rows.append(dict(pub=pub, name=u["name"], advert_name=n.get("name") or None, first=u["first"], last=u["last"],
+                             heard_rf=n.get("rf"), heard_obs=n.get("obs"), approved=pub in approved,
+                             send=self.web_can_send(pub), banned=self.web_banned(pub), connected=connected,
+                             stats=self.key_stats(WEB_ID_PREFIX + pub)))
+        rows.sort(key=lambda r: (-min(r["connected"], 1), -r["last"]))
+        return rows
 
     @staticmethod
     def valid(k, now=None):
@@ -7318,6 +7533,9 @@ class KaasHub:
         if kind == "kaas_query":
             self.query(*ev[1:])
             return
+        if kind == "kaas_web_admin":
+            self.web_admin(*ev[1:])
+            return
         if kind == "kaas_key_add":
             cfg.set("kaas_keys", self.keys() + [ev[1]])
         elif kind == "kaas_key_del":
@@ -7332,11 +7550,44 @@ class KaasHub:
             cfg.set("kaas_keys", [dict(k, last_used=ev[2]) if k["id"] == ev[1] else k for k in self.keys()])
         self.room.web_dirty = True
 
+    def web_admin(self, action, pub_hex, name=""):
+        """The dashboard's Web users card, in the main loop: allow / unallow sending, kick, ban, unban, forget;
+        or ("settings", {"web_login": bool, "web_trust_observers": bool})."""
+        cfg = self.room.cfg
+        if action == "settings":
+            for k, v in pub_hex.items():
+                cfg.set(k, v)
+        elif action == "allow":
+            cfg.set("web_approved", [p for p in (cfg.web_approved or []) if p != pub_hex] + [pub_hex])
+        elif action == "unallow":
+            cfg.set("web_approved", [p for p in (cfg.web_approved or []) if p != pub_hex])
+        elif action == "ban":
+            with self.slock:
+                name = name or (self.wusers.get(pub_hex) or {}).get("name", "")
+            cfg.set("web_banned", [b for b in (cfg.web_banned or []) if isinstance(b, dict) and b.get("pub") != pub_hex] +
+                    [dict(pub=pub_hex, name=name, ts=now_s())])
+            cfg.set("web_approved", [p for p in (cfg.web_approved or []) if p != pub_hex])
+        elif action == "unban":
+            cfg.set("web_banned", [b for b in (cfg.web_banned or []) if isinstance(b, dict) and b.get("pub") != pub_hex])
+        elif action == "forget":
+            with self.slock:
+                if self.wusers.pop(pub_hex, None) is not None:
+                    self.wusers_dirty = True
+        for c in self.conns:
+            if c.web and (c.web == pub_hex or action == "settings"):
+                if action == "kick":
+                    c.close(4005, "disconnected by the admin")
+                elif action == "ban":
+                    c.close(4003, "this key is banned from this server")
+        self.next_check = 0.0                               # settings, allow/unallow: applied by the next periodic check
+        self.room.web_dirty = True
+
     # ---------------------------------------------------------------- clients
 
     def add(self, conn):
         with self.lock:
-            if len(self.conns) >= KAAS_MAX_CLIENTS:
+            web = sum(1 for c in self.conns if c.web)
+            if (web >= int(self.room.cfg.web_max_clients or 0)) if conn.web else (len(self.conns) - web >= KAAS_MAX_CLIENTS):
                 return False
             self.conns = self.conns + [conn]
         self.last_used[conn.key_id] = now_s()
@@ -7355,8 +7606,10 @@ class KaasHub:
         room = self.room
         radio = dict(zip(("freq_hz", "bw_hz", "sf", "cr"), room.radio)) if room.radio else None
         return {"type": "hello", "api": 1, "server": FIRMWARE_VERSION,
-                "key": {"id": key["id"], "receive": bool(key.get("receive")), "send": bool(key.get("send")),
-                        "expires": key.get("expires")},
+                "key": dict({"id": key["id"], "receive": bool(key.get("receive")), "send": bool(key.get("send")),
+                             "expires": key.get("expires")},
+                            **({"web": True, "pub": key["web"], "state": "allowed" if key.get("send") else "pending"}
+                               if key.get("web") else {})),
                 "send_burst": int(room.cfg.kaas_send_burst), "send_window_s": float(room.cfg.kaas_send_window_s),
                 "airtime_pct": float(room.cfg.kaas_airtime_pct),
                 "radio": radio,
@@ -7383,7 +7636,8 @@ class KaasHub:
             self.stats["dropped"] += 1
             conn.send_json({"type": "send_result", "id": rid, "status": "dropped", "reason": reason})
         if not conn.can_send:
-            return drop("this key can't send")
+            return drop("your key hasn't been heard on this radio yet: the admin can let it send" if conn.web
+                        else "this key can't send")
         try:
             raw = bytes.fromhex(str(msg.get("raw", "")))
         except ValueError:
@@ -7538,12 +7792,21 @@ class KaasHub:
             conn.send_json(dict(type="send_result", id=rid, status=status, **kw))
         if conn.closed:
             return
-        k = self.key_by_id(conn.key_id)
-        if not self.valid(k) or not k.get("send"):
-            return result("dropped", reason="key revoked or expired")
+        if conn.web:
+            k = self.web_key(conn.web)
+            if k is None or not k["send"]:
+                return result("dropped", reason="this key may not send (anymore)")
+        else:
+            k = self.key_by_id(conn.key_id)
+            if not self.valid(k) or not k.get("send"):
+                return result("dropped", reason="key revoked or expired")
         pkt = Packet.parse(raw)
         if pkt is None or pkt.encode() != raw:
             return result("dropped", reason="not a valid MeshCore packet")
+        if conn.web:
+            why = web_packet_check(pkt, bytes.fromhex(conn.web))
+            if why:
+                return result("dropped", reason=why)
         own = self.own_keys()
         if (pkt.ptype == PT_ADVERT and pkt.payload[:PUB_KEY_SIZE] in own) or \
                 (pkt.ptype == PT_ANON_REQ and pkt.payload[1:1 + PUB_KEY_SIZE] in own):
@@ -7593,7 +7856,20 @@ class KaasHub:
             return
         self.next_check = now + 1.0
         t = time.time()
+        cfg = self.room.cfg
         for c in self.conns:
+            if c.web:
+                if not cfg.web_login:
+                    c.close(4004, "web logins were turned off")
+                elif self.web_banned(c.web):
+                    c.close(4003, "this key is banned from this server")
+                else:
+                    self.web_seen(c.web)
+                    send = self.web_can_send(c.web)
+                    if send != c.can_send:                  # heard on the air at last, or allowed / unallowed by the admin
+                        c.can_send = send
+                        c.send_json({"type": "access", "send": send, "state": "allowed" if send else "pending"})
+                continue
             k = self.key_by_id(c.key_id)
             if k is None:
                 c.close(4001, "key revoked")
@@ -7756,6 +8032,16 @@ Receive streams every packet this radio hears and sends. Send may send raw packe
 together within <span id="kk_air">5</span>% of airtime, after everything of the room's. Clients do their own MeshCore crypto: see docs/api.md and the Python client in client/.
 A key is shown once, when it is made: only a hash of it is kept, so a lost key can't be recovered, only revoked and replaced.</div>
 <table id="kklist" style="margin-top:8px"></table></div>
+<div class="card" id="webcard" style="display:none"><h2>Web users <span class="hdesc">MeshCore Web: people log in by signing with their node's private key, which never leaves their browser</span></h2>
+<div class="rprow"><label><input id="wb_on" type="checkbox" onchange="wbSettings({web_login:this.checked})"> Allow web logins</label>
+<label title="A key heard only by an MQTT observer, not by this radio, may send too"><input id="wb_obs" type="checkbox" onchange="wbSettings({web_trust_observers:this.checked})"> Trust keys heard by MQTT observers</label>
+<span class="dim small"><span id="wb_conn">0</span> of <span id="wb_max">32</span> sessions in use</span><span id="wbmsg" class="small"></span></div>
+<div class="hint" style="margin-left:26px">Anyone can log in and read. A key may send once this radio has heard it advertise (or after you press Allow send):
+<span id="wb_burst">3</span> packets per <span id="wb_win">20</span> s each, within the API's shared airtime cap, and only as itself. A ban is by public key: a new key starts out unable to send.</div>
+<table id="wblist" style="margin-top:8px"></table>
+<div class="rprow" style="margin-top:10px"><label>Ban a public key <input id="wb_banpub" class="mono" size="40" maxlength="64" placeholder="64 hex characters"></label>
+<button onclick="wbBanKey(this)">Ban</button><span id="wbbanmsg" class="small"></span></div>
+<table id="wbbanned" style="margin-top:8px"></table></div>
 <div class="card" id="advcard" style="display:none"><h2>Adverts <span class="hdesc">the room's, and the virtual repeater's when it's on</span></h2><div class="advrow">
 <div class="adv"><button class="act" title="Advert: zero-hop, heard by direct neighbours" onclick="sendAdvert(false,this)"><img src="icons/advert.png" alt="advert"></button><div>Advert<br><span class="dim small">zero-hop</span></div></div>
 <div class="adv"><button class="act" title="Flood advert: spreads across the whole mesh" onclick="sendAdvert(true,this)"><img src="icons/flood_advert.png" alt="flood advert"></button><div>Flood advert<br><span class="dim small">whole mesh</span></div></div>
@@ -7860,6 +8146,33 @@ async function kkCopy(){const i=$("kk_token");i.select();try{await navigator.cli
 function kkDone(){$("kk_token").value="";$("kkbox").style.display="none"}
 async function kkRevoke(b){if(!confirm("Revoke the API key "+b.dataset.name+"? Clients using it are disconnected now and can't connect again."))return;
  const m=await tnPost("api/v1/kaas/keys/"+b.dataset.id+"/revoke",{});if(m)alert(m);setTimeout(loadKaas,500)}
+let WB={users:[],banned:[]};
+async function loadWeb(){if(!MAINADM)return;let d;try{const r=await fetch("api/v1/web/users");if(!r.ok)return;d=await r.json()}catch(e){return}
+ WB=d;$("wb_on").checked=d.enabled;$("wb_obs").checked=d.trust_observers;$("wb_conn").textContent=d.connected;$("wb_max").textContent=d.max;
+ $("wb_burst").textContent=$("kk_burst").textContent;$("wb_win").textContent=$("kk_win").textContent;
+ const t=$("wblist");if(!d.users.length){t.innerHTML='<tr><td class="dim">'+(d.enabled?"Nobody has logged in yet.":"Web logins are off.")+'</td></tr>'}else{
+ const key=p=>`<span class="mono" title="${esc(p)}">${esc(p.slice(0,8))}&hellip;</span>`;
+ const access=u=>u.banned?'<span class="poor">banned</span>':u.send?('<span class="good">can send</span> <span class="dim small">'+(u.heard_rf?"heard "+ago(u.heard_rf)+" ago":u.approved?"allowed":"heard by an observer")+'</span>'):'<span class="mid">pending</span> <span class="dim small">not heard on the air</span>';
+ t.innerHTML="<tr><th>Name</th><th>Public key</th><th>Access</th><th>Last active</th><th>Connected</th>"+
+  '<th title="packets streamed to this user: last 24 h / total">Received <span class="dim small">24h / total</span></th><th title="packets this user sent: last 24 h / total">Sent <span class="dim small">24h / total</span></th>'+
+  '<th title="refused sends and other errors: last 24 h / total">Errors <span class="dim small">24h / total</span></th><th></th></tr>'+d.users.map(u=>
+  `<tr><td>${esc(u.name)||'<span class="dim">(no name)</span>'}${u.advert_name&&u.advert_name!==u.name?' <span class="dim small">adverts as '+esc(u.advert_name)+'</span>':''}</td><td>${key(u.pub)}</td>`+
+  `<td>${access(u)}</td><td>${ago(u.last)} ago</td><td>${u.connected?'<span class="mqdot on"></span> '+u.connected:'<span class="dim">no</span>'}</td>`+
+  ["rx","tx","err"].map(f=>{const v=(u.stats||{})[f]||[0,0];return `<td class="${f==="err"&&v[0]?"poor":""}">${v[0].toLocaleString()} <span class="dim">/ ${v[1].toLocaleString()}</span></td>`}).join("")+
+  `<td>${u.send||u.banned?"":`<button data-pub="${esc(u.pub)}" data-act="allow" onclick="wbAct(this)">Allow send</button> `}`+
+  `${u.approved&&!u.banned?`<button data-pub="${esc(u.pub)}" data-act="unallow" onclick="wbAct(this)">Unallow</button> `:""}`+
+  `${u.connected?`<button data-pub="${esc(u.pub)}" data-act="kick" onclick="wbAct(this)">Kick</button> `:""}`+
+  `${u.banned?"":`<button data-pub="${esc(u.pub)}" data-name="${esc(u.name)}" data-act="ban" onclick="wbAct(this)">Ban</button>`}</td></tr>`).join("")}
+ const b=$("wbbanned");b.innerHTML=d.banned.length?"<tr><th>Banned</th><th>Public key</th><th>Since</th><th></th></tr>"+d.banned.map(x=>
+  `<tr><td>${esc(x.name)||'<span class="dim">(no name)</span>'}</td><td class="mono">${esc(x.pub)}</td><td>${ago(x.ts)} ago</td>`+
+  `<td><button data-pub="${esc(x.pub)}" data-act="unban" onclick="wbAct(this)">Unban</button></td></tr>`).join(""):""}
+async function wbSettings(o){const m=await tnPost("api/v1/web/settings",o);$("wbmsg").className="poor small";$("wbmsg").textContent=m?" "+m:"";setTimeout(loadWeb,500)}
+async function wbAct(btn){const a=btn.dataset.act,p=btn.dataset.pub;
+ if(a==="ban"&&!confirm("Ban "+(btn.dataset.name||p.slice(0,8))+"? They are disconnected now and can't log in with this key again."))return;
+ if(a==="kick"&&!confirm("Disconnect "+p.slice(0,8)+"? They can log in again."))return;
+ btn.disabled=true;const m=await tnPost("api/v1/web/users/"+p+"/"+a,{name:btn.dataset.name||""});if(m)alert(m);setTimeout(loadWeb,500)}
+async function wbBanKey(btn){const p=$("wb_banpub").value.trim().toLowerCase();if(!/^[0-9a-f]{64}$/.test(p)){$("wbbanmsg").className="poor small";$("wbbanmsg").textContent=" A public key is 64 hex characters.";return}
+ btn.disabled=true;const m=await tnPost("api/v1/web/users/"+p+"/ban",{});btn.disabled=false;$("wbbanmsg").className=m?"poor small":"dim small";$("wbbanmsg").textContent=" "+(m||"Banned.");if(!m)$("wb_banpub").value="";setTimeout(loadWeb,500)}
 async function tnPost(url,o){const r=await fetch(url,{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(o)});
  let m="";if(!r.ok){m="Failed";try{m=(await r.json()).error||m}catch(e){}}if(r.status===401){m="Your admin session has expired: log in again.";session()}return m}
 async function tnCreate(btn){const o={name:$("tn_name").value.trim(),path:$("tn_path").value.trim(),private_key:$("tn_key").value.trim(),
@@ -7899,7 +8212,7 @@ async function session(){try{const r=await (await fetch("api/session")).json();A
  $("rpcard").style.display=MAINADM?"":"none";
  $("vccard").style.display=MAINADM?"":"none";
  $("tncard").style.display=MAINADM?"":"none";if(MAINADM)loadTenants();
- $("kaascard").style.display=MAINADM?"":"none";if(MAINADM)loadKaas();
+ $("kaascard").style.display=MAINADM?"":"none";if(MAINADM)loadKaas();$("webcard").style.display=MAINADM?"":"none";if(MAINADM)loadWeb();
  $("loginbtn").textContent=ADMIN?"Log out":"Log in";$("loginbtn").style.display=LOGIN_ON||ADMIN?"":"none";$("who").textContent=ADMIN?"admin":""}
 let OBS_SERVERS=[];
 function renderObserverServers(){const t=$("observerservers");t.innerHTML="<tr><th>Name</th><th>Endpoint</th><th>Audience</th><th>Prefix</th><th>State</th><th></th></tr>"+OBS_SERVERS.map((s,i)=>`<tr><td>${esc(s.name)}</td><td>${esc(s.host)}:${s.port}${esc(s.ws_path)}</td><td>${esc(s.audience)}</td><td>${esc(s.topic_prefix)}</td><td>${s.enabled?"enabled":"off"}</td><td><button onclick="removeObserverServer(${i})">Delete</button></td></tr>`).join("")}
@@ -8151,7 +8464,7 @@ $("sgpath").addEventListener("keydown",e=>{const it=acItems();
  else if((e.key==="Enter"||e.key==="Tab")&&ACI>=0&&$("aclist").style.display==="block"){acPick(it[ACI]);e.preventDefault()}
  else if(e.key==="Enter"){doSuggest()}else if(e.key==="Escape"){closeSuggest()}});
 $("chatmsg").addEventListener("input",chatLeft);$("chatmsg").addEventListener("keydown",e=>{if(e.key==="Enter")sendChat()});chatLeft();
-setInterval(()=>loadChat(false),3000);setInterval(loadTenants,5000);setInterval(loadKaas,5000);
+setInterval(()=>loadChat(false),3000);setInterval(loadTenants,5000);setInterval(loadKaas,5000);setInterval(loadWeb,5000);
 session().then(()=>{load();loadMap()});setInterval(load,1000);setInterval(loadMap,30000);setInterval(session,60000);
 </script></body></html>"""
 
@@ -8458,14 +8771,16 @@ class WebUI:
                         return self._send(401, '{"error":"missing, unknown, revoked or expired API key"}')
                     conn = KaasConn(hub, self.connection, self.rfile, key, self.client_address[0])
                     if not hub.add(conn):
-                        return self._send(503, json.dumps({"error": "at most %d API clients at once" % KAAS_MAX_CLIENTS}))
+                        return self._send(503, json.dumps({"error": "at most %d %s at once" % (
+                            (int(cfg.web_max_clients), "web sessions") if conn.web else (KAAS_MAX_CLIENTS, "API clients"))}))
                     self.send_response(101, "Switching Protocols")
                     self.send_header("Upgrade", "websocket")
                     self.send_header("Connection", "Upgrade")
                     self.send_header("Sec-WebSocket-Accept", ws_accept(wkey))
                     self.end_headers()
                     self.close_connection = True
-                    events.put(("kaas_used", key["id"], now_s()))
+                    if not conn.web:
+                        events.put(("kaas_used", key["id"], now_s()))
                     conn.send_json(hub.hello(key))
                 finally:
                     slots.release()
@@ -8491,9 +8806,38 @@ class WebUI:
                     return self._send(503, '{"error":"too many tickets waiting: try again shortly"}', headers=cors)
                 return self._send(200, json.dumps({"ticket": ticket, "expires_in": KAAS_TICKET_S}), headers=cors)
 
+            def _web_hosts(self):
+                """The host names a web login may be signed for: this request's Host; X-Forwarded-Host from a proxy on
+                this machine; and web_hosts from the config (a proxy elsewhere that rewrites Host)."""
+                hosts = {(self.headers.get("Host") or "").strip().lower()}
+                if self.client_address[0] in ("127.0.0.1", "::1", "::ffff:127.0.0.1"):
+                    hosts.add((self.headers.get("X-Forwarded-Host") or "").split(",")[0].strip().lower())
+                hosts.update(str(h).strip().lower() for h in (cfg.web_hosts or []))
+                hosts.discard("")
+                return hosts
+
+            def _web_public(self, path):
+                """POST /api/v1/web/challenge and /api/v1/web/login: logging in to MeshCore Web by signing with the
+                node's private key, which never leaves the browser. Any origin may ask (CORS: *); no cookies."""
+                cors = {"Access-Control-Allow-Origin": "*"}
+                body = self._body()
+                if path.endswith("/challenge"):
+                    if not cfg.web_login:
+                        return self._send(403, '{"error":"web logins are off on this server"}', headers=cors)
+                    ch = room.kaas.new_challenge()
+                    if ch is None:
+                        return self._send(503, '{"error":"too many logins at once: try again shortly"}', headers=cors)
+                    return self._send(200, json.dumps({"challenge": ch, "expires_in": WEB_CHALLENGE_S,
+                                                       "label": WEB_LOGIN_LABEL}), headers=cors)
+                code, answer = room.kaas.web_login(body, self._web_hosts())
+                if code == 200:
+                    log.info("web login %s (%s) from %s: %s", answer["state"], (body or {}).get("pub", "")[:8],
+                             self.client_address[0], (body or {}).get("name", ""))
+                return self._send(code, json.dumps(answer), headers=cors)
+
             def do_OPTIONS(self):
-                """CORS preflight, for the ticket endpoint only."""
-                if self.path.split("?")[0] != KAAS_PATH + "/ticket":
+                """CORS preflight, for the ticket and web login endpoints only."""
+                if self.path.split("?")[0] not in (KAAS_PATH + "/ticket", WEB_PATH + "/challenge", WEB_PATH + "/login"):
                     return self._send(404, '{"error":"not found"}')
                 self._send(204, b"", headers={"Access-Control-Allow-Origin": "*",
                                               "Access-Control-Allow-Methods": "POST",
@@ -8518,6 +8862,14 @@ class WebUI:
                     return self._send(200, json.dumps({"rooms": room.web_tenant_rows, "max": TENANT_MAX}))
                 if path == "/api/session":
                     return self._send(200, json.dumps({"admin": self._is_admin(), "login_enabled": bool(cfg.web_password)}))
+                if path == WEB_PATH + "/users":
+                    if not self._is_admin():
+                        return self._send(401, '{"error":"log in first"}')
+                    hub = room.kaas
+                    return self._send(200, json.dumps({
+                        "enabled": bool(cfg.web_login), "trust_observers": bool(cfg.web_trust_observers),
+                        "max": int(cfg.web_max_clients), "connected": sum(1 for c in hub.conns if c.web),
+                        "users": hub.web_rows(), "banned": [b for b in (cfg.web_banned or []) if isinstance(b, dict)]}))
                 if path == KAAS_PATH + "/keys":
                     if not self._is_admin():
                         return self._send(401, '{"error":"log in first"}')
@@ -8618,6 +8970,8 @@ class WebUI:
                     return self._tenant(t, "/" + rest, True)
                 if self.path.split("?")[0] == KAAS_PATH + "/ticket":
                     return self._kaas_ticket()
+                if self.path.split("?")[0] in (WEB_PATH + "/challenge", WEB_PATH + "/login"):
+                    return self._web_public(self.path.split("?")[0])
                 parts = self.path.strip("/").split("/")
                 if parts == ["api", "login"]:
                     if not cfg.web_password:
@@ -8653,6 +9007,28 @@ class WebUI:
                     token, entry = room.kaas.new_key(spec)
                     events.put(("kaas_key_add", entry))             # saved (hash only) by the main loop
                     return self._send(200, json.dumps({"ok": True, "id": entry["id"], "token": token}))
+                if parts == ["api", "v1", "web", "settings"]:
+                    body = self._body() or {}
+                    change = {k: body[k] for k in ("web_login", "web_trust_observers") if isinstance(body.get(k), bool)}
+                    if "web_max_clients" in body:
+                        n = body["web_max_clients"]
+                        if isinstance(n, bool) or not isinstance(n, int) or not 0 <= n <= 256:
+                            return self._send(400, '{"error":"web_max_clients: 0 to 256"}')
+                        change["web_max_clients"] = n
+                    if not change:
+                        return self._send(400, '{"error":"nothing to change"}')
+                    events.put(("kaas_web_admin", "settings", change))
+                    return self._send(200, '{"ok":true}')
+                if len(parts) == 6 and parts[:4] == ["api", "v1", "web", "users"] and \
+                        parts[5] in ("allow", "unallow", "kick", "ban", "unban", "forget"):
+                    try:
+                        pub = bytes.fromhex(parts[4])
+                    except ValueError:
+                        pub = b""
+                    if len(pub) != PUB_KEY_SIZE:
+                        return self._send(400, '{"error":"a 32-byte public key in hex"}')
+                    events.put(("kaas_web_admin", parts[5], pub.hex(), str((self._body() or {}).get("name", ""))[:32]))
+                    return self._send(200, '{"ok":true}')
                 if len(parts) == 6 and parts[:4] == ["api", "v1", "kaas", "keys"] and parts[5] == "revoke":
                     if room.kaas.key_by_id(parts[4]) is None:
                         return self._send(404, '{"error":"no such key"}')

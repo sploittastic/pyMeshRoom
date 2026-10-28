@@ -463,6 +463,10 @@ total), and **Revoke** disconnects a key's clients at once.
 * Protocol: [docs/api.md](docs/api.md), and [docs/asyncapi.yaml](docs/asyncapi.yaml) for tools.
 * Browsers trade the key for a one-time websocket ticket at `/api/v1/kaas/ticket`, since they can't send the
   `Authorization` header on a websocket.
+* **MeshCore Web logins** (off by default; **Web users** card): people log in by signing with their node's private key,
+  which never leaves their browser, instead of with an API key. Anyone can read. A key can send once this radio has
+  heard it advertise, or once the admin allows it, and only as itself. The card lists each user's name, key, access,
+  last activity and packet counts, with Allow send, Kick and Ban by key. See [docs/api.md](docs/api.md).
 * Python client: [client/](client/README.md). It works with raw packets, or as a full chat node: adverts, contacts,
   DMs, hashtag and private channels, and joining rooms.
 

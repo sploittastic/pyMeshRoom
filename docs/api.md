@@ -74,10 +74,58 @@ const {ticket} = await r.json();
 const ws = new WebSocket("wss://meshroom.example/api/v1/kaas?ticket=" + encodeURIComponent(ticket));
 ```
 
+### Logging in with a node's private key (MeshCore Web)
+
+People can log in without an API key, by signing with their MeshCore node's private key. The key never leaves their
+browser; only a signature does. The admin turns this on with **Allow web logins** on the dashboard's **Web users**
+card (`web_login`, off by default).
+
+1. `POST /api/v1/web/challenge` returns `{"challenge": "wc_...", "expires_in": 60, "label": "meshcore-web login v1"}`.
+2. Sign these lines, joined with `\n`, using Ed25519 and the node's key:
+   `meshcore-web login v1`, the server's host as the browser reached it (e.g. `mesh.example.com` or
+   `10.0.0.5:8081`), the challenge, and the public key in lowercase hex.
+3. `POST /api/v1/web/login` with
+   `{"pub": "<64 hex>", "signature": "<128 hex>", "challenge": "wc_...", "host": "...", "name": "pl@web"}`.
+   The answer is `{"ticket": "kt_...", "expires_in": 30, "send": true, "state": "allowed"}`, or
+   `"send": false, "state": "pending"`.
+4. Connect with `?ticket=`, as above.
+
+A challenge works once. The host must be the one this request arrived at: its `Host` header, `X-Forwarded-Host` from
+a reverse proxy on the same machine, or one listed in `web_hosts`. This stops another site from getting a visitor to
+sign a login for this server. The label means a login signature can never also be a valid MeshCore packet
+signature.
+
+Anyone may log in and receive. A key may **send** once this radio has heard it advertise, or once the admin presses
+**Allow send** for it. An advert sent through this API doesn't count: it has to be heard on the air. With
+`web_trust_observers`, an advert reported by an MQTT observer counts too. Until then the session is **pending**:
+sends are refused, and `{"type": "access", "send": true, "state": "allowed"}` arrives when that changes (it also
+arrives with `false` if the admin takes it back).
+
+A web session may only send what a chat client needs, and only as itself:
+
+* adverts for its own key, and room logins (`anon_req`) from its own key;
+* DMs, requests, responses and path returns whose sender hash is its own key's first byte;
+* channel messages and ACKs, which carry no sender identity in MeshCore;
+* nothing else: no traces, control or raw packets.
+
+It shares the API's rate limit (per key, so per web user) and the airtime cap. `hello` says it's a web login:
+`"key": {"id": "w:<pub>", "receive": true, "send": false, "expires": null, "web": true, "pub": "<64 hex>",
+"state": "pending"}`.
+
+On the **Web users** card, the admin sees each key's name, public key, access, last activity, connections and packet
+counts, and can:
+
+* **Allow send**: let a key send without being heard;
+* **Kick**: disconnect it, though it can log in again;
+* **Ban**: disconnect it and refuse it from then on; a key can also be banned before it ever logs in.
+
+A banned person can make a new key, but a new key can't send until it's heard on the air or allowed.
+
 Failed handshakes return:
 
 * 401: missing, unknown, revoked or expired key, after a one-second delay.
-* 503: too many clients. The limit is 16 connections across all keys.
+* 503: too many clients. The limit is 16 connections across all API keys, and `web_max_clients` (32) web sessions on
+  top of that.
 
 Every message in both directions is a JSON text frame. The server pings every 30 s. A connection that sends nothing
 back for 90 s, not even a pong, is closed.
@@ -86,6 +134,9 @@ Close codes from the server:
 
 * 4001: the key was revoked.
 * 4002: the key expired.
+* 4003: a web login's key was banned.
+* 4004: web logins were turned off.
+* 4005: the admin disconnected this web session (it may log in again).
 * 1001: the server is shutting down.
 * 1002: a protocol error (the reason says which).
 
@@ -141,6 +192,7 @@ Other messages:
   oldest are discarded and this tells you how many.
 * `{"type": "pong", "id": ...}`: the answer to your ping.
 * `{"type": "error", "error": "..."}`: a message the server couldn't use.
+* `{"type": "access", "send": bool, "state": "allowed" | "pending"}`: a web login's permission to send changed.
 
 ## Client to server
 
@@ -238,6 +290,12 @@ Bad input gets `{"type": "error", "id": ..., "error": ...}`. Questions share the
 | `kaas_send_burst` | 3 | Per key: at most this many packets... |
 | `kaas_send_window_s` | 20 | ...in any this many seconds. ACKs and path returns are excepted. |
 | `kaas_airtime_pct` | 5 | All API clients together: at most this share of airtime. |
+| `web_login` | false | MeshCore Web: people may log in by signing with their node's key. |
+| `web_max_clients` | 32 | Web sessions at once, apart from API keys' 16. |
+| `web_approved` | `[]` | Public keys (hex) allowed to send without being heard. Managed from the dashboard. |
+| `web_banned` | `[]` | `{"pub", "name", "ts"}` of banned keys. Managed from the dashboard. |
+| `web_trust_observers` | false | A key heard only by an MQTT observer may send too. |
+| `web_hosts` | `[]` | More host names a login may be signed for, behind a proxy elsewhere that rewrites `Host`. |
 
 ## Writing your own client
 

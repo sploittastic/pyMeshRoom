@@ -24,6 +24,7 @@ import meshroom_kaas as kc
 class FakeConn:
     def __init__(self, key, receive=True, send=True):
         self.key_id, self.can_receive, self.can_send = key, receive, send
+        self.web = None
         self.closed, self.inflight, self.msgs = False, 1, []
         self.cv = threading.Lock()
 
