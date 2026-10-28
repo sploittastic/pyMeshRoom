@@ -246,3 +246,24 @@ dialog.wide { width: min(760px, calc(100% - 32px)); }
 .mentions button { display: block; width: 100%; text-align: left; border: none; border-radius: 0; background: transparent; padding: 6px 10px; }
 .mentions button.on, .mentions button:hover { background: var(--mine); }
 .msg .room-author { color: var(--muted); font-weight: 400; }
+
+/* reactions */
+.msg { position: relative; }
+.react-btn {
+  position: absolute; top: -10px; right: 6px; padding: 0 6px; font-size: 12px; line-height: 18px; border-radius: 9px;
+  background: var(--panel); border-color: var(--line); color: var(--muted); opacity: 0; transition: opacity .1s;
+}
+.msg:hover .react-btn, .msg:focus-within .react-btn { opacity: 1; }
+@media (hover: none) { .react-btn { opacity: .75; } }
+.reactions { display: flex; flex-wrap: wrap; gap: 4px; margin-top: 4px; }
+.chip { padding: 0 7px; font-size: 13px; line-height: 20px; border-radius: 10px; background: var(--button); border-color: var(--line); }
+.chip.me { border-color: var(--accent); }
+.react-pop {
+  position: fixed; z-index: 20; display: grid; grid-template-columns: repeat(6, 36px); gap: 2px; padding: 6px;
+  background: var(--panel); border: 1px solid var(--line); border-radius: 8px; box-shadow: 0 6px 24px rgb(0 0 0 / .35);
+}
+.react-pop button { padding: 4px 0; font-size: 18px; border: none; background: transparent; }
+.react-pop button:hover { background: var(--button); }
+.reaction-note { align-self: center; color: var(--muted); font-size: 12px; }
+.reaction-note .emoji { font-size: 15px; }
+.msg .text.big { font-size: 34px; line-height: 1.2; }

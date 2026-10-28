@@ -177,6 +177,7 @@ DEFAULT_CONFIG = {
     "web_banned": [],               #   [{"pub", "name", "ts"}]: may not log in
     "web_trust_observers": False,   #   a key heard only by an MQTT observer may send too (else: heard on this radio)
     "web_hosts": [],                #   other host names logins may sign for (behind a proxy that rewrites Host)
+    "web_page_password": "",        #   a password for the MeshCore Web page and its logins (hashed; "" = none)
 }
 
 
@@ -7909,6 +7910,19 @@ class KaasHub:
 # Dashboard (own thread; reads only the snapshot the main loop publishes)
 # ============================================================================
 
+WEB_UNLOCK_HTML = """<!doctype html><html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1"><title>MeshCore Web</title>
+<style>:root{color-scheme:dark}body{margin:0;min-height:100vh;display:grid;place-items:center;background:#111418;color:#d8dee6;
+font:14px/1.45 system-ui,sans-serif;padding:16px}form{background:#1a1f26;border:1px solid #2a313b;border-radius:8px;padding:22px;
+width:100%;max-width:360px}h1{font-size:20px;margin:0 0 6px}p{color:#8a94a3;margin:0 0 14px}input{width:100%;box-sizing:border-box;
+padding:9px 11px;border:1px solid #2a313b;border-radius:4px;background:#111418;color:inherit;font:inherit}button{width:100%;
+margin-top:14px;padding:10px;border:1px solid #5cb3ff;border-radius:4px;background:#5cb3ff;color:#0b1420;font:inherit;font-weight:600;
+cursor:pointer}.err{color:#e05a5a;margin:12px 0 0}</style></head><body>
+<form method="post" action="unlock"><h1>MeshCore Web</h1><p>This server's MeshCore Web needs a password.</p>
+<input type="password" name="password" autocomplete="current-password" placeholder="Password" autofocus required aria-label="Password">
+{error}<button type="submit">Open</button></form></body></html>"""
+
+
 DASHBOARD_HTML = r"""<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>meshroom</title>
 <meta name="referrer" content="strict-origin-when-cross-origin">
@@ -8064,6 +8078,9 @@ A key is shown once, when it is made: only a hash of it is kept, so a lost key c
 <div class="rprow"><label><input id="wb_on" type="checkbox" onchange="wbSettings({web_login:this.checked})"> Allow web logins</label>
 <label title="A key heard only by an MQTT observer, not by this radio, may send too"><input id="wb_obs" type="checkbox" onchange="wbSettings({web_trust_observers:this.checked})"> Trust keys heard by MQTT observers</label>
 <span class="dim small"><span id="wb_conn">0</span> of <span id="wb_max">32</span> sessions in use</span><span id="wbmsg" class="small"></span></div>
+<div class="rprow"><label>Page password <input id="wb_pw" type="password" size="18" maxlength="64" autocomplete="new-password" placeholder="none"></label>
+<button onclick="wbPagePw(this,false)">Set</button><button id="wb_pw_rm" onclick="wbPagePw(this,true)">Remove</button>
+<span class="dim small" id="wb_pw_state"></span></div>
 <div class="hint" style="margin-left:26px">Anyone can log in and read. A key may send once this radio has heard it advertise (or after you press Allow send):
 <span id="wb_burst">3</span> packets per <span id="wb_win">20</span> s each, within the API's shared airtime cap, and only as itself. A ban is by public key: a new key starts out unable to send.</div>
 <table id="wblist" style="margin-top:8px"></table>
@@ -8176,7 +8193,7 @@ async function kkRevoke(b){if(!confirm("Revoke the API key "+b.dataset.name+"? C
  const m=await tnPost("api/v1/kaas/keys/"+b.dataset.id+"/revoke",{});if(m)alert(m);setTimeout(loadKaas,500)}
 let WB={users:[],banned:[]};
 async function loadWeb(){if(!MAINADM)return;let d;try{const r=await fetch("api/v1/web/users");if(!r.ok)return;d=await r.json()}catch(e){return}
- WB=d;$("wb_on").checked=d.enabled;$("wb_obs").checked=d.trust_observers;$("wb_conn").textContent=d.connected;$("wb_max").textContent=d.max;
+ WB=d;$("wb_on").checked=d.enabled;$("wb_pw_state").textContent=d.page_password?"set: the page and its logins ask for it":"none: anyone who can reach this server can open the page";$("wb_pw_rm").disabled=!d.page_password;$("wb_obs").checked=d.trust_observers;$("wb_conn").textContent=d.connected;$("wb_max").textContent=d.max;
  $("wb_burst").textContent=$("kk_burst").textContent;$("wb_win").textContent=$("kk_win").textContent;
  const t=$("wblist");if(!d.users.length){t.innerHTML='<tr><td class="dim">'+(d.enabled?"Nobody has logged in yet.":"Web logins are off.")+'</td></tr>'}else{
  const key=p=>`<span class="mono" title="${esc(p)}">${esc(p.slice(0,8))}&hellip;</span>`;
@@ -8194,6 +8211,10 @@ async function loadWeb(){if(!MAINADM)return;let d;try{const r=await fetch("api/v
  const b=$("wbbanned");b.innerHTML=d.banned.length?"<tr><th>Banned</th><th>Public key</th><th>Since</th><th></th></tr>"+d.banned.map(x=>
   `<tr><td>${esc(x.name)||'<span class="dim">(no name)</span>'}</td><td class="mono">${esc(x.pub)}</td><td>${ago(x.ts)} ago</td>`+
   `<td><button data-pub="${esc(x.pub)}" data-act="unban" onclick="wbAct(this)">Unban</button></td></tr>`).join(""):""}
+async function wbPagePw(btn,remove){const pw=remove?"":$("wb_pw").value;
+ if(!remove&&(pw.length<4||pw.length>64)){$("wbmsg").className="poor small";$("wbmsg").textContent=" A page password is 4 to 64 characters.";return}
+ if(remove&&!confirm("Remove the MeshCore Web page password? Anyone who can reach this server can then open the page."))return;
+ btn.disabled=true;await wbSettings({page_password:pw});btn.disabled=false;$("wb_pw").value=""}
 async function wbSettings(o){const m=await tnPost("api/v1/web/settings",o);$("wbmsg").className="poor small";$("wbmsg").textContent=m?" "+m:"";setTimeout(loadWeb,500)}
 async function wbAct(btn){const a=btn.dataset.act,p=btn.dataset.pub;
  if(a==="ban"&&!confirm("Ban "+(btn.dataset.name||p.slice(0,8))+"? They are disconnected now and can't log in with this key again."))return;
@@ -8563,6 +8584,8 @@ class WebUI:
         thtml = DASHBOARD_HTML.replace("<script>\nconst TENANT=", "<script>window.TENANT=true</script><script>\nconst TENANT=")
         tpage = (thtml.encode(), gzip.compress(thtml.encode(), 6))
         tsessions = {}                                      # token -> (expiry, tenant key hex)
+        wpsessions = {}                                     # MeshCore Web page: token -> (expiry, the password hash)
+        WEB_PAGE_SESSION_S = 30 * 86400
         tsnaps = {}                                         # tenant key -> (state dict, raw, gzipped)
         t_last_advert = {}
         viewers = {}                                        # client id -> (last seen, admin)
@@ -8845,11 +8868,65 @@ class WebUI:
                 hosts.discard("")
                 return hosts
 
+            def _page_unlocked(self):
+                """MeshCore Web's page password: none set, or this browser has a page session made under it."""
+                h = cfg.web_page_password
+                if not h:
+                    return True
+                for part in (self.headers.get("Cookie") or "").split(";"):
+                    k, _, v = part.strip().partition("=")
+                    if k == "mr_web":
+                        with slock:
+                            e = wpsessions.get(v)
+                            if e is not None and e[0] >= time.monotonic() and hmac.compare_digest(e[1], h):
+                                return True
+                return False
+
+            def _page_password_ok(self, pw):
+                if self._page_unlocked():
+                    return True
+                if pw and check_web_password(str(pw), cfg.web_page_password):
+                    return True
+                time.sleep(1.0)                             # slow down guessing
+                return False
+
+            def _web_unlock_page(self, error=""):
+                msg = '<p class="err">%s</p>' % error if error else ""
+                html = WEB_UNLOCK_HTML.replace("{error}", msg)
+                return self._send(401 if error else 200, html, "text/html; charset=utf-8",
+                                  headers={"Content-Security-Policy": "default-src 'none'; style-src 'unsafe-inline'; "
+                                           "form-action 'self'; frame-ancestors 'none'; base-uri 'none'",
+                                           "X-Frame-Options": "DENY", "Referrer-Policy": "no-referrer"})
+
+            def _web_unlock(self):
+                """POST /meshcore-web/unlock: the page password, from the form. Right: a page session (cookie), then
+                the app; wrong: the form again, after a second."""
+                n = int(self.headers.get("Content-Length") or 0)
+                form = urllib.parse.parse_qs(self.rfile.read(min(n, 4096)).decode(errors="replace")) if n else {}
+                pw = (form.get("password") or [""])[0]
+                if not cfg.web_page_password or not check_web_password(pw, cfg.web_page_password):
+                    time.sleep(1.0)
+                    return self._web_unlock_page("That isn't the password." if cfg.web_page_password else "")
+                tok = secrets.token_hex(24)
+                with slock:
+                    now_m = time.monotonic()
+                    for k in [k for k, e in wpsessions.items() if e[0] < now_m]:
+                        del wpsessions[k]
+                    wpsessions[tok] = (now_m + WEB_PAGE_SESSION_S, cfg.web_page_password)
+                self.send_response(303)
+                self.send_header("Location", "./")
+                self.send_header("Set-Cookie", "mr_web=%s; HttpOnly; SameSite=Strict; Path=/; Max-Age=%d" % (tok, WEB_PAGE_SESSION_S))
+                self.send_header("Content-Length", "0")
+                self.end_headers()
+
             def _web_public(self, path):
                 """POST /api/v1/web/challenge and /api/v1/web/login: logging in to MeshCore Web by signing with the
                 node's private key, which never leaves the browser. Any origin may ask (CORS: *); no cookies."""
                 cors = {"Access-Control-Allow-Origin": "*"}
                 body = self._body()
+                if cfg.web_login and not self._page_password_ok((body or {}).get("page_password")):
+                    return self._send(401, json.dumps({"error": "MeshCore Web on this server has a password",
+                                                       "page_password": True}), headers=cors)
                 if path.endswith("/challenge"):
                     if not cfg.web_login:
                         return self._send(403, '{"error":"web logins are off on this server"}', headers=cors)
@@ -8897,6 +8974,7 @@ class WebUI:
                     hub = room.kaas
                     return self._send(200, json.dumps({
                         "enabled": bool(cfg.web_login), "trust_observers": bool(cfg.web_trust_observers),
+                        "page_password": bool(cfg.web_page_password),
                         "max": int(cfg.web_max_clients), "connected": sum(1 for c in hub.conns if c.web),
                         "users": hub.web_rows(), "banned": [b for b in (cfg.web_banned or []) if isinstance(b, dict)]}))
                 if path == KAAS_PATH + "/keys":
@@ -8943,6 +9021,8 @@ class WebUI:
                     self.end_headers()
                     return
                 if path in ("/meshcore-web/", "/meshcore-web/index.html"):
+                    if not self._page_unlocked():
+                        return self._web_unlock_page()
                     if not os.path.isfile(MESHCORE_WEB_FILE):
                         return self._send(404, '{"error":"MeshCore Web isn\'t built: run node build.mjs in web/"}')
                     _, raw, gzd = cached_file(MESHCORE_WEB_FILE, True)
@@ -9016,6 +9096,8 @@ class WebUI:
                     return self._kaas_ticket()
                 if self.path.split("?")[0] in (WEB_PATH + "/challenge", WEB_PATH + "/login"):
                     return self._web_public(self.path.split("?")[0])
+                if self.path.split("?")[0] == "/meshcore-web/unlock":
+                    return self._web_unlock()
                 parts = self.path.strip("/").split("/")
                 if parts == ["api", "login"]:
                     if not cfg.web_password:
@@ -9054,6 +9136,11 @@ class WebUI:
                 if parts == ["api", "v1", "web", "settings"]:
                     body = self._body() or {}
                     change = {k: body[k] for k in ("web_login", "web_trust_observers") if isinstance(body.get(k), bool)}
+                    if "page_password" in body:
+                        pw = body["page_password"]
+                        if not isinstance(pw, str) or (pw and not 4 <= len(pw) <= 64):
+                            return self._send(400, '{"error":"page password: 4 to 64 characters, or empty for none"}')
+                        change["web_page_password"] = hash_web_password(pw) if pw else ""   # (hashed here: never stored)
                     if "web_max_clients" in body:
                         n = body["web_max_clients"]
                         if isinstance(n, bool) or not isinstance(n, int) or not 0 <= n <= 256:

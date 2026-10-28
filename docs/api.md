@@ -121,6 +121,15 @@ counts, and can:
 
 A banned person can make a new key, but a new key can't send until it's heard on the air or allowed.
 
+The admin can also set a **page password** on the card (`web_page_password`, stored hashed). Then:
+
+* `/meshcore-web/` shows a password form first. The right password gives that browser a page session (an `HttpOnly`
+  cookie, 30 days).
+* `/api/v1/web/challenge` and `/api/v1/web/login` need either that cookie or `"page_password"` in their JSON body.
+  Without them they answer 401 with `{"error": ..., "page_password": true}`, after a one-second delay.
+* A new password, or removing it, ends every page session.
+* API keys aren't affected.
+
 Failed handshakes return:
 
 * 401: missing, unknown, revoked or expired key, after a one-second delay.
@@ -308,6 +317,7 @@ Bad input gets `{"type": "error", "id": ..., "error": ...}`. Questions share the
 | `web_banned` | `[]` | `{"pub", "name", "ts"}` of banned keys. Managed from the dashboard. |
 | `web_trust_observers` | false | A key heard only by an MQTT observer may send too. |
 | `web_hosts` | `[]` | More host names a login may be signed for, behind a proxy elsewhere that rewrites `Host`. |
+| `web_page_password` | `""` | A password for the MeshCore Web page and its logins, hashed. Set from the dashboard. |
 
 ## Writing your own client
 

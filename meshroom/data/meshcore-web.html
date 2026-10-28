@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'sha256-ADHl61abDXPZWqVwVHioe5EiLw+Os9yd1iBGvFUCEMU=' 'self' https://unpkg.com/leaflet@1.9.4/dist/leaflet.js; style-src 'sha256-u2xfhdUKUKTY+Y30FjvCbYloc7aaSFWX9BQkZ1wgESg=' 'self' https://unpkg.com/leaflet@1.9.4/dist/leaflet.css; img-src 'self' data: https://media.giphy.com https://i.giphy.com https://*.tile.openstreetmap.org https://unpkg.com/leaflet@1.9.4/dist/images/; connect-src https: wss: http: ws:; base-uri 'none'; form-action 'none'">
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'sha256-36XTyex0vUI5tTiBCHkYJdIbCYECr3o22jq6/aPEYjw=' 'self' https://unpkg.com/leaflet@1.9.4/dist/leaflet.js; style-src 'sha256-MR/U7r6289lDmFT6czlrddrwJEDJYjKykxOcVDnLLVI=' 'self' https://unpkg.com/leaflet@1.9.4/dist/leaflet.css; img-src 'self' data: https://media.giphy.com https://i.giphy.com https://*.tile.openstreetmap.org https://unpkg.com/leaflet@1.9.4/dist/images/; connect-src https: wss: http: ws:; base-uri 'none'; form-action 'none'">
 <meta name="referrer" content="no-referrer">
 <title>MeshCore Web</title>
 <style>:root {
@@ -254,6 +254,27 @@ dialog.wide { width: min(760px, calc(100% - 32px)); }
 .mentions button { display: block; width: 100%; text-align: left; border: none; border-radius: 0; background: transparent; padding: 6px 10px; }
 .mentions button.on, .mentions button:hover { background: var(--mine); }
 .msg .room-author { color: var(--muted); font-weight: 400; }
+
+/* reactions */
+.msg { position: relative; }
+.react-btn {
+  position: absolute; top: -10px; right: 6px; padding: 0 6px; font-size: 12px; line-height: 18px; border-radius: 9px;
+  background: var(--panel); border-color: var(--line); color: var(--muted); opacity: 0; transition: opacity .1s;
+}
+.msg:hover .react-btn, .msg:focus-within .react-btn { opacity: 1; }
+@media (hover: none) { .react-btn { opacity: .75; } }
+.reactions { display: flex; flex-wrap: wrap; gap: 4px; margin-top: 4px; }
+.chip { padding: 0 7px; font-size: 13px; line-height: 20px; border-radius: 10px; background: var(--button); border-color: var(--line); }
+.chip.me { border-color: var(--accent); }
+.react-pop {
+  position: fixed; z-index: 20; display: grid; grid-template-columns: repeat(6, 36px); gap: 2px; padding: 6px;
+  background: var(--panel); border: 1px solid var(--line); border-radius: 8px; box-shadow: 0 6px 24px rgb(0 0 0 / .35);
+}
+.react-pop button { padding: 4px 0; font-size: 18px; border: none; background: transparent; }
+.react-pop button:hover { background: var(--button); }
+.reaction-note { align-self: center; color: var(--muted); font-size: 12px; }
+.reaction-note .emoji { font-size: 15px; }
+.msg .text.big { font-size: 34px; line-height: 1.2; }
 </style>
 <script type="module">// src/bytes.js
 const __src_bytes_js = (() => {
@@ -327,18 +348,248 @@ function i32le(n) {
 return { hexToBytes, bytesToHex, base64ToBytes, utf8Encode, utf8Decode, concatBytes, equalBytes, randomBytes, utf8Cut, u32le, readU32le, i32le };
 })();
 
+// src/hash.js
+const __src_hash_js = (() => {
+// SHA-256, SHA-512 and HMAC-SHA256 in plain JS: WebCrypto exists only on secure origins, and is async.
+const { concatBytes } = __src_bytes_js;
+// The round constants and initial values come from the primes (cube and square roots), so none are typed in.
+function firstPrimes(n) {
+  const out = [];
+  for (let c = 2; out.length < n; c++) if (out.every((p) => c % p)) out.push(c);
+  return out;
+}
+
+function iroot(x, k) {
+  // floor(x^(1/k)) for BigInt x, by Newton's method from above
+  let r = 1n << BigInt(Math.ceil(x.toString(2).length / Number(k)) + 1);
+  for (;;) {
+    const next = ((k - 1n) * r + x / r ** (k - 1n)) / k;
+    if (next >= r) return r;
+    r = next;
+  }
+}
+
+const MASK64 = (1n << 64n) - 1n;
+const PRIMES = firstPrimes(80);
+const K512 = PRIMES.map((p) => iroot(BigInt(p) << 192n, 3n) & MASK64);
+const H512 = PRIMES.slice(0, 8).map((p) => iroot(BigInt(p) << 128n, 2n) & MASK64);
+const K256 = Uint32Array.from(K512.slice(0, 64), (k) => Number(k >> 32n));
+const H256 = Uint32Array.from(H512, (h) => Number(h >> 32n));
+
+function pad(msg, blockBytes, lenBytes) {
+  const n = msg.length;
+  const total = Math.ceil((n + 1 + lenBytes) / blockBytes) * blockBytes;
+  const out = new Uint8Array(total);
+  out.set(msg);
+  out[n] = 0x80;
+  const bits = BigInt(n) * 8n;
+  for (let i = 0; i < 8; i++) out[total - 1 - i] = Number((bits >> BigInt(8 * i)) & 255n);
+  return out;
+}
+
+function sha256(msg) {
+  const m = pad(msg, 64, 8);
+  const h = Uint32Array.from(H256);
+  const w = new Uint32Array(64);
+  const rotr = (x, n) => (x >>> n) | (x << (32 - n));
+  for (let off = 0; off < m.length; off += 64) {
+    for (let i = 0; i < 16; i++) {
+      const j = off + i * 4;
+      w[i] = (m[j] << 24) | (m[j + 1] << 16) | (m[j + 2] << 8) | m[j + 3];
+    }
+    for (let i = 16; i < 64; i++) {
+      const s0 = rotr(w[i - 15], 7) ^ rotr(w[i - 15], 18) ^ (w[i - 15] >>> 3);
+      const s1 = rotr(w[i - 2], 17) ^ rotr(w[i - 2], 19) ^ (w[i - 2] >>> 10);
+      w[i] = (w[i - 16] + s0 + w[i - 7] + s1) | 0;
+    }
+    let [a, b, c, d, e, f, g, hh] = h;
+    for (let i = 0; i < 64; i++) {
+      const t1 = (hh + (rotr(e, 6) ^ rotr(e, 11) ^ rotr(e, 25)) + ((e & f) ^ (~e & g)) + K256[i] + w[i]) | 0;
+      const t2 = ((rotr(a, 2) ^ rotr(a, 13) ^ rotr(a, 22)) + ((a & b) ^ (a & c) ^ (b & c))) | 0;
+      hh = g; g = f; f = e; e = (d + t1) | 0; d = c; c = b; b = a; a = (t1 + t2) | 0;
+    }
+    h[0] += a; h[1] += b; h[2] += c; h[3] += d; h[4] += e; h[5] += f; h[6] += g; h[7] += hh;
+  }
+  const out = new Uint8Array(32);
+  for (let i = 0; i < 8; i++) {
+    out[i * 4] = h[i] >>> 24; out[i * 4 + 1] = h[i] >>> 16; out[i * 4 + 2] = h[i] >>> 8; out[i * 4 + 3] = h[i];
+  }
+  return out;
+}
+
+// BigInt words: slow next to native code, but it only signs the odd advert.
+function sha512(msg) {
+  const m = pad(msg, 128, 16);
+  const h = H512.slice();
+  const w = new Array(80);
+  const rotr = (x, n) => ((x >> n) | (x << (64n - n))) & MASK64;
+  for (let off = 0; off < m.length; off += 128) {
+    for (let i = 0; i < 16; i++) {
+      let v = 0n;
+      for (let j = 0; j < 8; j++) v = (v << 8n) | BigInt(m[off + i * 8 + j]);
+      w[i] = v;
+    }
+    for (let i = 16; i < 80; i++) {
+      const s0 = rotr(w[i - 15], 1n) ^ rotr(w[i - 15], 8n) ^ (w[i - 15] >> 7n);
+      const s1 = rotr(w[i - 2], 19n) ^ rotr(w[i - 2], 61n) ^ (w[i - 2] >> 6n);
+      w[i] = (w[i - 16] + s0 + w[i - 7] + s1) & MASK64;
+    }
+    let [a, b, c, d, e, f, g, hh] = h;
+    for (let i = 0; i < 80; i++) {
+      const t1 = (hh + (rotr(e, 14n) ^ rotr(e, 18n) ^ rotr(e, 41n)) + ((e & f) ^ (~e & MASK64 & g)) + K512[i] + w[i]) & MASK64;
+      const t2 = ((rotr(a, 28n) ^ rotr(a, 34n) ^ rotr(a, 39n)) + ((a & b) ^ (a & c) ^ (b & c))) & MASK64;
+      hh = g; g = f; f = e; e = (d + t1) & MASK64; d = c; c = b; b = a; a = (t1 + t2) & MASK64;
+    }
+    [a, b, c, d, e, f, g, hh].forEach((v, i) => { h[i] = (h[i] + v) & MASK64; });
+  }
+  const out = new Uint8Array(64);
+  h.forEach((v, i) => {
+    for (let j = 0; j < 8; j++) out[i * 8 + j] = Number((v >> BigInt(56 - 8 * j)) & 255n);
+  });
+  return out;
+}
+
+function hmacSha256(key, msg) {
+  let k = key.length > 64 ? sha256(key) : key;
+  const block = new Uint8Array(64);
+  block.set(k);
+  const ipad = block.map((b) => b ^ 0x36);
+  const opad = block.map((b) => b ^ 0x5c);
+  return sha256(concatBytes(opad, sha256(concatBytes(ipad, msg))));
+}
+
+return { sha256, sha512, hmacSha256 };
+})();
+
+// src/format.js
+const __src_format_js = (() => {
+// What MeshCore apps put inside a message's text, as the MeshTrax message format describes it
+// (github.com/venamartin/meshtrax, docs/message-format.md): reactions, and the hash that ties one to its message.
+const { concatBytes, u32le, utf8Encode } = __src_bytes_js;
+const { sha256 } = __src_hash_js;
+const CROCKFORD = "0123456789abcdefghjkmnpqrstvwxyz";
+
+// The quick-reaction row, as MeshTrax offers it.
+const QUICK_REACTIONS = ["👍", "❤️", "😂", "🎉", "👏", "🔥", "😮", "😢", "🙏", "👀", "✅", "💯"];
+
+// meshcore-open's frozen r: table (decode only: its hash can't be reproduced outside Dart, so such a reaction is
+// shown, but not attached to a message).
+const LEGACY_EMOJI = [
+  "👍", "❤️", "😂", "🎉", "👏", "🔥",
+  "😀", "😃", "😄", "😁", "😅", "😂", "🤣", "😊", "😇", "🙂", "🙃", "😉", "😌", "😍", "🥰", "😘", "😗", "😙", "😚",
+  "😋", "😛", "😝", "😜", "🤪", "🤨", "🧐", "🤓", "😎", "🥸", "🤩", "🥳", "😏", "😒", "😞", "😔", "😟", "😕", "🙁",
+  "😣", "😖", "😫", "😩", "🥺", "😢", "😭", "😤", "😠", "😡", "🤬", "🤯", "😳", "🥵", "🥶", "😱", "😨", "😰", "😥",
+  "😓", "🤗", "🤔", "🤭", "🤫", "🤥", "😶",
+  "👍", "👎", "👊", "✊", "🤛", "🤜", "🤞", "✌️", "🤟", "🤘", "👌", "🤌", "🤏", "👈", "👉", "👆", "👇", "☝️", "👋",
+  "🤚", "🖐️", "✋", "🖖", "👏", "🙌", "👐", "🤲", "🤝", "🙏", "✍️", "💅", "🤳", "💪",
+  "❤️", "🧡", "💛", "💚", "💙", "💜", "🖤", "🤍", "🤎", "💔", "❤️‍🔥", "❤️‍🩹", "💕", "💞", "💓", "💗", "💖", "💘",
+  "💝", "💟", "💌", "💢", "💥", "💫", "💦", "💨", "🕳️", "💬", "👁️‍🗨️", "🗨️", "🗯️", "💭",
+  "🎉", "🎊", "🎈", "🎁", "🎀", "🪅", "🪆", "🏆", "🥇", "🥈", "🥉", "⚽", "⚾", "🥎", "🏀", "🏐", "🏈", "🏉", "🎾",
+  "🥏", "🎳", "🏏", "🏑", "🏒", "🥍", "🏓", "🏸", "🥊", "🥋", "🥅", "⛳", "🔥", "⭐", "🌟", "✨", "⚡", "💡", "🔦",
+  "🏮", "🪔", "📱", "💻", "⌚", "📷", "📺", "📻", "🎵", "🎶", "🚀",
+];
+
+// A message's hash, as reactions name it: the first 5 bytes of SHA-256(UTF-8 text + its sender timestamp, u32 LE),
+// in 8 characters of lowercase Crockford Base32.
+function messageHash(text, ts) {
+  const d = sha256(concatBytes(utf8Encode(text), u32le(ts >>> 0)));
+  let bits = 0n;
+  for (let i = 0; i < 5; i++) bits = (bits << 8n) | BigInt(d[i]);
+  let out = "";
+  for (let shift = 35n; shift >= 0n; shift -= 5n) out += CROCKFORD[Number((bits >> shift) & 31n)];
+  return out;
+}
+
+function crockford(raw) {
+  if (raw.length !== 8) return null;
+  let out = "";
+  for (let ch of raw.toLowerCase()) {
+    if (ch === "o") ch = "0";
+    if (ch === "i" || ch === "l") ch = "1";
+    if (!CROCKFORD.includes(ch)) return null;
+    out += ch;
+  }
+  return out;
+}
+
+const looksLikeEmoji = (s) => {
+  const cps = [...s].map((c) => c.codePointAt(0));
+  return cps.length > 0 && cps.length <= 8 && (cps[0] >= 0x2000 || cps.some((c) => c === 0xfe0f || c === 0x20e3));
+};
+
+// A reaction's text -> {emoji, hash, targetSender} (MeshCore One: "@[Name]👍\nhash", older "👍@[Name]\nhash", or in a DM
+// "👍\nhash"), {emoji, legacy: true} (meshcore-open's "r:HASH:INDEX"), or null. A MeshCore One reaction looks like any
+// two-line message, so it only counts as one when its hash finds the message.
+function parseReaction(text) {
+  const legacy = /^r:([0-9a-f]{4}):([0-9a-f]{2})$/.exec(text);
+  if (legacy) {
+    const emoji = LEGACY_EMOJI[parseInt(legacy[2], 16)];
+    return emoji ? { emoji, legacy: true } : null;
+  }
+  const nl = text.lastIndexOf("\n");
+  if (nl < 0) return null;
+  const hash = crockford(text.slice(nl + 1));
+  let head = text.slice(0, nl);
+  if (!hash || head.includes("\n")) return null;
+  let targetSender = null;
+  if (head.startsWith("@[")) {
+    const close = head.lastIndexOf("]");
+    if (close < 3) return null;
+    targetSender = head.slice(2, close);
+    head = head.slice(close + 1);
+  } else {
+    const at = head.indexOf("@[");
+    if (at >= 0) {
+      if (!head.endsWith("]")) return null;
+      targetSender = head.slice(at + 2, -1);
+      if (!targetSender) return null;
+      head = head.slice(0, at);
+    }
+  }
+  return looksLikeEmoji(head) ? { emoji: head, hash, targetSender } : null;
+}
+
+// The text to send for a reaction: in a channel or a room, naming the message's author; in a DM, without.
+function reactionText(emoji, hash, author = null) {
+  return (author ? "@[" + author + "]" : "") + emoji + "\n" + hash;
+}
+
+// The forms a message's text may have been hashed in: as received, trimmed of spaces and tabs, and without leading
+// @[mentions] (apps hash a message as they show it).
+function hashTexts(text) {
+  const trimmed = text.replace(/^[ \t]+|[ \t]+$/g, "");
+  const bare = trimmed.replace(/^(?:@\[[^\]]*\][ \t]*\n?[ \t]*)+/, "");
+  return [...new Set([text, trimmed, bare])];
+}
+
+// A message of nothing but emoji, at most 5: shown large.
+function emojiOnly(text) {
+  const t = text.trim();
+  if (!t || /[\p{L}\p{N}]/u.test(t.replace(/[\u{1F1E6}-\u{1F1FF}]/gu, ""))) return false;
+  const parts = [...new Intl.Segmenter(undefined, { granularity: "grapheme" }).segment(t)].filter((s) => s.segment.trim());
+  return parts.length <= 5 && parts.every((s) => /\p{Extended_Pictographic}|\p{Regional_Indicator}|⃣/u.test(s.segment));
+}
+
+return { QUICK_REACTIONS, messageHash, parseReaction, reactionText, hashTexts, emojiOnly };
+})();
+
 // src/gif.js
 const __src_gif_js = (() => {
 // GIFs: a Giphy link in a message (as people paste them from giphy.com) is shown as the GIF itself.
 // Only Giphy's own image hosts are ever loaded, by id, so a message can't make the page fetch anything else.
 
-// giphy.com/gifs/[slug-]ID, giphy.com/embed/ID, media[0-4].giphy.com/media/[v1.../]ID/..., i.giphy.com/[media/]ID[.gif]
+// As the MeshTrax message format reads them, standing alone (separated by spaces or line breaks): meshcore-open's
+// g:ID; giphy.com/gifs/[slug-]ID (also /embed/, /clips/, /stickers/); media[0-4].giphy.com/media/[v1.../]ID/...;
+// i.giphy.com/[media/]ID[.gif]. The scheme is optional on the links.
 const GIPHY_RE = new RegExp(
-  "https?://(?:" +
-    "(?:www\\.)?giphy\\.com/(?:gifs|embed|clips|stickers)/(?:[\\w-]*-)?([A-Za-z0-9]{6,40})" +
-    "|media\\d?\\.giphy\\.com/media/(?:v1\\.[\\w.=-]+/)?([A-Za-z0-9]{6,40})" +
-    "|i\\.giphy\\.com/(?:media/)?([A-Za-z0-9]{6,40})" +
-  ")[^\\s]*",
+  "(?<=^|\\s)(?:" +
+    "g:([A-Za-z0-9_-]{12,64})" +
+    "|(?:https?://)?(?:" +
+      "(?:www\\.)?giphy\\.com/(?:gifs|embed|clips|stickers)/(?:[\\w-]*-)?([A-Za-z0-9]{6,40})" +
+      "|media\\d?\\.giphy\\.com/media/(?:v1\\.[\\w.=-]+/)?([A-Za-z0-9]{6,40})" +
+      "|i\\.giphy\\.com/(?:media/)?([A-Za-z0-9]{6,40})" +
+    ")[^\\s]*" +
+  ")(?=$|\\s)",
   "g",
 );
 
@@ -346,7 +597,7 @@ const GIPHY_RE = new RegExp(
 function findGifs(text) {
   const out = [];
   for (const m of String(text).matchAll(GIPHY_RE)) {
-    out.push({ start: m.index, end: m.index + m[0].length, id: m[1] || m[2] || m[3] });
+    out.push({ start: m.index, end: m.index + m[0].length, id: m[1] || m[2] || m[3] || m[4] });
   }
   return out;
 }
@@ -370,6 +621,9 @@ const WEB_PATH = "/api/v1/web";
 const WEB_LOGIN_LABEL = "meshcore-web login v1";
 
 class AuthError extends Error {}
+
+// The server's MeshCore Web has a page password, and this login didn't give it (or gave a wrong one).
+class PagePasswordNeeded extends AuthError {}
 
 // "https://host[/prefix]" (or with /api/v1/kaas on the end, or ws(s)://) -> {ticket: https URL, ws: wss URL}
 function kaasEndpoints(input) {
@@ -418,6 +672,7 @@ class KaasClient extends EventTarget {
     this.identity = auth.identity || null;
     this.name = auth.name || "";
     this.apiKey = String(auth.apiKey || "").trim();
+    this.pagePassword = auth.pagePassword || "";        // (a page served by the server itself has its cookie instead)
     this.ws = null;
     this.hello = null;
     this.state = "closed";
@@ -468,6 +723,7 @@ class KaasClient extends EventTarget {
       throw new Error("Can't reach " + this.endpoints.host + " (offline, a wrong URL, or a pyMeshRoom too old for browser logins).");
     }
     const answer = await r.json().catch(() => ({}));
+    if (r.status === 401 && answer.page_password) throw new PagePasswordNeeded(answer.error || "this server needs a page password");
     if (r.status === 401 || r.status === 403) throw new AuthError(answer.error || "the server refused the login");
     if (!r.ok) throw new Error(answer.error || "The server answered " + r.status + ".");
     return answer;
@@ -479,11 +735,12 @@ class KaasClient extends EventTarget {
       if (!r.ticket) throw new Error("The server sent no ticket.");
       return r.ticket;
     }
-    const { challenge } = await this.post(this.endpoints.challenge);
+    const page = this.pagePassword ? { page_password: this.pagePassword } : {};
+    const { challenge } = await this.post(this.endpoints.challenge, {}, page);
     if (!/^wc_[\w-]{8,100}$/.test(String(challenge))) throw new Error("The server sent a malformed challenge.");
     const pub = this.identity.pubHex;
     const signature = bytesToHex(this.identity.sign(webLoginMessage(this.endpoints.host, challenge, pub)));
-    const r = await this.post(this.endpoints.login, {}, { pub, signature, challenge, host: this.endpoints.host, name: this.name });
+    const r = await this.post(this.endpoints.login, {}, { pub, signature, challenge, host: this.endpoints.host, name: this.name, ...page });
     if (!r.ticket) throw new Error("The server sent no ticket.");
     return r.ticket;
   }
@@ -658,7 +915,7 @@ class KaasClient extends EventTarget {
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, Math.max(0, ms)));
 
-return { KAAS_PATH, WEB_PATH, WEB_LOGIN_LABEL, AuthError, kaasEndpoints, webLoginMessage, KaasClient };
+return { KAAS_PATH, WEB_PATH, WEB_LOGIN_LABEL, AuthError, PagePasswordNeeded, kaasEndpoints, webLoginMessage, KaasClient };
 })();
 
 // src/map.js
@@ -835,119 +1092,6 @@ function aesEcbDecrypt(key16, data) {
 }
 
 return { aesExpandKey, aesEncryptBlock, aesDecryptBlock, aesEcbEncrypt, aesEcbDecrypt };
-})();
-
-// src/hash.js
-const __src_hash_js = (() => {
-// SHA-256, SHA-512 and HMAC-SHA256 in plain JS: WebCrypto exists only on secure origins, and is async.
-const { concatBytes } = __src_bytes_js;
-// The round constants and initial values come from the primes (cube and square roots), so none are typed in.
-function firstPrimes(n) {
-  const out = [];
-  for (let c = 2; out.length < n; c++) if (out.every((p) => c % p)) out.push(c);
-  return out;
-}
-
-function iroot(x, k) {
-  // floor(x^(1/k)) for BigInt x, by Newton's method from above
-  let r = 1n << BigInt(Math.ceil(x.toString(2).length / Number(k)) + 1);
-  for (;;) {
-    const next = ((k - 1n) * r + x / r ** (k - 1n)) / k;
-    if (next >= r) return r;
-    r = next;
-  }
-}
-
-const MASK64 = (1n << 64n) - 1n;
-const PRIMES = firstPrimes(80);
-const K512 = PRIMES.map((p) => iroot(BigInt(p) << 192n, 3n) & MASK64);
-const H512 = PRIMES.slice(0, 8).map((p) => iroot(BigInt(p) << 128n, 2n) & MASK64);
-const K256 = Uint32Array.from(K512.slice(0, 64), (k) => Number(k >> 32n));
-const H256 = Uint32Array.from(H512, (h) => Number(h >> 32n));
-
-function pad(msg, blockBytes, lenBytes) {
-  const n = msg.length;
-  const total = Math.ceil((n + 1 + lenBytes) / blockBytes) * blockBytes;
-  const out = new Uint8Array(total);
-  out.set(msg);
-  out[n] = 0x80;
-  const bits = BigInt(n) * 8n;
-  for (let i = 0; i < 8; i++) out[total - 1 - i] = Number((bits >> BigInt(8 * i)) & 255n);
-  return out;
-}
-
-function sha256(msg) {
-  const m = pad(msg, 64, 8);
-  const h = Uint32Array.from(H256);
-  const w = new Uint32Array(64);
-  const rotr = (x, n) => (x >>> n) | (x << (32 - n));
-  for (let off = 0; off < m.length; off += 64) {
-    for (let i = 0; i < 16; i++) {
-      const j = off + i * 4;
-      w[i] = (m[j] << 24) | (m[j + 1] << 16) | (m[j + 2] << 8) | m[j + 3];
-    }
-    for (let i = 16; i < 64; i++) {
-      const s0 = rotr(w[i - 15], 7) ^ rotr(w[i - 15], 18) ^ (w[i - 15] >>> 3);
-      const s1 = rotr(w[i - 2], 17) ^ rotr(w[i - 2], 19) ^ (w[i - 2] >>> 10);
-      w[i] = (w[i - 16] + s0 + w[i - 7] + s1) | 0;
-    }
-    let [a, b, c, d, e, f, g, hh] = h;
-    for (let i = 0; i < 64; i++) {
-      const t1 = (hh + (rotr(e, 6) ^ rotr(e, 11) ^ rotr(e, 25)) + ((e & f) ^ (~e & g)) + K256[i] + w[i]) | 0;
-      const t2 = ((rotr(a, 2) ^ rotr(a, 13) ^ rotr(a, 22)) + ((a & b) ^ (a & c) ^ (b & c))) | 0;
-      hh = g; g = f; f = e; e = (d + t1) | 0; d = c; c = b; b = a; a = (t1 + t2) | 0;
-    }
-    h[0] += a; h[1] += b; h[2] += c; h[3] += d; h[4] += e; h[5] += f; h[6] += g; h[7] += hh;
-  }
-  const out = new Uint8Array(32);
-  for (let i = 0; i < 8; i++) {
-    out[i * 4] = h[i] >>> 24; out[i * 4 + 1] = h[i] >>> 16; out[i * 4 + 2] = h[i] >>> 8; out[i * 4 + 3] = h[i];
-  }
-  return out;
-}
-
-// BigInt words: slow next to native code, but it only signs the odd advert.
-function sha512(msg) {
-  const m = pad(msg, 128, 16);
-  const h = H512.slice();
-  const w = new Array(80);
-  const rotr = (x, n) => ((x >> n) | (x << (64n - n))) & MASK64;
-  for (let off = 0; off < m.length; off += 128) {
-    for (let i = 0; i < 16; i++) {
-      let v = 0n;
-      for (let j = 0; j < 8; j++) v = (v << 8n) | BigInt(m[off + i * 8 + j]);
-      w[i] = v;
-    }
-    for (let i = 16; i < 80; i++) {
-      const s0 = rotr(w[i - 15], 1n) ^ rotr(w[i - 15], 8n) ^ (w[i - 15] >> 7n);
-      const s1 = rotr(w[i - 2], 19n) ^ rotr(w[i - 2], 61n) ^ (w[i - 2] >> 6n);
-      w[i] = (w[i - 16] + s0 + w[i - 7] + s1) & MASK64;
-    }
-    let [a, b, c, d, e, f, g, hh] = h;
-    for (let i = 0; i < 80; i++) {
-      const t1 = (hh + (rotr(e, 14n) ^ rotr(e, 18n) ^ rotr(e, 41n)) + ((e & f) ^ (~e & MASK64 & g)) + K512[i] + w[i]) & MASK64;
-      const t2 = ((rotr(a, 28n) ^ rotr(a, 34n) ^ rotr(a, 39n)) + ((a & b) ^ (a & c) ^ (b & c))) & MASK64;
-      hh = g; g = f; f = e; e = (d + t1) & MASK64; d = c; c = b; b = a; a = (t1 + t2) & MASK64;
-    }
-    [a, b, c, d, e, f, g, hh].forEach((v, i) => { h[i] = (h[i] + v) & MASK64; });
-  }
-  const out = new Uint8Array(64);
-  h.forEach((v, i) => {
-    for (let j = 0; j < 8; j++) out[i * 8 + j] = Number((v >> BigInt(56 - 8 * j)) & 255n);
-  });
-  return out;
-}
-
-function hmacSha256(key, msg) {
-  let k = key.length > 64 ? sha256(key) : key;
-  const block = new Uint8Array(64);
-  block.set(k);
-  const ipad = block.map((b) => b ^ 0x36);
-  const opad = block.map((b) => b ^ 0x5c);
-  return sha256(concatBytes(opad, sha256(concatBytes(ipad, msg))));
-}
-
-return { sha256, sha512, hmacSha256 };
 })();
 
 // src/ed25519.js
@@ -1555,9 +1699,9 @@ class MeshNode extends EventTarget {
   }
 
   // A direct message (or a post, to a room). Retries until ACKed, the last try by flood. -> {acked, status, reason}
-  async sendDm(c, text, attempts = 3, onAttempt = () => {}) {
+  // ts: its timestamp (the same on every try), which a reaction to it hashes.
+  async sendDm(c, text, attempts = 3, onAttempt = () => {}, ts = this.uniqueTime()) {
     const body = utf8Cut(utf8Encode(text), c.room ? MAX_ROOM_POST_LEN : MAX_TEXT_LEN);
-    const ts = this.uniqueTime();
     let last = { status: "dropped", reason: "not sent" };
     for (let attempt = 0; attempt < attempts; attempt++) {
       const data = concatBytes(u32le(ts), new Uint8Array([(TXT_TYPE_PLAIN << 2) | (attempt & 3)]), body);
@@ -1760,8 +1904,9 @@ const __src_app_js = (() => {
 // The web app: log in, then talk on MeshCore channels, in DMs and in rooms through pyMeshRoom's KaaS API.
 // The private key, channel secrets and room passwords never leave the browser; the server only sees encrypted packets.
 const { bytesToHex, randomBytes, utf8Decode, utf8Encode } = __src_bytes_js;
+const { QUICK_REACTIONS, emojiOnly, hashTexts, messageHash, parseReaction, reactionText } = __src_format_js;
 const { findGifs, gifFallbackUrl, gifPageUrl, gifUrl } = __src_gif_js;
-const { AuthError, KaasClient, kaasEndpoints } = __src_kaas_js;
+const { AuthError, KaasClient, PagePasswordNeeded, kaasEndpoints } = __src_kaas_js;
 const { showMap } = __src_map_js;
 const { Identity, MAX_NAME_LEN, MAX_TEXT_LEN, PT_ADVERT, PT_GRP_TXT, advertPayload, channelMessagePacket, floodPacket, makeChannel, packetHash, parsePacket, readChannelMessage, textBudget, zeroHopPacket } = __src_meshcore_js;
 const { LoginFailed, MAX_ROOM_POST_LEN, MeshNode } = __src_node_js;
@@ -1771,6 +1916,7 @@ const HISTORY_PER_CONVERSATION = 300;
 const SEEN_MAX = 4096;
 const DIRECTORY_EVERY_MS = 15 * 60 * 1000;     // the server's node directory, refreshed this often
 const DIRECTORY_DAYS = 7;
+const REACTION_WINDOW_MS = 48 * 3600 * 1000;   // a reaction is matched against messages this recent
 const $ = (id) => document.getElementById(id);
 
 const app = {
@@ -1863,6 +2009,8 @@ function initLogin() {
   $("f-priv").value = s.remember && !s.vault ? s.privateKey || "" : "";
   setUnlockMode(!!(s.remember && s.vault));
   $("key-box").open = !!$("f-key").value;
+  $("f-sitepw").value = s.remember && !s.vault ? s.pagePassword || "" : "";
+  $("sitepw-box").hidden = !$("f-sitepw").value;
   updatePubPreview();
   $("login").hidden = false;
   if (!autoTried && s.remember && s.privateKey && s.name && $("f-url").value) {
@@ -1906,6 +2054,7 @@ async function login(ev) {
   const s = loadSettings();
   const url = $("f-url").value.trim();
   let apiKey = $("key-box").open ? $("f-key").value.trim() : "";
+  let pagePassword = $("f-sitepw").value;
   let priv = $("f-priv").value.trim();
   const name = $("f-name").value.trim();
   const go = $("login-go");
@@ -1917,7 +2066,7 @@ async function login(ev) {
     go.disabled = false;
     go.textContent = "Connect";
     if (!opened) return showError("login-error", "That passphrase doesn't unlock the saved key.");
-    ({ privateKey: priv, apiKey = "" } = JSON.parse(utf8Decode(opened)));
+    ({ privateKey: priv, apiKey = "", pagePassword = pagePassword } = JSON.parse(utf8Decode(opened)));
   }
   let identity;
   try {
@@ -1938,24 +2087,32 @@ async function login(ev) {
   else if ($("f-pass").value) {
     go.textContent = "Saving…";
     await new Promise((r) => setTimeout(r, 20));
-    saveSettings({ ...prefs, vault: seal(utf8Encode(JSON.stringify({ privateKey: identity.privateHex, apiKey })), $("f-pass").value) });
-  } else saveSettings({ ...prefs, apiKey: apiKey || undefined, privateKey: identity.privateHex });
+    saveSettings({ ...prefs, vault: seal(utf8Encode(JSON.stringify({ privateKey: identity.privateHex, apiKey, pagePassword })), $("f-pass").value) });
+  } else saveSettings({ ...prefs, apiKey: apiKey || undefined, pagePassword: pagePassword || undefined, privateKey: identity.privateHex });
 
   go.disabled = true;
   go.textContent = "Connecting…";
-  const client = new KaasClient(url, apiKey ? { apiKey } : { identity, name });
+  const client = new KaasClient(url, apiKey ? { apiKey } : { identity, name, pagePassword });
   try {
     await client.start();
   } catch (e) {
     client.stop();
     go.disabled = false;
     go.textContent = "Connect";
+    if (e instanceof PagePasswordNeeded) {
+      const asked = !$("sitepw-box").hidden;
+      $("sitepw-box").hidden = false;
+      $("f-sitepw").focus();
+      return showError("login-error", asked && pagePassword ? "That isn't the server's page password." :
+        "This server's MeshCore Web needs a password: enter it above.");
+    }
     return showError("login-error", e instanceof AuthError ? "The server refused the login: " + e.message : e.message);
   }
   go.disabled = false;
   go.textContent = "Connect";
   $("f-priv").value = remember && !loadSettings().vault ? $("f-priv").value : "";
   $("f-key").value = remember && !loadSettings().vault ? $("f-key").value : "";
+  $("f-sitepw").value = remember && !loadSettings().vault ? $("f-sitepw").value : "";
   $("f-pass").value = $("f-unlock").value = "";
   startChat(identity, name, client);
 }
@@ -2175,6 +2332,7 @@ function onPost({ room, author, text, ts }) {
 }
 
 function addIncoming(key, msg) {
+  if (takeReaction(key, msg)) return;
   (app.history[key] ||= []).push(msg);
   scheduleSave();
   if (key === app.active) appendMessage(msg);
@@ -2205,6 +2363,87 @@ function onState({ state, reason }) {
 }
 
 // ---------------------------------------------------------------- sending
+
+// ---------------------------------------------------------------- reactions (MeshCore One's format, as MeshTrax uses it)
+
+// An incoming message that is a reaction to one we hold: added to it, and true. Otherwise false (one that finds nothing
+// stays a message, shown as a reaction note).
+function takeReaction(key, msg) {
+  const r = parseReaction(msg.text);
+  if (!r) return false;
+  const target = r.legacy ? null : findReactionTarget(key, r);
+  if (!target) {
+    msg.reaction = { emoji: r.emoji, to: r.targetSender || null };
+    return false;
+  }
+  addReaction(target, r.emoji, msg.sender);
+  updateMessage(target);
+  scheduleSave();
+  return true;
+}
+
+function findReactionTarget(key, r) {
+  const since = Date.now() - REACTION_WINDOW_MS;
+  const msgs = (app.history[key] || []).filter((m) => !m.reaction && m.at >= since);
+  const hit = (m) => hashTexts(m.text).some((t) => messageHash(t, m.ts) === r.hash);
+  for (const pass of [(m) => m.sender === r.targetSender, () => true])
+    for (let i = msgs.length - 1; i >= 0; i--) if (pass(msgs[i]) && hit(msgs[i])) return msgs[i];
+  return null;
+}
+
+function addReaction(m, emoji, who) {
+  m.reactions ||= {};
+  const list = (m.reactions[emoji] ||= []);
+  if (list.includes(who)) return false;                  // the same person, the same emoji: once
+  list.push(who);
+  return true;
+}
+
+async function react(m, emoji) {
+  closeReactPicker();
+  const key = Object.keys(app.history).find((k) => app.history[k].includes(m));
+  const cv = conv(key);
+  if (!cv || !canSend()) return toast("Can't send right now.");
+  if (!addReaction(m, emoji, app.name)) return;
+  updateMessage(m);
+  scheduleSave();
+  // the hash covers the text as the author's app holds it: in a channel the body trimmed, else exactly as sent
+  const hash = messageHash(cv.kind === "channel" ? hashTexts(m.text)[1] || m.text : m.text, m.ts);
+  const text = reactionText(emoji, hash, cv.kind === "dm" ? null : m.sender);
+  let ok;
+  if (cv.kind === "channel") {
+    const raw = channelMessagePacket(cv.channel, app.name, text, uniqueTime());
+    markSeen(packetHash(parsePacket(raw)));
+    const res = await app.client.send(raw);
+    ok = res.status === "sent" || res.status === "local";
+  } else {
+    ok = (await app.node.sendDm(cv.contact, text)).acked;
+  }
+  if (!ok) {
+    m.reactions[emoji] = m.reactions[emoji].filter((w) => w !== app.name);
+    if (!m.reactions[emoji].length) delete m.reactions[emoji];
+    updateMessage(m);
+    toast("The reaction wasn't delivered.");
+  }
+}
+
+let pickerFor = null;
+
+function openReactPicker(m, button) {
+  const pop = $("react-pop");
+  if (pickerFor === m && !pop.hidden) return closeReactPicker();
+  pickerFor = m;
+  pop.replaceChildren(...QUICK_REACTIONS.map((e) => el("button", { type: "button", "aria-label": "React " + e, onclick: () => react(m, e) }, e)));
+  pop.hidden = false;
+  const r = button.getBoundingClientRect(), w = pop.offsetWidth;
+  pop.style.left = Math.max(8, Math.min(window.innerWidth - w - 8, r.right - w)) + "px";
+  pop.style.top = Math.max(8, r.top - pop.offsetHeight - 6) + "px";
+}
+
+function closeReactPicker() {
+  pickerFor = null;
+  $("react-pop").hidden = true;
+}
 
 async function sendMessage(ev) {
   ev?.preventDefault();
@@ -2249,7 +2488,7 @@ async function deliver(cv, msg) {
     const res = await app.node.sendDm(c, msg.text, 3, (attempt, flood) => {
       if (attempt) Object.assign(msg, { status: "retrying", reason: flood ? "by flood" : "" });
       updateMessage(msg);
-    });
+    }, msg.ts);
     msg.status = res.acked ? "delivered" : res.status === "dropped" ? "failed" : "unconfirmed";
     msg.reason = res.acked ? "" : res.reason || "";
   }
@@ -2377,6 +2616,12 @@ function appendMessage(m, scroll = true) {
 
 function messageNode(m) {
   const when = new Date(shownTime(m));
+  if (m.reaction) {
+    return el("div", { class: "reaction-note", dataset: { id: m.id }, title: when.toLocaleString() },
+      el("b", {}, m.sender || "(no name)"), " reacted ", el("span", { class: "emoji" }, m.reaction.emoji),
+      m.reaction.to ? " to a message from " + m.reaction.to : " to a message", " not shown here");
+  }
+  const reactions = Object.entries(m.reactions || {}).filter(([, who]) => who.length);
   const route = [];
   if (m.hops != null) route.push(m.hops === 0 ? "direct" : m.hops + (m.hops === 1 ? " hop" : " hops"));
   if (m.snr != null) route.push("SNR " + Number(m.snr).toFixed(1));
@@ -2387,7 +2632,13 @@ function messageNode(m) {
       el("time", { datetime: when.toISOString(), title: when.toLocaleString() },
         when.toLocaleTimeString(undefined, { hour: "2-digit", minute: "2-digit" })),
       route.length ? el("span", {}, route.join(" · ")) : null),
-    el("div", { class: "text" }, ...richText(m.text)),
+    el("div", { class: "text" + (emojiOnly(m.text) ? " big" : "") }, ...richText(m.text)),
+    reactions.length ? el("div", { class: "reactions" }, ...reactions.map(([e, who]) => el("button", {
+      type: "button", class: "chip" + (who.includes(app.name) ? " me" : ""), title: who.join(", "),
+      "aria-label": e + " from " + who.join(", "), onclick: () => react(m, e),
+    }, e + (who.length > 1 ? " " + who.length : "")))) : null,
+    el("button", { type: "button", class: "react-btn", title: "React", "aria-label": "React to this message",
+      onclick: (ev) => openReactPicker(m, ev.currentTarget) }, "☺+"),
     m.mine ? statusNode(m) : null);
 }
 
@@ -2842,6 +3093,10 @@ function wire() {
     logout();
   });
   $("toggle-side").addEventListener("click", () => $("sidebar").classList.toggle("open"));
+  document.addEventListener("click", (e) => {
+    if (!$("react-pop").hidden && !e.target.closest("#react-pop, .react-btn")) closeReactPicker();
+  });
+  $("messages").addEventListener("scroll", closeReactPicker);
   document.addEventListener("visibilitychange", () => {
     if (!document.hidden && app.active && app.unread[app.active]) {
       delete app.unread[app.active];
@@ -2893,6 +3148,12 @@ return {  };
 
     <label for="f-name">Your name</label>
     <input id="f-name" type="text" maxlength="31" placeholder="Shown before your messages" required>
+
+    <div id="sitepw-box" hidden>
+      <label for="f-sitepw">Server page password</label>
+      <input id="f-sitepw" type="password" placeholder="The password for this server's MeshCore Web" autocomplete="off">
+      <p class="hint">This server's MeshCore Web has a password, set by its admin.</p>
+    </div>
 
     <details id="key-box">
       <summary>Use an API key instead</summary>
@@ -3078,6 +3339,7 @@ return {  };
   </div>
 </dialog>
 
+<div class="react-pop" id="react-pop" role="menu" aria-label="React" hidden></div>
 <div class="toast" id="toast" role="status" hidden></div>
 </body>
 </html>

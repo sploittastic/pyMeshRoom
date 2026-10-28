@@ -135,9 +135,9 @@ export class MeshNode extends EventTarget {
   }
 
   // A direct message (or a post, to a room). Retries until ACKed, the last try by flood. -> {acked, status, reason}
-  async sendDm(c, text, attempts = 3, onAttempt = () => {}) {
+  // ts: its timestamp (the same on every try), which a reaction to it hashes.
+  async sendDm(c, text, attempts = 3, onAttempt = () => {}, ts = this.uniqueTime()) {
     const body = utf8Cut(utf8Encode(text), c.room ? MAX_ROOM_POST_LEN : MAX_TEXT_LEN);
-    const ts = this.uniqueTime();
     let last = { status: "dropped", reason: "not sent" };
     for (let attempt = 0; attempt < attempts; attempt++) {
       const data = concatBytes(u32le(ts), new Uint8Array([(TXT_TYPE_PLAIN << 2) | (attempt & 3)]), body);

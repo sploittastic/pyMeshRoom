@@ -22,7 +22,16 @@ test("Giphy links, in the forms people paste them", () => {
 test("several, and nothing else", () => {
   const text = "a https://giphy.com/gifs/a-abcdef123 and https://i.giphy.com/XYZ987abc.gif";
   assert.deepEqual(findGifs(text).map((g) => g.id), ["abcdef123", "XYZ987abc"]);
-  for (const t of ["https://giphy.com/", "https://evilgiphy.com/gifs/abcdef123", "giphy.com/gifs/abcdef123",
-    "https://example.com/?u=https:/giphy.com/gifs/x", "https://giphy.com.evil.example/gifs/abcdef123"])
+  for (const t of ["https://giphy.com/", "https://evilgiphy.com/gifs/abcdef123", "x-giphy.com/gifs/abcdef123",
+    "https://example.com/?u=https://giphy.com/gifs/abcdef123", "https://giphy.com.evil.example/gifs/abcdef123",
+    "see:https://giphy.com/gifs/abcdef123", "g:short", "eg:JIX9t2j0ZTN9Sabc"])
     assert.deepEqual(findGifs(t), [], t);
+});
+
+test("the MeshTrax forms: g:ID, links without a scheme, after a mention or in a reply", () => {
+  assert.deepEqual(findGifs("g:JIX9t2j0ZTN9S").map((g) => g.id), ["JIX9t2j0ZTN9S"]);
+  assert.deepEqual(findGifs("giphy.com/gifs/cat-funny-JIX9t2j0ZTN9S").map((g) => g.id), ["JIX9t2j0ZTN9S"]);
+  assert.deepEqual(findGifs("http://www.giphy.com/gifs/JIX9t2j0ZTN9S/").map((g) => g.id), ["JIX9t2j0ZTN9S"]);
+  assert.deepEqual(findGifs("media.giphy.com/media/JIX9t2j0ZTN9S/giphy.gif").map((g) => g.id), ["JIX9t2j0ZTN9S"]);
+  assert.deepEqual(findGifs("@[Bob]\n>look at..\ng:abcdefghijkl").map((g) => g.id), ["abcdefghijkl"]);
 });

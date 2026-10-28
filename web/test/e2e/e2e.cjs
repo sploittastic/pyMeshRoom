@@ -19,6 +19,14 @@ const ok = (cond, what) => { if (!cond) { console.log('FAIL', what); process.exi
 const GIF_ID = 'JIX9t2j0ZTN9S';
 const command = (line) => fs.appendFileSync(W + '/rx.txt', line + '\n');
 const seed = () => require('crypto').randomBytes(32).toString('hex');
+// MeshCore One's message hash (what a reaction names): Crockford base32 of SHA-256(text + u32 LE ts)[0..5]
+function messageHash(text, ts) {
+  const b = Buffer.alloc(4); b.writeUInt32LE(ts >>> 0);
+  const d = require('crypto').createHash('sha256').update(Buffer.concat([Buffer.from(text, 'utf8'), b])).digest();
+  let bits = 0n; for (let i = 0; i < 5; i++) bits = (bits << 8n) | BigInt(d[i]);
+  let out = ''; for (let sh = 35n; sh >= 0n; sh -= 5n) out += '0123456789abcdefghjkmnpqrstvwxyz'[Number((bits >> sh) & 31n)];
+  return out;
+}
 const LEAFLET_DIR = path.join(process.env.PYMESHROOM, 'meshroom', 'data', 'static');
 const TINY_GIF = Buffer.from('R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7', 'base64');
 
@@ -214,6 +222,31 @@ let b;
   ok(await p.inputValue('#text') === 'hey @[Bob] ', 'autocomplete: @Bo becomes @[Bob]');
   await p.fill('#text', '');
 
+  // reactions (MeshCore One's format): to our own message, from someone else, and ours to theirs
+  const hist = await p.evaluate((pub16) => JSON.parse(localStorage.getItem('meshcore-web.history.' + pub16) || '{}'), PUB.slice(0, 16));
+  const pub = Object.values(hist).flat();
+  const mine = pub.find((m) => m.mine && m.text === 'hello from the browser');
+  inject('Public', 'Bob', '@[WebTester]👍\n' + messageHash(mine.text, mine.ts));
+  await p.waitForSelector('.msg.mine:has(.text:text("hello from the browser")) .chip', { timeout: 10000 });
+  ok(await p.textContent('.msg.mine:has(.text:text("hello from the browser")) .chip') === '👍' &&
+    await p.locator('.msg .text:has-text("👍")').count() === 0, 'a reaction to our message shows on it, not as a message');
+  inject('Public', 'Carol', '@[Nobody]🔥\nabcdefgh');
+  await p.waitForSelector('.reaction-note:has-text("Carol")', { timeout: 10000 });
+  ok(true, 'a reaction to a message we never saw: a note, not raw text');
+  await p.hover('.msg:has(.text:text("only once"))');
+  await p.click('.msg:has(.text:text("only once")) .react-btn');
+  await p.click('#react-pop button:text("❤️")');
+  await p.waitForSelector('.msg:has(.text:text("only once")) .chip.me', { timeout: 5000 });
+  ok(true, 'reacting to a message: shown at once');
+  const theirs = pub.find((m) => m.text === 'only once');
+  const wantReaction = 'WebTester: @[Bob]❤️\n' + messageHash('only once', theirs.ts);
+  inject('Public', 'Bob', '🎉');
+  await p.waitForSelector('.msg .text.big:text("🎉")', { timeout: 10000 });
+  ok(true, 'an emoji-only message is shown large');
+  inject('Public', 'Bob', 'g:abcdefghijklmn');
+  await p.waitForSelector('.msg:last-child .gif img', { timeout: 10000 });
+  ok(true, 'a g:ID GIF (meshcore-open) is shown');
+
   // the map
   await p.click('#open-map');
   await p.waitForSelector('#map-box .leaflet-interactive', { timeout: 15000 });
@@ -304,6 +337,32 @@ let b;
   ok(await served.evaluate(() => getComputedStyle(document.body).backgroundColor) === 'rgb(17, 20, 24)', 'the dashboard\'s look');
   await served.screenshot({ path: shotPrefix + '-served.png' });
 
+  // a page password, set by the admin: the served page asks first; a standalone page asks when it logs in
+  ok(await admin('/api/v1/web/settings', { page_password: 'open sesame' }) === 200, 'admin sets a page password');
+  const locked = await newPage(b);
+  await locked.goto(SERVER + '/meshcore-web/');
+  ok(await locked.isVisible('input[name=password]') && await locked.locator('#login').count() === 0, 'the page asks for its password first');
+  await locked.fill('input[name=password]', 'wrong');
+  await locked.click('button[type=submit]');
+  ok(/isn't the password/.test(await locked.textContent('body')), 'a wrong page password is refused');
+  await locked.screenshot({ path: shotPrefix + '-locked.png' });
+  await locked.fill('input[name=password]', 'open sesame');
+  await locked.click('button[type=submit]');
+  await locked.waitForSelector('#login:not([hidden])', { timeout: 10000 });
+  await loginWith(locked, { url: null, name: 'Unlocked' });
+  await waitOpen(locked);
+  ok(true, 'the right page password opens the app, and logging in works');
+  const standalone = await newPage(b);
+  await standalone.goto(pageUrl);
+  await loginWith(standalone, { name: 'Elsewhere' });
+  await standalone.waitForSelector('#sitepw-box:not([hidden])', { timeout: 15000 });
+  ok(/needs a password/.test(await standalone.textContent('#login-error')), 'a page elsewhere is asked for the server\'s page password');
+  await standalone.fill('#f-sitepw', 'open sesame');
+  await standalone.click('#login-go');
+  await waitOpen(standalone);
+  ok(true, 'with it, it logs in');
+  ok(await admin('/api/v1/web/settings', { page_password: '' }) === 200, 'admin removes the page password');
+
   const mp = await newPage(b, { viewport: { width: 390, height: 780 }, isMobile: true, hasTouch: true });
   await mp.goto(pageUrl);
   await loginWith(mp, { name: 'Phone' });
@@ -317,6 +376,8 @@ let b;
   ok(tx.includes("GRP Public 'WebTester: hello from the browser'"), 'the radio sent our Public message, readable by the Python client');
   ok(tx.includes("GRP 00112233445566778899aabbccddeeff 'WebTester: burst 4'"), 'the radio sent our private message, readable with the secret');
   ok(/ADVERT flood \w+ valid-sig WebTester/.test(tx), 'the radio sent our advert, with a valid signature');
+  ok(tx.includes(wantReaction.replace('\n', '\\n')),                      // (readtx prints the line break as \n)
+    'the radio sent our reaction, naming the message by its hash: ' + JSON.stringify(wantReaction));
   for (const pg of [p, banned, apiPage, bad, served, mp]) errors.push(...pg.errors);
   ok(errors.length === 0, 'no page errors' + (errors.length ? ': ' + errors.join(' | ') : ''));
 })().catch(e => { console.log('FAIL', e.message); process.exitCode = 1; }).finally(() => b && b.close());

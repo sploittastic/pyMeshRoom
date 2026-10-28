@@ -43,6 +43,12 @@
     <label for="f-name">Your name</label>
     <input id="f-name" type="text" maxlength="31" placeholder="Shown before your messages" required>
 
+    <div id="sitepw-box" hidden>
+      <label for="f-sitepw">Server page password</label>
+      <input id="f-sitepw" type="password" placeholder="The password for this server's MeshCore Web" autocomplete="off">
+      <p class="hint">This server's MeshCore Web has a password, set by its admin.</p>
+    </div>
+
     <details id="key-box">
       <summary>Use an API key instead</summary>
       <label for="f-key">API key</label>
@@ -227,6 +233,7 @@
   </div>
 </dialog>
 
+<div class="react-pop" id="react-pop" role="menu" aria-label="React" hidden></div>
 <div class="toast" id="toast" role="status" hidden></div>
 </body>
 </html>

@@ -32,6 +32,10 @@ def advert(ident, name, ts=None, lat=None, lon=None):
     return flood(mr.PT_ADVERT, ident.pub + tsb + ident.sign(ident.pub + tsb + app) + app)
 
 
+def check(stored, pw):
+    return bool(stored) and mr.check_web_password(pw, stored)
+
+
 def channel_msg(text):
     data = struct.pack("<I", int(time.time())) + b"\0" + text.encode()
     return flood(mr.PT_GRP_TXT, bytes([channel_hash(PUBLIC_CHANNEL_KEY)]) +
@@ -260,6 +264,56 @@ class WebLoginTests(WebTestCase):
         c.close()
         with self.assertRaisesRegex(ValueError, "already in use"):
             mr.tenant_spec({"name": "Web", "path": "meshcore-web", "web_password": "x" * 12})
+
+    def test_page_password(self):
+        """With a page password, /meshcore-web/ shows a password form, and the login API wants it (or the cookie)."""
+        import http.client
+        self.enable()
+        self.assertEqual(self.http("POST", "/api/v1/web/settings", {"page_password": "abc"})[0], 400)   # too short
+        self.assertEqual(self.http("POST", "/api/v1/web/settings", {"page_password": "open sesame"})[0], 200)
+        self.assertTrue(self.h.pump(lambda: self.h.cfg.web_page_password, 5))
+        self.assertTrue(self.h.cfg.web_page_password.startswith("pbkdf2_sha256$"))           # only a hash is kept
+        self.assertTrue(self.http("GET", "/api/v1/web/users")[1]["page_password"])
+
+        def get(path, cookie=None, body=None):
+            c = http.client.HTTPConnection("127.0.0.1", self.port, timeout=10)
+            hdrs = {"Cookie": cookie} if cookie else {}
+            if body is None:
+                c.request("GET", path, headers=hdrs)
+            else:
+                c.request("POST", path, body=body, headers=dict(hdrs, **{"Content-Type": "application/x-www-form-urlencoded"}))
+            r = c.getresponse()
+            out = (r.status, r.getheader("Set-Cookie"), r.getheader("Location"), r.read().decode())
+            c.close()
+            return out
+        code, _, _, page = get("/meshcore-web/")
+        self.assertEqual(code, 200)
+        self.assertIn('name="password"', page)
+        self.assertNotIn("script-src 'sha256-", page)                                       # not the app
+        self.assertEqual(get("/meshcore-web/unlock", body="password=wrong")[0], 401)
+        code, cookie, where, _ = get("/meshcore-web/unlock", body="password=open+sesame")
+        self.assertEqual((code, where), (303, "./"))
+        self.assertIn("HttpOnly", cookie)
+        cookie = cookie.split(";")[0]
+        self.assertIn("script-src 'sha256-", get("/meshcore-web/", cookie)[3])               # the app now
+
+        me = kc.Identity.generate()
+        code, d = self.post("/api/v1/web/challenge")
+        self.assertEqual((code, d.get("page_password")), (401, True))                       # no cookie, no password
+        code, d = self.post("/api/v1/web/challenge", {"page_password": "open sesame"})
+        self.assertEqual(code, 200)                                                         # (a page served elsewhere)
+        msg = mr.web_login_message(self.host, d["challenge"], me.pub.hex())
+        body = dict(pub=me.pub.hex(), signature=me.sign(msg).hex(), challenge=d["challenge"], host=self.host, page_password="open sesame")
+        self.assertEqual(self.post("/api/v1/web/login", body)[0], 200)
+        self.assertEqual(self.post("/api/v1/web/challenge", headers={"Cookie": cookie})[0], 200)   # (the page's cookie)
+
+        self.http("POST", "/api/v1/web/settings", {"page_password": "a new one"})            # a new password: the old
+        self.assertTrue(self.h.pump(lambda: check(self.h.cfg.web_page_password, "a new one"), 5))   # sessions end
+        self.assertIn('name="password"', get("/meshcore-web/", cookie)[3])
+        self.http("POST", "/api/v1/web/settings", {"page_password": ""})
+        self.assertTrue(self.h.pump(lambda: not self.h.cfg.web_page_password, 5))
+        self.assertIn("script-src 'sha256-", get("/meshcore-web/")[3])                       # removed: open again
+        self.assertEqual(self.post("/api/v1/web/challenge")[0], 200)
 
     def test_web_sessions_have_their_own_limit(self):
         self.enable(web_max_clients=1)

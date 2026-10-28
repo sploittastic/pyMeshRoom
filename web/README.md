@@ -37,6 +37,10 @@ that happens. The admin can also disconnect or ban a key.
 
 For a server with web logins turned off, **Use an API key instead** takes a KaaS key (`kaas_…`) from its dashboard.
 
+If the admin set a **page password**, the page pyMeshRoom serves asks for it before showing anything. A copy of the
+page opened from elsewhere asks for it when logging in. With **Remember me**, it's saved like the key (sealed, with a
+passphrase).
+
 ### How it authenticates
 
 1. The page asks the server for a one-time challenge (`POST /api/v1/web/challenge`).
@@ -68,8 +72,19 @@ What you get:
   repeaters shows once.
 * `@[name]` mentions are highlighted, and mentions of you stand out. Typing `@` suggests names: people who wrote in this
   conversation lately first, then your contacts. Arrow keys or Tab pick one, which is inserted as `@[name]`.
-* **GIFs:** a Giphy link in a message (`https://giphy.com/gifs/…`, as Giphy's Share button copies it) shows as the
-  GIF itself. To send one, paste the link; the GIF is previewed while you type. Other MeshCore apps see the link.
+* **Reactions**, in MeshCore One's format as the
+  [MeshTrax message format](https://github.com/venamartin/meshtrax/blob/master/docs/message-format.md#reactions)
+  describes it.
+  * **On the wire:** `@[Author]👍` and a second line holding the message's hash: 8 Crockford Base32 characters of
+    SHA-256(text + its timestamp). In a DM, just `👍` and the hash.
+  * **Receiving:** a reaction is matched against the last 48 hours of that conversation and shown as a chip on its
+    message. One whose message isn't here shows as a short note, not as raw text.
+  * **Sending:** react from the button on any message, or press a chip to add yours.
+  * **meshcore-open's older `r:HASH:INDEX`:** shown as a note. Its hash can't be reproduced outside Dart, so it can't
+    be attached to a message.
+* A message of nothing but emoji, up to 5, is shown large.
+* **GIFs:** a Giphy link in a message (`https://giphy.com/gifs/…`, as Giphy's Share button copies it, with or without
+  the `https://`), or meshcore-open's `g:ID`, shows as the GIF itself. To send one, paste the link; the GIF is previewed while you type. Other MeshCore apps see the link.
   **Show GIFs from Giphy** in the sidebar turns this off: loading a GIF lets Giphy see your IP address.
 * Your own messages show **Sent**, **Waiting for the rate limit** or **Not sent: reason**, with **Retry**. DMs and
   room posts show **Delivered** once ACKed, or **Not delivered** after three tries. Sends are queued to fit the
@@ -140,6 +155,7 @@ Source layout:
 | `src/map.js` | The map (Leaflet, loaded when first opened) |
 | `src/vault.js` | The passphrase-sealed saved key |
 | `src/gif.js` | Giphy links |
+| `src/format.js` | Reactions and the message hash, from the MeshTrax message format |
 | `src/meshcore.js` | Packets, identities, adverts, channel messages: a port of `client/meshroom_kaas` |
 | `src/hash.js`, `src/aes.js`, `src/ed25519.js`, `src/bytes.js` | Crypto and byte helpers |
 | `src/store.js` | `localStorage` |

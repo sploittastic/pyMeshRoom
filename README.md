@@ -478,7 +478,10 @@ signatures and encrypted packets.
 It covers the Public channel, hashtag and private channels, DMs, rooms, contacts with a map, adverts, `@` mentions with
 autocomplete, and GIFs from Giphy links.
 
-Turn it on with **Allow web logins** on the **Web users** card. Its source is in [web/](web/README.md).
+It also reads and sends reactions, in MeshCore One's format as MeshTrax uses it.
+
+Turn it on with **Allow web logins** on the **Web users** card. A **page password** there keeps the page, and logging
+in through it, to people who know it. Its source is in [web/](web/README.md).
 * Python client: [client/](client/README.md). It works with raw packets, or as a full chat node: adverts, contacts,
   DMs, hashtag and private channels, and joining rooms.
 

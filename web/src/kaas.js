@@ -10,6 +10,9 @@ export const WEB_LOGIN_LABEL = "meshcore-web login v1";
 
 export class AuthError extends Error {}
 
+// The server's MeshCore Web has a page password, and this login didn't give it (or gave a wrong one).
+export class PagePasswordNeeded extends AuthError {}
+
 // "https://host[/prefix]" (or with /api/v1/kaas on the end, or ws(s)://) -> {ticket: https URL, ws: wss URL}
 export function kaasEndpoints(input) {
   let s = String(input || "").trim();
@@ -57,6 +60,7 @@ export class KaasClient extends EventTarget {
     this.identity = auth.identity || null;
     this.name = auth.name || "";
     this.apiKey = String(auth.apiKey || "").trim();
+    this.pagePassword = auth.pagePassword || "";        // (a page served by the server itself has its cookie instead)
     this.ws = null;
     this.hello = null;
     this.state = "closed";
@@ -107,6 +111,7 @@ export class KaasClient extends EventTarget {
       throw new Error("Can't reach " + this.endpoints.host + " (offline, a wrong URL, or a pyMeshRoom too old for browser logins).");
     }
     const answer = await r.json().catch(() => ({}));
+    if (r.status === 401 && answer.page_password) throw new PagePasswordNeeded(answer.error || "this server needs a page password");
     if (r.status === 401 || r.status === 403) throw new AuthError(answer.error || "the server refused the login");
     if (!r.ok) throw new Error(answer.error || "The server answered " + r.status + ".");
     return answer;
@@ -118,11 +123,12 @@ export class KaasClient extends EventTarget {
       if (!r.ticket) throw new Error("The server sent no ticket.");
       return r.ticket;
     }
-    const { challenge } = await this.post(this.endpoints.challenge);
+    const page = this.pagePassword ? { page_password: this.pagePassword } : {};
+    const { challenge } = await this.post(this.endpoints.challenge, {}, page);
     if (!/^wc_[\w-]{8,100}$/.test(String(challenge))) throw new Error("The server sent a malformed challenge.");
     const pub = this.identity.pubHex;
     const signature = bytesToHex(this.identity.sign(webLoginMessage(this.endpoints.host, challenge, pub)));
-    const r = await this.post(this.endpoints.login, {}, { pub, signature, challenge, host: this.endpoints.host, name: this.name });
+    const r = await this.post(this.endpoints.login, {}, { pub, signature, challenge, host: this.endpoints.host, name: this.name, ...page });
     if (!r.ticket) throw new Error("The server sent no ticket.");
     return r.ticket;
   }

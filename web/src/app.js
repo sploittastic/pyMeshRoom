@@ -1,8 +1,9 @@
 // The web app: log in, then talk on MeshCore channels, in DMs and in rooms through pyMeshRoom's KaaS API.
 // The private key, channel secrets and room passwords never leave the browser; the server only sees encrypted packets.
 import { bytesToHex, randomBytes, utf8Decode, utf8Encode } from "./bytes.js";
+import { QUICK_REACTIONS, emojiOnly, hashTexts, messageHash, parseReaction, reactionText } from "./format.js";
 import { findGifs, gifFallbackUrl, gifPageUrl, gifUrl } from "./gif.js";
-import { AuthError, KaasClient, kaasEndpoints } from "./kaas.js";
+import { AuthError, KaasClient, PagePasswordNeeded, kaasEndpoints } from "./kaas.js";
 import { showMap } from "./map.js";
 import {
   Identity, MAX_NAME_LEN, MAX_TEXT_LEN, PT_ADVERT, PT_GRP_TXT, advertPayload, channelMessagePacket, floodPacket,
@@ -19,6 +20,7 @@ const HISTORY_PER_CONVERSATION = 300;
 const SEEN_MAX = 4096;
 const DIRECTORY_EVERY_MS = 15 * 60 * 1000;     // the server's node directory, refreshed this often
 const DIRECTORY_DAYS = 7;
+const REACTION_WINDOW_MS = 48 * 3600 * 1000;   // a reaction is matched against messages this recent
 const $ = (id) => document.getElementById(id);
 
 const app = {
@@ -111,6 +113,8 @@ function initLogin() {
   $("f-priv").value = s.remember && !s.vault ? s.privateKey || "" : "";
   setUnlockMode(!!(s.remember && s.vault));
   $("key-box").open = !!$("f-key").value;
+  $("f-sitepw").value = s.remember && !s.vault ? s.pagePassword || "" : "";
+  $("sitepw-box").hidden = !$("f-sitepw").value;
   updatePubPreview();
   $("login").hidden = false;
   if (!autoTried && s.remember && s.privateKey && s.name && $("f-url").value) {
@@ -154,6 +158,7 @@ async function login(ev) {
   const s = loadSettings();
   const url = $("f-url").value.trim();
   let apiKey = $("key-box").open ? $("f-key").value.trim() : "";
+  let pagePassword = $("f-sitepw").value;
   let priv = $("f-priv").value.trim();
   const name = $("f-name").value.trim();
   const go = $("login-go");
@@ -165,7 +170,7 @@ async function login(ev) {
     go.disabled = false;
     go.textContent = "Connect";
     if (!opened) return showError("login-error", "That passphrase doesn't unlock the saved key.");
-    ({ privateKey: priv, apiKey = "" } = JSON.parse(utf8Decode(opened)));
+    ({ privateKey: priv, apiKey = "", pagePassword = pagePassword } = JSON.parse(utf8Decode(opened)));
   }
   let identity;
   try {
@@ -186,24 +191,32 @@ async function login(ev) {
   else if ($("f-pass").value) {
     go.textContent = "Saving…";
     await new Promise((r) => setTimeout(r, 20));
-    saveSettings({ ...prefs, vault: seal(utf8Encode(JSON.stringify({ privateKey: identity.privateHex, apiKey })), $("f-pass").value) });
-  } else saveSettings({ ...prefs, apiKey: apiKey || undefined, privateKey: identity.privateHex });
+    saveSettings({ ...prefs, vault: seal(utf8Encode(JSON.stringify({ privateKey: identity.privateHex, apiKey, pagePassword })), $("f-pass").value) });
+  } else saveSettings({ ...prefs, apiKey: apiKey || undefined, pagePassword: pagePassword || undefined, privateKey: identity.privateHex });
 
   go.disabled = true;
   go.textContent = "Connecting…";
-  const client = new KaasClient(url, apiKey ? { apiKey } : { identity, name });
+  const client = new KaasClient(url, apiKey ? { apiKey } : { identity, name, pagePassword });
   try {
     await client.start();
   } catch (e) {
     client.stop();
     go.disabled = false;
     go.textContent = "Connect";
+    if (e instanceof PagePasswordNeeded) {
+      const asked = !$("sitepw-box").hidden;
+      $("sitepw-box").hidden = false;
+      $("f-sitepw").focus();
+      return showError("login-error", asked && pagePassword ? "That isn't the server's page password." :
+        "This server's MeshCore Web needs a password: enter it above.");
+    }
     return showError("login-error", e instanceof AuthError ? "The server refused the login: " + e.message : e.message);
   }
   go.disabled = false;
   go.textContent = "Connect";
   $("f-priv").value = remember && !loadSettings().vault ? $("f-priv").value : "";
   $("f-key").value = remember && !loadSettings().vault ? $("f-key").value : "";
+  $("f-sitepw").value = remember && !loadSettings().vault ? $("f-sitepw").value : "";
   $("f-pass").value = $("f-unlock").value = "";
   startChat(identity, name, client);
 }
@@ -423,6 +436,7 @@ function onPost({ room, author, text, ts }) {
 }
 
 function addIncoming(key, msg) {
+  if (takeReaction(key, msg)) return;
   (app.history[key] ||= []).push(msg);
   scheduleSave();
   if (key === app.active) appendMessage(msg);
@@ -453,6 +467,87 @@ function onState({ state, reason }) {
 }
 
 // ---------------------------------------------------------------- sending
+
+// ---------------------------------------------------------------- reactions (MeshCore One's format, as MeshTrax uses it)
+
+// An incoming message that is a reaction to one we hold: added to it, and true. Otherwise false (one that finds nothing
+// stays a message, shown as a reaction note).
+function takeReaction(key, msg) {
+  const r = parseReaction(msg.text);
+  if (!r) return false;
+  const target = r.legacy ? null : findReactionTarget(key, r);
+  if (!target) {
+    msg.reaction = { emoji: r.emoji, to: r.targetSender || null };
+    return false;
+  }
+  addReaction(target, r.emoji, msg.sender);
+  updateMessage(target);
+  scheduleSave();
+  return true;
+}
+
+function findReactionTarget(key, r) {
+  const since = Date.now() - REACTION_WINDOW_MS;
+  const msgs = (app.history[key] || []).filter((m) => !m.reaction && m.at >= since);
+  const hit = (m) => hashTexts(m.text).some((t) => messageHash(t, m.ts) === r.hash);
+  for (const pass of [(m) => m.sender === r.targetSender, () => true])
+    for (let i = msgs.length - 1; i >= 0; i--) if (pass(msgs[i]) && hit(msgs[i])) return msgs[i];
+  return null;
+}
+
+function addReaction(m, emoji, who) {
+  m.reactions ||= {};
+  const list = (m.reactions[emoji] ||= []);
+  if (list.includes(who)) return false;                  // the same person, the same emoji: once
+  list.push(who);
+  return true;
+}
+
+async function react(m, emoji) {
+  closeReactPicker();
+  const key = Object.keys(app.history).find((k) => app.history[k].includes(m));
+  const cv = conv(key);
+  if (!cv || !canSend()) return toast("Can't send right now.");
+  if (!addReaction(m, emoji, app.name)) return;
+  updateMessage(m);
+  scheduleSave();
+  // the hash covers the text as the author's app holds it: in a channel the body trimmed, else exactly as sent
+  const hash = messageHash(cv.kind === "channel" ? hashTexts(m.text)[1] || m.text : m.text, m.ts);
+  const text = reactionText(emoji, hash, cv.kind === "dm" ? null : m.sender);
+  let ok;
+  if (cv.kind === "channel") {
+    const raw = channelMessagePacket(cv.channel, app.name, text, uniqueTime());
+    markSeen(packetHash(parsePacket(raw)));
+    const res = await app.client.send(raw);
+    ok = res.status === "sent" || res.status === "local";
+  } else {
+    ok = (await app.node.sendDm(cv.contact, text)).acked;
+  }
+  if (!ok) {
+    m.reactions[emoji] = m.reactions[emoji].filter((w) => w !== app.name);
+    if (!m.reactions[emoji].length) delete m.reactions[emoji];
+    updateMessage(m);
+    toast("The reaction wasn't delivered.");
+  }
+}
+
+let pickerFor = null;
+
+function openReactPicker(m, button) {
+  const pop = $("react-pop");
+  if (pickerFor === m && !pop.hidden) return closeReactPicker();
+  pickerFor = m;
+  pop.replaceChildren(...QUICK_REACTIONS.map((e) => el("button", { type: "button", "aria-label": "React " + e, onclick: () => react(m, e) }, e)));
+  pop.hidden = false;
+  const r = button.getBoundingClientRect(), w = pop.offsetWidth;
+  pop.style.left = Math.max(8, Math.min(window.innerWidth - w - 8, r.right - w)) + "px";
+  pop.style.top = Math.max(8, r.top - pop.offsetHeight - 6) + "px";
+}
+
+function closeReactPicker() {
+  pickerFor = null;
+  $("react-pop").hidden = true;
+}
 
 async function sendMessage(ev) {
   ev?.preventDefault();
@@ -497,7 +592,7 @@ async function deliver(cv, msg) {
     const res = await app.node.sendDm(c, msg.text, 3, (attempt, flood) => {
       if (attempt) Object.assign(msg, { status: "retrying", reason: flood ? "by flood" : "" });
       updateMessage(msg);
-    });
+    }, msg.ts);
     msg.status = res.acked ? "delivered" : res.status === "dropped" ? "failed" : "unconfirmed";
     msg.reason = res.acked ? "" : res.reason || "";
   }
@@ -625,6 +720,12 @@ function appendMessage(m, scroll = true) {
 
 function messageNode(m) {
   const when = new Date(shownTime(m));
+  if (m.reaction) {
+    return el("div", { class: "reaction-note", dataset: { id: m.id }, title: when.toLocaleString() },
+      el("b", {}, m.sender || "(no name)"), " reacted ", el("span", { class: "emoji" }, m.reaction.emoji),
+      m.reaction.to ? " to a message from " + m.reaction.to : " to a message", " not shown here");
+  }
+  const reactions = Object.entries(m.reactions || {}).filter(([, who]) => who.length);
   const route = [];
   if (m.hops != null) route.push(m.hops === 0 ? "direct" : m.hops + (m.hops === 1 ? " hop" : " hops"));
   if (m.snr != null) route.push("SNR " + Number(m.snr).toFixed(1));
@@ -635,7 +736,13 @@ function messageNode(m) {
       el("time", { datetime: when.toISOString(), title: when.toLocaleString() },
         when.toLocaleTimeString(undefined, { hour: "2-digit", minute: "2-digit" })),
       route.length ? el("span", {}, route.join(" · ")) : null),
-    el("div", { class: "text" }, ...richText(m.text)),
+    el("div", { class: "text" + (emojiOnly(m.text) ? " big" : "") }, ...richText(m.text)),
+    reactions.length ? el("div", { class: "reactions" }, ...reactions.map(([e, who]) => el("button", {
+      type: "button", class: "chip" + (who.includes(app.name) ? " me" : ""), title: who.join(", "),
+      "aria-label": e + " from " + who.join(", "), onclick: () => react(m, e),
+    }, e + (who.length > 1 ? " " + who.length : "")))) : null,
+    el("button", { type: "button", class: "react-btn", title: "React", "aria-label": "React to this message",
+      onclick: (ev) => openReactPicker(m, ev.currentTarget) }, "☺+"),
     m.mine ? statusNode(m) : null);
 }
 
@@ -1090,6 +1197,10 @@ function wire() {
     logout();
   });
   $("toggle-side").addEventListener("click", () => $("sidebar").classList.toggle("open"));
+  document.addEventListener("click", (e) => {
+    if (!$("react-pop").hidden && !e.target.closest("#react-pop, .react-btn")) closeReactPicker();
+  });
+  $("messages").addEventListener("scroll", closeReactPicker);
   document.addEventListener("visibilitychange", () => {
     if (!document.hidden && app.active && app.unread[app.active]) {
       delete app.unread[app.active];
