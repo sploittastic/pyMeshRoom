@@ -304,6 +304,28 @@ let b;
   await p.waitForSelector('#conn-dot.open', { timeout: 20000 });
   ok(await p.isHidden('#login'), 'remembered without a passphrase: connects by itself');
 
+  // away, then back: the server's backlog catches us up, read only
+  await p.waitForTimeout(1500);                                            // (the cursor is saved)
+  await p.click('#logout');
+  inject('Public', 'Bob', 'missed while away');
+  command('BOT_DM ' + PUB + ' are you there?');
+  await p.waitForTimeout(2500);                                            // (kept: written about once a second)
+  const sentFrames = [];
+  p.on('websocket', (ws) => ws.on('framesent', (f) => sentFrames.push(String(f.payload))));
+  await p.reload();
+  await p.waitForSelector('#conn-dot.open', { timeout: 20000 });
+  await p.waitForSelector('#toast:has-text("Caught up")', { timeout: 20000 });
+  await p.click('#channel-list button:has-text("Public")');
+  await p.waitForSelector('.msg:has(.text:text("missed while away")) .meta:has-text("while you were away")', { timeout: 10000 });
+  ok(true, 'a channel message sent while we were away arrives on reconnect, marked so');
+  await p.click('#dm-list button:has-text("EchoBot")');
+  await p.waitForSelector('.msg .text:text("are you there?")', { timeout: 10000 });
+  ok(await p.locator('.msg:has(.text:text("are you there?")) .meta:has-text("while you were away")').count() >= 1,
+    'and a DM sent while we were away, from the backlog');
+  const answered = sentFrames.map((f) => { try { return JSON.parse(f); } catch { return {}; } })
+    .filter((m) => m.type === 'send').map((m) => (parseInt(m.raw.slice(0, 2), 16) >> 2) & 15).filter((t) => t === 3 || t === 8);
+  ok(answered.length === 0, 'nothing answered for old packets (no ACKs or paths): ' + answered.length);
+
   ok(await admin('/api/v1/web/users/' + PUB + '/kick') === 200, 'admin kicks the key');
   await p.waitForSelector('#conn-dot.failed', { timeout: 10000 });
   ok(/admin disconnected/.test(await p.textContent('#banner')), 'kicked: ' + await p.textContent('#banner'));

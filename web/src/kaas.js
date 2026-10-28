@@ -204,7 +204,9 @@ export class KaasClient extends EventTarget {
       } catch {
         return;
       }
-      this.emit("packet", { dir: msg.dir, raw, snr: msg.snr, rssi: msg.rssi, ts: msg.ts, hash: msg.hash });
+      this.emit("packet", { dir: msg.dir, raw, snr: msg.snr, rssi: msg.rssi, ts: msg.ts, hash: msg.hash, seq: msg.seq });
+    } else if (msg.type === "replay_batch") {
+      this.emit("replay", msg.packets || []);
     } else if (msg.type === "send_result") {
       const w = this.waiting.get(msg.id);
       this.emit("send", msg);
@@ -212,7 +214,7 @@ export class KaasClient extends EventTarget {
         this.waiting.delete(msg.id);
         w.resolve(msg);
       }
-    } else if ((/_result$/.test(msg.type) || msg.type === "error") && this.queries.has(msg.id)) {
+    } else if ((/_result$|^replay_done$/.test(msg.type) || msg.type === "error") && this.queries.has(msg.id)) {
       const q = this.queries.get(msg.id);
       this.queries.delete(msg.id);
       if (msg.type === "error") q.reject(new Error(msg.error || "the server couldn't answer"));

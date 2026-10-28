@@ -121,6 +121,38 @@ counts, and can:
 
 A banned person can make a new key, but a new key can't send until it's heard on the air or allowed.
 
+### Catching up (web logins only)
+
+The server keeps a **backlog** of channel messages and DMs: what this radio hears and sends, and with
+`web_backlog_mqtt`, what MQTT observers report.
+
+* **Retention:** `web_backlog_days` days, 30 by default, with no maximum; older ones are pruned. 0 keeps none.
+* **One copy each:** a packet is kept once, by its packet hash, however many repeaters or observers passed it on.
+  Each is numbered in order.
+* **Live packets** carry their number as `seq`. With `web_backlog_mqtt`, web users also get observer-reported
+  packets as they come, with `"dir": "mqtt"`.
+
+A web session catches up with:
+
+```json
+{"type": "replay", "id": "r1", "since": 48213, "channels": [17, 202], "me": 3}
+```
+
+* `since` is the last `seq` it has, or null on a first visit: nothing then, it starts from now.
+* `channels` are the hash bytes of its channels, and `me` is its key's first byte.
+* The server sends the kept packets after `since` that could be for it as `replay_batch` messages, each
+  `{"packets": [{"seq", "raw", "ts", "dir", "snr"}]}`.
+* Then it sends `{"type": "replay_done", "id": "r1", "last": 48990, "count": 12}`.
+* An API key asking gets an error: bots don't answer old messages.
+
+The client treats replayed and MQTT packets as read only, sending no ACKs or path returns for them.
+
+On the Web users card, the admin sets the days and MQTT. Each user's **Missed** column counts the packets kept since
+they were last connected. Its **Actions** menu adds:
+
+* **Purge backlog:** count them as caught up to now. Nothing before that is replayed to them.
+* **Delete:** disconnect and forget them, with their counts and "allow send". It isn't a ban.
+
 The admin can also set a **page password** on the card (`web_page_password`, stored hashed). Then:
 
 * `/meshcore-web/` shows a password form first. The right password gives that browser a page session (an `HttpOnly`
@@ -325,6 +357,8 @@ Bad input gets `{"type": "error", "id": ..., "error": ...}`. Questions share the
 | `web_trust_observers` | false | A key heard only by an MQTT observer may send too. |
 | `web_hosts` | `[]` | More host names a login may be signed for, behind a proxy elsewhere that rewrites `Host`. |
 | `web_page_password` | `""` | A password for the MeshCore Web page and its logins, hashed. Set from the dashboard. |
+| `web_backlog_days` | 30 | Keep channel messages and DMs this many days, for web users to catch up (0 = none). |
+| `web_backlog_mqtt` | false | Keep what MQTT observers report too (each packet once), and show it to web users live. |
 
 ## Writing your own client
 

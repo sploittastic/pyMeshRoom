@@ -178,6 +178,8 @@ DEFAULT_CONFIG = {
     "web_trust_observers": False,   #   a key heard only by an MQTT observer may send too (else: heard on this radio)
     "web_hosts": [],                #   other host names logins may sign for (behind a proxy that rewrites Host)
     "web_page_password": "",        #   a password for the MeshCore Web page and its logins (hashed; "" = none)
+    "web_backlog_days": 30,         #   keep channel messages and DMs this many days, so web users catch up (0 = off)
+    "web_backlog_mqtt": False,      #   ...including those MQTT observers reported (each packet is kept once)
 }
 
 
@@ -786,6 +788,8 @@ class Store:
         "edges": ("a BLOB", "b BLOB", "w REAL", "t INT", "snr REAL", "PRIMARY KEY (a, b)"),
         "repeaters": ("pubkey BLOB PRIMARY KEY", "name TEXT", "lat REAL", "lon REAL", "adv_ts INT", "last_advert INT"),
         "nodes": ("pubkey BLOB PRIMARY KEY", "type INT", "name TEXT", "lat REAL", "lon REAL", "adv_ts INT", "rf INT", "obs INT"),
+        "backlog": ("seq INTEGER PRIMARY KEY", "hash BLOB UNIQUE", "ts INT", "raw BLOB", "src TEXT", "snr REAL", "ptype INT",
+                    "ch INT", "dst INT"),
         "heard": ("hash BLOB PRIMARY KEY", "last INT", "w REAL", "t INT", "last_direct INT", "snr REAL", "disc INT", "out_snr REAL"),
         "bans": ("pubkey BLOB PRIMARY KEY", "name TEXT", "ts INT"),
         "probes": ("hash BLOB PRIMARY KEY", "data TEXT"),
@@ -2874,6 +2878,8 @@ class RoomServer:
             self.observer_group(ev[2])
         elif k == "topo" and self.cfg.mqtt_topo_ingest:
             self.observer_topology(ev[2], ev[3], ev[4])
+        elif k == "backlog" and self.kaas is not None:
+            self.kaas.backlog_mqtt(ev[2], ev[3])
 
     def observer_ack(self, ack):
         """An ACK some observer heard. If it confirms one of our pushes: delivered. No route credit, no pace or
@@ -6962,6 +6968,8 @@ class ObserverFeed:
                 out.append((pkey, ("grp", raw)))
             if cfg.mqtt_topo_ingest and ((pkt.is_flood and pkt.hash_size >= 2 and pkt.hop_count) or (t == PT_TRACE and pkt.is_direct)):
                 out.append(((pkey, origin[:4]), ("topo", raw, origin, snr)))   # every observer's copy adds its own last link
+            if cfg.web_backlog_mqtt and int(cfg.web_backlog_days or 0) > 0 and t in BACKLOG_TYPES and len(pl) >= 2:
+                out.append((("bk", pkey), ("backlog", raw, snr)))         # for MeshCore Web's catch-up (kept once)
         with self.lock:
             self.recent.append((now, bool(out)))
             keep = []
@@ -7011,6 +7019,11 @@ WEB_MAX_CHALLENGES = 256
 WEB_LOGIN_LABEL = "meshcore-web login v1"   # signed first, so a login signature is never a valid packet signature
 WEB_USERS_MAX = 1000                  # web users remembered for the dashboard (the least recently active go first)
 WEB_ID_PREFIX = "w:"                  # a web session's id in the per-key stats: "w:" + its public key
+BACKLOG_TYPES = (PT_GRP_TXT, PT_TXT_MSG)  # what web users catch up on: channel messages and DMs (and room posts)
+BACKLOG_RECENT = 20000                # packet hash -> seq kept in memory, so later copies of a packet get its number
+BACKLOG_BATCH = 200                   # packets per replay message
+BACKLOG_FLUSH_S = 1.0                 # new backlog rows are written at most this often (one transaction)
+BACKLOG_PRUNE_S = 3600
 # what a web session may send, and the identity each must carry (adverts, logins: the full key; DMs etc.: its hash)
 WEB_SEND_TYPES = (PT_ADVERT, PT_GRP_TXT, PT_TXT_MSG, PT_ACK, PT_PATH, PT_ANON_REQ, PT_REQ, PT_RESPONSE, PT_MULTIPART)
 
@@ -7292,6 +7305,20 @@ class KaasHub:
         self.wusers = {}                    # web user (pub hex) -> {"name", "first", "last"}: shown on the dashboard
         self.wusers_path = os.path.join(room.cfg.data_dir, "web_users.json")
         self.wusers_dirty = False
+        # the backlog: channel messages and DMs, numbered (seq), so web users catch up on what they missed
+        self.bk_lock = threading.Lock()
+        self.bk_seq = 0
+        self.bk_recent = collections.OrderedDict()  # packet hash -> seq
+        self.bk_pending = []                # rows not written yet (a replay reads them too)
+        self.bk_next_flush, self.bk_next_prune = 0.0, 0.0
+        self.bk_store = getattr(room, "store", None)
+        if self.bk_store is not None:
+            try:
+                self.bk_seq = int(self.bk_store.read("SELECT MAX(seq) FROM backlog")[0][0] or 0)
+                self.bk_store.execmany([("CREATE INDEX IF NOT EXISTS backlog_ts ON backlog (ts)", None)])
+            except Exception as e:
+                log.warning("MeshCore Web backlog not available: %s", e)
+                self.bk_store = None
         self.slock = threading.Lock()
         self.kstats = {}                    # key id -> {"total": [rx, tx, err], "hours": {hour: [rx, tx, err]}}
         self.kstats_path = os.path.join(room.cfg.data_dir, "kaas_stats.json")
@@ -7307,7 +7334,8 @@ class KaasHub:
             log.warning("KaaS stats in %s not read: %s", self.kstats_path, e)
         try:
             with open(self.wusers_path) as f:
-                self.wusers = {k: dict(name=str(v.get("name", ""))[:32], first=int(v["first"]), last=int(v["last"]))
+                self.wusers = {k: dict(name=str(v.get("name", ""))[:32], first=int(v["first"]), last=int(v["last"]),
+                                       seq=int(v.get("seq") or 0), floor=int(v.get("floor") or 0))
                                for k, v in json.load(f).items()}
         except FileNotFoundError:
             pass
@@ -7469,7 +7497,7 @@ class KaasHub:
                     keep = set(self.room.cfg.web_approved or [])
                     cands = [k for k in self.wusers if k not in keep] or list(self.wusers)
                     del self.wusers[min(cands, key=lambda k: self.wusers[k]["last"])]
-                u = self.wusers[pub_hex] = dict(name="", first=now, last=now)
+                u = self.wusers[pub_hex] = dict(name="", first=now, last=now, seq=self.bk_seq, floor=0)
             if name:
                 u["name"] = name
             u["last"] = now
@@ -7504,6 +7532,8 @@ class KaasHub:
                              send=self.web_can_send(pub), banned=self.web_banned(pub), connected=connected,
                              stats=self.key_stats(WEB_ID_PREFIX + pub)))
         rows.sort(key=lambda r: (-min(r["connected"], 1), -r["last"]))
+        for r in rows:                                      # backlog packets since they were last connected
+            r["missed"] = 0 if r["connected"] else max(0, self.bk_seq - users[r["pub"]].get("seq", self.bk_seq))
         return rows
 
     @staticmethod
@@ -7571,13 +7601,22 @@ class KaasHub:
             cfg.set("web_approved", [p for p in (cfg.web_approved or []) if p != pub_hex])
         elif action == "unban":
             cfg.set("web_banned", [b for b in (cfg.web_banned or []) if isinstance(b, dict) and b.get("pub") != pub_hex])
-        elif action == "forget":
+        elif action == "purge":                             # their backlog: as if they'd caught up just now
+            with self.slock:
+                u = self.wusers.get(pub_hex)
+                if u is not None:
+                    u["floor"] = u["seq"] = self.bk_seq
+                    self.wusers_dirty = True
+        elif action == "delete":                            # forget them: their record, counts, and "allow send"
             with self.slock:
                 if self.wusers.pop(pub_hex, None) is not None:
                     self.wusers_dirty = True
+                if self.kstats.pop(WEB_ID_PREFIX + pub_hex, None) is not None:
+                    self.kstats_dirty = True
+            cfg.set("web_approved", [p for p in (cfg.web_approved or []) if p != pub_hex])
         for c in self.conns:
             if c.web and (c.web == pub_hex or action == "settings"):
-                if action == "kick":
+                if action in ("kick", "delete"):
                     c.close(4005, "disconnected by the admin")
                 elif action == "ban":
                     c.close(4003, "this key is banned from this server")
@@ -7631,6 +7670,8 @@ class KaasHub:
             return conn.send_json({"type": "pong", "id": rid})
         if t in ("near", "routes", "route", "nodes"):
             return self.ask(conn, t, msg, rid)
+        if t == "replay":
+            return self.replay(conn, msg, rid)
         if t != "send":
             return conn.send_json({"type": "error", "id": rid,
                                    "error": "unknown message type: use send, near, routes, route, nodes or ping"})
@@ -7654,6 +7695,138 @@ class KaasHub:
         if busy:
             return drop("too many sends waiting: wait for their results")
         self.room.events_put(("kaas_tx", conn, raw, rid))
+
+    # ---------------------------------------------------------------- the backlog (MeshCore Web's catch-up)
+
+    def backlog_add(self, raw, src, snr=None):
+        """A packet heard ("rf": by this radio, or sent by it) or reported by an observer ("mqtt"), in the main loop.
+        Channel messages and DMs are kept, once each whatever the source, numbered in order. -> its seq and whether
+        it's new, or (None, False) when it isn't kept."""
+        cfg = self.room.cfg
+        if self.bk_store is None or int(cfg.web_backlog_days or 0) <= 0:
+            return None, False
+        pkt = Packet.parse(raw)
+        if pkt is None or pkt.ptype not in BACKLOG_TYPES or len(pkt.payload) < 2:
+            return None, False
+        h = pkt.packet_hash()
+        with self.bk_lock:
+            seq = self.bk_recent.get(h)
+            if seq is not None:
+                return seq, False                           # another copy: through another repeater, or MQTT and RF
+            self.bk_seq += 1
+            seq = self.bk_recent[h] = self.bk_seq
+            while len(self.bk_recent) > BACKLOG_RECENT:
+                self.bk_recent.popitem(last=False)
+            p = pkt.payload
+            self.bk_pending.append((seq, h, now_s(), bytes(raw), src, snr, pkt.ptype,
+                                    p[0] if pkt.ptype == PT_GRP_TXT else None, p[0] if pkt.ptype == PT_TXT_MSG else None))
+        return seq, True
+
+    def backlog_info(self):
+        """For the dashboard (a web thread): the settings, and how much is kept."""
+        cfg = self.room.cfg
+        info = {"days": int(cfg.web_backlog_days or 0), "mqtt": bool(cfg.web_backlog_mqtt), "count": 0, "oldest": None,
+                "seq": self.bk_seq}
+        if self.bk_store is not None:
+            try:
+                n, oldest = self.bk_store.read("SELECT COUNT(*), MIN(ts) FROM backlog")[0]
+                info.update(count=int(n or 0) + len(self.bk_pending), oldest=oldest)
+            except Exception:
+                pass
+        return info
+
+    def backlog_mqtt(self, raw, snr):
+        """A channel message or DM an MQTT observer reported: kept, and to web users at once (they'd see it on their
+        next catch-up otherwise). Read only, like a catch-up: the radio didn't hear it."""
+        if not self.room.cfg.web_backlog_mqtt:
+            return
+        seq, new = self.backlog_add(raw, "mqtt", snr)
+        if not new:
+            return
+        conns = [c for c in self.conns if c.web and c.can_receive]
+        if conns:
+            text = json.dumps({"type": "packet", "dir": "mqtt", "ts": round(time.time(), 3), "raw": bytes(raw).hex(),
+                               "seq": seq}, separators=(",", ":"))
+            for c in conns:
+                c.put(text)
+                self.count(c.key_id, "rx")
+
+    def backlog_periodic(self):
+        """Main loop: write new rows (one transaction a second at most), and prune past web_backlog_days."""
+        if self.bk_store is None:
+            return
+        now = time.monotonic()
+        if self.bk_pending and now >= self.bk_next_flush:
+            self.bk_next_flush = now + BACKLOG_FLUSH_S
+            with self.bk_lock:
+                rows, self.bk_pending = self.bk_pending, []
+            self.bk_store.execmany([("INSERT OR IGNORE INTO backlog (seq, hash, ts, raw, src, snr, ptype, ch, dst) "
+                                     "VALUES (?,?,?,?,?,?,?,?,?)", rows)])
+        if now >= self.bk_next_prune:
+            self.bk_next_prune = now + BACKLOG_PRUNE_S
+            days = int(self.room.cfg.web_backlog_days or 0)
+            self.bk_store.execmany([("DELETE FROM backlog WHERE ts < ?", [(now_s() - days * 86400,)])])
+
+    def replay(self, conn, msg, rid):
+        """A web user's catch-up: {"type": "replay", "since": seq or null, "channels": [channel hash bytes], "me": its key's
+        hash byte}. The channel messages and DMs kept after `since` (and after the admin's purge) that could be for it,
+        in batches; then replay_done with the seq it's up to. No `since` (a first visit): nothing, just that seq."""
+        def err(e):
+            conn.send_json({"type": "error", "id": rid, "error": e})
+        if not conn.web:
+            return err("catching up is for web logins only")
+        since, chans, me = msg.get("since"), msg.get("channels") or [], msg.get("me")
+        ok_byte = lambda x: isinstance(x, int) and not isinstance(x, bool) and 0 <= x <= 255
+        if since is not None and (isinstance(since, bool) or not isinstance(since, int) or since < 0):
+            return err("since: a seq from a packet, or null")
+        if not isinstance(chans, list) or len(chans) > 256 or not all(ok_byte(x) for x in chans) or not ok_byte(me):
+            return err("channels: channel hash bytes; me: your key's first byte")
+        if getattr(conn, "replaying", False):
+            return err("a catch-up is already running")
+        conn.replaying = True
+        threading.Thread(target=self._replay, args=(conn, rid, since, sorted(set(chans)), me), name="kaas-replay",
+                         daemon=True).start()
+
+    def _replay(self, conn, rid, since, chans, me):
+        try:
+            with self.slock:
+                u = dict(self.wusers.get(conn.web) or {})
+            top = self.bk_seq
+            if since is None or self.bk_store is None:
+                conn.send_json({"type": "replay_done", "id": rid, "last": top, "count": 0})
+                return
+            since = max(since, int(u.get("floor") or 0))
+            want = lambda ptype, ch, dst: (ptype == PT_GRP_TXT and ch in chans) or (ptype == PT_TXT_MSG and dst == me)
+            marks = ",".join("?" * len(chans)) or "NULL"
+            sql = ("SELECT seq, raw, ts, src, snr FROM backlog WHERE seq > ? AND seq <= ? AND ((ptype = %d AND ch IN (%s)) OR "
+                   "(ptype = %d AND dst = ?)) ORDER BY seq LIMIT %d" % (PT_GRP_TXT, marks, PT_TXT_MSG, BACKLOG_BATCH))
+            sent, last = 0, since
+            while not conn.closed:
+                rows = self.bk_store.read(sql, (last, top, *chans, me))
+                if not rows:
+                    with self.bk_lock:                      # (and what's not written yet)
+                        rows = [(r[0], r[3], r[2], r[4], r[5]) for r in self.bk_pending
+                                if last < r[0] <= top and want(r[6], r[7], r[8])][:BACKLOG_BATCH]
+                    if not rows:
+                        break
+                pkts = [{"seq": q, "raw": bytes(raw).hex(), "ts": ts, "dir": "mqtt" if src == "mqtt" else "rx",
+                         "snr": snr} for q, raw, ts, src, snr in rows]
+                while len(conn.out) > 32 and not conn.closed:
+                    time.sleep(0.05)                        # let the client keep up: its outbox is bounded
+                conn.send_json({"type": "replay_batch", "id": rid, "packets": pkts})
+                sent += len(pkts)
+                last = rows[-1][0]
+                self.count(conn.key_id, "rx", len(pkts))
+            conn.send_json({"type": "replay_done", "id": rid, "last": top, "count": sent})
+            with self.slock:
+                if conn.web in self.wusers:
+                    self.wusers[conn.web]["seq"] = max(self.wusers[conn.web].get("seq", 0), top)
+                    self.wusers_dirty = True
+        except Exception as e:
+            log.warning("catch-up for %s failed: %s", conn.web[:8], e)
+            conn.send_json({"type": "error", "id": rid, "error": "the catch-up failed"})
+        finally:
+            conn.replaying = False
 
     def ask(self, conn, t, msg, rid):
         """A route question: checked here, answered by the main loop (it owns the map). Shares the in-flight cap."""
@@ -7821,12 +7994,16 @@ class KaasHub:
         return keys
 
     def publish(self, direction, raw, snr=None, rssi=None):
-        """A packet this radio heard ("rx") or sent ("tx"): to every client that may receive."""
+        """A packet this radio heard ("rx") or sent ("tx"): to every client that may receive. Channel messages and DMs
+        are kept for MeshCore Web's catch-up, and carry their number (seq)."""
+        raw = bytes(raw)
+        seq, _ = self.backlog_add(raw, "rf", snr)
         conns = [c for c in self.conns if c.can_receive]
         if not conns:
             return
-        raw = bytes(raw)
         msg = {"type": "packet", "dir": direction, "ts": round(time.time(), 3), "raw": raw.hex()}
+        if seq is not None:
+            msg["seq"] = seq
         pkt = Packet.parse(raw)
         if pkt is not None:
             msg.update(ptype=PT_NAMES[pkt.ptype] if pkt.ptype < len(PT_NAMES) else pkt.ptype,
@@ -7907,8 +8084,9 @@ class KaasHub:
         conn.send_json({"type": "send_result", "id": rid, "status": "sent"})
 
     def periodic(self):
-        """Close connections whose key was revoked or has expired; save the per-key stats now and then."""
+        """Close connections whose key was revoked or has expired; save the per-key stats now and then; the backlog."""
         now = time.monotonic()
+        self.backlog_periodic()
         if now >= self.next_save:
             self.next_save = now + KAAS_STATS_SAVE_S
             self.save_stats()
@@ -7918,6 +8096,8 @@ class KaasHub:
         t = time.time()
         cfg = self.room.cfg
         for c in self.conns:
+            if c.closed:
+                continue                                    # (closing: kicked, banned or deleted a moment ago)
             if c.web:
                 if not cfg.web_login:
                     c.close(4004, "web logins were turned off")
@@ -7925,6 +8105,9 @@ class KaasHub:
                     c.close(4003, "this key is banned from this server")
                 else:
                     self.web_seen(c.web)
+                    with self.slock:                        # connected: they get everything as it comes
+                        if c.web in self.wusers and not getattr(c, "replaying", False):
+                            self.wusers[c.web]["seq"] = self.bk_seq
                     send = self.web_can_send(c.web)
                     if send != c.can_send:                  # heard on the air at last, or allowed / unallowed by the admin
                         c.can_send = send
@@ -8002,7 +8185,7 @@ td.rcell .dir{flex:none}.mono4{font-family:ui-monospace,monospace}
 .rprow input,.rprow select{width:auto;flex:none;padding:4px 6px;background:#0d1014;border:1px solid var(--line);border-radius:4px;color:var(--fg)}.sw{cursor:pointer}
 .mqrow input[type=checkbox]{transform:scale(1.2);margin-right:6px}.mqrow input[type=text],.mqrow input[type=password],.mqrow input[type=number],.mqrow select{width:auto;min-width:110px;padding:4px 6px;background:#0d1014;border:1px solid var(--line);border-radius:4px;color:var(--fg)}.mqnote{margin-top:10px;padding:8px 10px;border-left:3px solid var(--acc);background:#151a20;color:var(--dim);font-size:12px}
 .advrow{display:flex;gap:26px;align-items:center;flex-wrap:wrap}.adv{display:flex;gap:10px;align-items:center}
-.hdesc{color:var(--dim);font-weight:400;text-transform:none;letter-spacing:0;font-size:12px;margin-left:8px}.hdesc a{color:var(--acc)}
+.hdesc{color:var(--dim);font-weight:400;text-transform:none;letter-spacing:0;font-size:12px;margin-left:8px}.hdesc a{color:var(--acc)}.wbkey{font-family:ui-monospace,monospace}
 #members tr.mrow{cursor:pointer}#members tr.mrow:hover td{background:#1e252d}#members tr.mrow.exp td{background:#1b2229}
 .hexr{font-family:ui-monospace,monospace;white-space:nowrap}.caret{color:var(--dim);font-size:11px;margin-right:4px}
 .mbox.wide{width:520px}.ac{position:relative}.aclist{background:#0d1014;border:1px solid var(--line);border-top:none;
@@ -8112,6 +8295,10 @@ A key is shown once, when it is made: only a hash of it is kept, so a lost key c
 <div class="rprow"><label>Page password <input id="wb_pw" type="password" size="18" maxlength="64" autocomplete="new-password" placeholder="none"></label>
 <button onclick="wbPagePw(this,false)">Set</button><button id="wb_pw_rm" onclick="wbPagePw(this,true)">Remove</button>
 <span class="dim small" id="wb_pw_state"></span></div>
+<div class="rprow"><label title="Channel messages and DMs, so web users catch up on what they missed while away (0 = keep none)">Backlog: keep
+<input id="wb_days" type="number" min="0" step="1" style="width:5em"> days</label><button onclick="wbBacklog(this)">Save</button>
+<label title="Also keep what MQTT observers report (each packet is kept once, whether heard here or reported), and show it to web users as it comes"><input id="wb_bk_mqtt" type="checkbox" onchange="wbSettings({web_backlog_mqtt:this.checked})"> Include MQTT packets</label>
+<span class="dim small" id="wb_bk_state"></span></div>
 <div class="hint" style="margin-left:26px">Anyone can log in and read. A key may send once this radio has heard it advertise (or after you press Allow send):
 <span id="wb_burst">3</span> packets per <span id="wb_win">20</span> s each, within the API's shared airtime cap, and only as itself. A ban is by public key: a new key starts out unable to send.</div>
 <table id="wblist" style="margin-top:8px"></table>
@@ -8224,32 +8411,42 @@ async function kkRevoke(b){if(!confirm("Revoke the API key "+b.dataset.name+"? C
  const m=await tnPost("api/v1/kaas/keys/"+b.dataset.id+"/revoke",{});if(m)alert(m);setTimeout(loadKaas,500)}
 let WB={users:[],banned:[]};
 async function loadWeb(){if(!MAINADM)return;let d;try{const r=await fetch("api/v1/web/users");if(!r.ok)return;d=await r.json()}catch(e){return}
- WB=d;$("wb_on").checked=d.enabled;$("wb_pw_state").textContent=d.page_password?"set: the page and its logins ask for it":"none: anyone who can reach this server can open the page";$("wb_pw_rm").disabled=!d.page_password;$("wb_obs").checked=d.trust_observers;$("wb_conn").textContent=d.connected;$("wb_max").textContent=d.max;
+ WB=d;$("wb_on").checked=d.enabled;$("wb_pw_state").textContent=d.page_password?"set: the page and its logins ask for it":"none: anyone who can reach this server can open the page";$("wb_pw_rm").disabled=!d.page_password;
+ {const b=d.backlog||{};if(document.activeElement!==$("wb_days"))$("wb_days").value=b.days;$("wb_bk_mqtt").checked=!!b.mqtt;
+  $("wb_bk_state").textContent=b.days?(b.count||0).toLocaleString()+" packets kept"+(b.oldest?", the oldest from "+ago(b.oldest)+" ago":""):"off: web users don't catch up";}$("wb_obs").checked=d.trust_observers;$("wb_conn").textContent=d.connected;$("wb_max").textContent=d.max;
  $("wb_burst").textContent=$("kk_burst").textContent;$("wb_win").textContent=$("kk_win").textContent;
  const t=$("wblist");if(!d.users.length){t.innerHTML='<tr><td class="dim">'+(d.enabled?"Nobody has logged in yet.":"Web logins are off.")+'</td></tr>'}else{
- const key=p=>`<span class="mono" title="${esc(p)}">${esc(p.slice(0,8))}&hellip;</span>`;
+ const key=p=>`<span class="wbkey" title="${esc(p)}">${esc(p.slice(0,8))}&hellip;</span>`;
  const access=u=>u.banned?'<span class="poor">banned</span>':u.send?('<span class="good">can send</span> <span class="dim small">'+(u.heard_rf?"heard "+ago(u.heard_rf)+" ago":u.approved?"allowed":"heard by an observer")+'</span>'):'<span class="mid">pending</span> <span class="dim small">not heard on the air</span>';
  t.innerHTML="<tr><th>Name</th><th>Public key</th><th>Access</th><th>Last active</th><th>Connected</th>"+
   '<th title="packets streamed to this user: last 24 h / total">Received <span class="dim small">24h / total</span></th><th title="packets this user sent: last 24 h / total">Sent <span class="dim small">24h / total</span></th>'+
-  '<th title="refused sends and other errors: last 24 h / total">Errors <span class="dim small">24h / total</span></th><th></th></tr>'+d.users.map(u=>
+  '<th title="refused sends and other errors: last 24 h / total">Errors <span class="dim small">24h / total</span></th>'+
+  '<th title="backlog packets kept since they were last connected: they catch up on these when they come back">Missed</th><th></th></tr>'+d.users.map(u=>
   `<tr><td>${esc(u.name)||'<span class="dim">(no name)</span>'}${u.advert_name&&u.advert_name!==u.name?' <span class="dim small">adverts as '+esc(u.advert_name)+'</span>':''}</td><td>${key(u.pub)}</td>`+
   `<td>${access(u)}</td><td>${ago(u.last)} ago</td><td>${u.connected?'<span class="mqdot on"></span> '+u.connected:'<span class="dim">no</span>'}</td>`+
   ["rx","tx","err"].map(f=>{const v=(u.stats||{})[f]||[0,0];return `<td class="${f==="err"&&v[0]?"poor":""}">${v[0].toLocaleString()} <span class="dim">/ ${v[1].toLocaleString()}</span></td>`}).join("")+
-  `<td>${u.send||u.banned?"":`<button data-pub="${esc(u.pub)}" data-act="allow" onclick="wbAct(this)">Allow send</button> `}`+
-  `${u.approved&&!u.banned?`<button data-pub="${esc(u.pub)}" data-act="unallow" onclick="wbAct(this)">Unallow</button> `:""}`+
-  `${u.connected?`<button data-pub="${esc(u.pub)}" data-act="kick" onclick="wbAct(this)">Kick</button> `:""}`+
-  `${u.banned?"":`<button data-pub="${esc(u.pub)}" data-name="${esc(u.name)}" data-act="ban" onclick="wbAct(this)">Ban</button>`}</td></tr>`).join("")}
+  `<td>${u.connected?'<span class="dim">-</span>':(u.missed||0).toLocaleString()}</td>`+
+  `<td><select data-pub="${esc(u.pub)}" data-name="${esc(u.name)}" onchange="wbAct(this)"><option value="">Actions&hellip;</option>`+
+  `${u.send||u.banned?"":'<option value="allow">Allow send</option>'}${u.approved&&!u.banned?'<option value="unallow">Unallow send</option>':""}`+
+  `${u.connected?'<option value="kick">Kick (disconnect)</option>':""}${u.banned?"":'<option value="ban">Ban</option>'}`+
+  `${u.missed?'<option value="purge">Purge backlog (count as caught up)</option>':""}<option value="delete">Delete (forget, not a ban)</option></select></td></tr>`).join("")}
  const b=$("wbbanned");b.innerHTML=d.banned.length?"<tr><th>Banned</th><th>Public key</th><th>Since</th><th></th></tr>"+d.banned.map(x=>
   `<tr><td>${esc(x.name)||'<span class="dim">(no name)</span>'}</td><td class="mono">${esc(x.pub)}</td><td>${ago(x.ts)} ago</td>`+
   `<td><button data-pub="${esc(x.pub)}" data-act="unban" onclick="wbAct(this)">Unban</button></td></tr>`).join(""):""}
+async function wbBacklog(btn){const n=Number($("wb_days").value);
+ if(!Number.isInteger(n)||n<0){$("wbmsg").className="poor small";$("wbmsg").textContent=" Days: a whole number, 0 for none.";return}
+ if(n===0&&!confirm("Keep no backlog? What's kept now is deleted, and web users won't catch up on what they missed."))return;
+ btn.disabled=true;await wbSettings({web_backlog_days:n});btn.disabled=false}
 async function wbPagePw(btn,remove){const pw=remove?"":$("wb_pw").value;
  if(!remove&&(pw.length<4||pw.length>64)){$("wbmsg").className="poor small";$("wbmsg").textContent=" A page password is 4 to 64 characters.";return}
  if(remove&&!confirm("Remove the MeshCore Web page password? Anyone who can reach this server can then open the page."))return;
  btn.disabled=true;await wbSettings({page_password:pw});btn.disabled=false;$("wb_pw").value=""}
 async function wbSettings(o){const m=await tnPost("api/v1/web/settings",o);$("wbmsg").className="poor small";$("wbmsg").textContent=m?" "+m:"";setTimeout(loadWeb,500)}
-async function wbAct(btn){const a=btn.dataset.act,p=btn.dataset.pub;
+async function wbAct(btn){const a=btn.dataset.act||btn.value,p=btn.dataset.pub;if(!a)return;if(btn.tagName==="SELECT")btn.value="";
  if(a==="ban"&&!confirm("Ban "+(btn.dataset.name||p.slice(0,8))+"? They are disconnected now and can't log in with this key again."))return;
  if(a==="kick"&&!confirm("Disconnect "+p.slice(0,8)+"? They can log in again."))return;
+ if(a==="delete"&&!confirm("Delete "+(btn.dataset.name||p.slice(0,8))+"? They are disconnected and forgotten, and lose \"allow send\". It isn't a ban: they can log in again as a new user."))return;
+ if(a==="purge"&&!confirm("Purge "+(btn.dataset.name||p.slice(0,8))+"'s backlog? They'll count as caught up to now, and won't get what they missed."))return;
  btn.disabled=true;const m=await tnPost("api/v1/web/users/"+p+"/"+a,{name:btn.dataset.name||""});if(m)alert(m);setTimeout(loadWeb,500)}
 async function wbBanKey(btn){const p=$("wb_banpub").value.trim().toLowerCase();if(!/^[0-9a-f]{64}$/.test(p)){$("wbbanmsg").className="poor small";$("wbbanmsg").textContent=" A public key is 64 hex characters.";return}
  btn.disabled=true;const m=await tnPost("api/v1/web/users/"+p+"/ban",{});btn.disabled=false;$("wbbanmsg").className=m?"poor small":"dim small";$("wbbanmsg").textContent=" "+(m||"Banned.");if(!m)$("wb_banpub").value="";setTimeout(loadWeb,500)}
@@ -9006,6 +9203,7 @@ class WebUI:
                     return self._send(200, json.dumps({
                         "enabled": bool(cfg.web_login), "trust_observers": bool(cfg.web_trust_observers),
                         "page_password": bool(cfg.web_page_password),
+                        "backlog": hub.backlog_info(),
                         "max": int(cfg.web_max_clients), "connected": sum(1 for c in hub.conns if c.web),
                         "users": hub.web_rows(), "banned": [b for b in (cfg.web_banned or []) if isinstance(b, dict)]}))
                 if path == KAAS_PATH + "/keys":
@@ -9172,6 +9370,13 @@ class WebUI:
                         if not isinstance(pw, str) or (pw and not 4 <= len(pw) <= 64):
                             return self._send(400, '{"error":"page password: 4 to 64 characters, or empty for none"}')
                         change["web_page_password"] = hash_web_password(pw) if pw else ""   # (hashed here: never stored)
+                    if "web_backlog_mqtt" in body and isinstance(body["web_backlog_mqtt"], bool):
+                        change["web_backlog_mqtt"] = body["web_backlog_mqtt"]
+                    if "web_backlog_days" in body:
+                        n = body["web_backlog_days"]
+                        if isinstance(n, bool) or not isinstance(n, int) or n < 0:
+                            return self._send(400, '{"error":"backlog days: a whole number, 0 for none"}')
+                        change["web_backlog_days"] = n
                     if "web_max_clients" in body:
                         n = body["web_max_clients"]
                         if isinstance(n, bool) or not isinstance(n, int) or not 0 <= n <= 256:
@@ -9182,7 +9387,7 @@ class WebUI:
                     events.put(("kaas_web_admin", "settings", change))
                     return self._send(200, '{"ok":true}')
                 if len(parts) == 6 and parts[:4] == ["api", "v1", "web", "users"] and \
-                        parts[5] in ("allow", "unallow", "kick", "ban", "unban", "forget"):
+                        parts[5] in ("allow", "unallow", "kick", "ban", "unban", "purge", "delete"):
                     try:
                         pub = bytes.fromhex(parts[4])
                     except ValueError:

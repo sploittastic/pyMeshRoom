@@ -42,7 +42,8 @@ def channel_msg(text):
                  encrypt_then_mac(PUBLIC_CHANNEL_KEY + bytes(16), data))
 
 
-class WebLoginTests(WebTestCase):
+class WebHelpers(WebTestCase):
+    """Logging in by signing, connecting, sending: for the tests below."""
 
     def setUp(self):
         super().setUp()
@@ -109,7 +110,9 @@ class WebLoginTests(WebTestCase):
         self.h.events.put(("rxraw", advert(ident, name)))
         self.assertTrue(self.h.pump(lambda: self.h.room.heard_on_rf(ident.pub) is not None, 10))
 
-    # ---------------------------------------------------------------- tests
+
+
+class WebLoginTests(WebHelpers):
 
     def test_off_by_default(self):
         self.assertFalse(self.h.cfg.web_login)
@@ -325,6 +328,118 @@ class WebLoginTests(WebTestCase):
         self.assertEqual(self.h.run_client(bot.connect)["type"], "hello")
         bot.close()
         first.ws.close()
+
+
+def dm(to_hash, from_hash, n=0):
+    return flood(mr.PT_TXT_MSG, bytes([to_hash, from_hash]) + bytes([n]) * 18)
+
+
+class BacklogTests(WebHelpers):
+    """MeshCore Web's catch-up: channel messages and DMs kept (once each, from RF or MQTT), numbered, and replayed to
+    web users after they reconnect."""
+
+    def setUp(self):
+        super().setUp()
+        self.enable()
+
+    def replay(self, c, since, channels, me):
+        c.ws.send_text(json.dumps({"type": "replay", "id": "r", "since": since, "channels": channels, "me": me}))
+        self.assertTrue(self.h.pump(lambda: any(m.get("type") in ("replay_done", "error") for m in c.msgs), 10), c.msgs)
+        done = next(m for m in c.msgs if m.get("type") in ("replay_done", "error"))
+        got = [p for m in c.msgs if m.get("type") == "replay_batch" for p in m["packets"]]
+        c.msgs.clear()
+        return done, got
+
+    def flush(self):
+        hub = self.h.room.kaas
+        hub.bk_next_flush = 0
+        hub.backlog_periodic()
+        self.h.room.store.execmany([("SELECT 1", None)])
+        time.sleep(0.3)                                     # (the writer thread)
+
+    def test_kept_once_numbered_and_replayed(self):
+        hub = self.h.room.kaas
+        me = kc.Identity.generate()
+        c = self.connect(self.login(me, "Away")[1]["ticket"])
+        pub_ch = channel_hash(PUBLIC_CHANNEL_KEY)
+        live = channel_msg("Bob: hello")
+        self.h.events.put(("rxraw", live))
+        self.assertTrue(self.h.pump(lambda: any(m.get("type") == "packet" for m in c.msgs), 10))
+        first = next(m for m in c.msgs if m.get("type") == "packet")
+        self.assertEqual(first["seq"], hub.bk_seq)                         # live packets carry their number
+        seq0 = first["seq"]
+        c.ws.close()
+        self.h.pump(lambda: not any(x.web for x in hub.conns), 5)
+        # while they're away: a channel message twice (two repeaters), the same one from MQTT, a DM to them,
+        # a DM to someone else, a channel they're not in
+        missed = channel_msg("Carol: while you were away")
+        self.h.events.put(("rxraw", missed))
+        self.h.events.put(("rxraw", missed))
+        self.h.room.observer_event(("obs", "backlog", missed, 5.0))
+        to_me = dm(me.pub[0], 0x42)
+        self.h.events.put(("rxraw", to_me))
+        self.h.events.put(("rxraw", dm(me.pub[0] ^ 0xFF, 0x42)))
+        other = flood(mr.PT_GRP_TXT, bytes([pub_ch ^ 1]) + bytes(18))
+        self.h.events.put(("rxraw", other))
+        self.h.pump(lambda: hub.bk_seq >= seq0 + 4, 5)
+        self.flush()
+        self.assertEqual(self.h.room.store.read("SELECT COUNT(*) FROM backlog WHERE seq > ?", (seq0,))[0][0], 4)
+        rows = self.http("GET", "/api/v1/web/users")[1]
+        self.assertEqual(rows["users"][0]["missed"], 4)                    # (packets since they were last connected)
+        self.assertEqual((rows["backlog"]["days"], rows["backlog"]["mqtt"]), (30, False))
+        c = self.connect(self.login(me, "Away")[1]["ticket"])
+        done, got = self.replay(c, seq0, [pub_ch], me.pub[0])
+        self.assertEqual([bytes.fromhex(p["raw"]) for p in got], [missed, to_me])
+        self.assertEqual(done["last"], hub.bk_seq)
+        done, got = self.replay(c, None, [pub_ch], me.pub[0])               # a first visit: from now on
+        self.assertEqual((got, done["last"], done["count"]), ([], hub.bk_seq, 0))
+        c.ws.close()
+
+    def test_purge_delete_bots_prune_and_mqtt(self):
+        hub = self.h.room.kaas
+        me = kc.Identity.generate()
+        c = self.connect(self.login(me, "Away")[1]["ticket"])
+        seq0 = hub.bk_seq
+        c.ws.close()
+        self.h.pump(lambda: not any(x.web for x in hub.conns), 5)
+        self.h.events.put(("rxraw", channel_msg("Bob: old news")))
+        self.h.pump(lambda: hub.bk_seq > seq0, 5)
+        self.flush()
+        self.assertEqual(self.http("POST", "/api/v1/web/users/%s/purge" % me.pub.hex(), {})[0], 200)
+        self.h.pump(lambda: hub.wusers[me.pub.hex()]["floor"] == hub.bk_seq, 5)
+        c = self.connect(self.login(me, "Away")[1]["ticket"])
+        done, got = self.replay(c, seq0, [channel_hash(PUBLIC_CHANNEL_KEY)], me.pub[0])
+        self.assertEqual(got, [])                                          # purged: synced up to then
+        token = self.make_key()                                            # a bot can't replay
+        bot = kc.KaasClient(self.url, token)
+        self.h.run_client(bot.connect)
+        with self.assertRaises(kc.RequestError):
+            self.h.run_client(lambda: bot._request("replay", 5, since=0, channels=[], me=1))
+        # MQTT: kept, and to web users live, only when ticked
+        far = channel_msg("Zed: from far away")
+        self.h.room.observer_event(("obs", "backlog", far, 1.0))
+        self.h.pump(lambda: False, 0.3)
+        self.assertFalse(any(m.get("dir") == "mqtt" for m in c.msgs))
+        self.http("POST", "/api/v1/web/settings", {"web_backlog_mqtt": True, "web_backlog_days": 7})
+        self.h.pump(lambda: self.h.cfg.web_backlog_mqtt, 5)
+        self.h.room.observer_event(("obs", "backlog", far, 1.0))
+        self.assertTrue(self.h.pump(lambda: any(m.get("dir") == "mqtt" for m in c.msgs), 5))
+        self.h.events.put(("rxraw", far))                                  # then heard on RF too: not again
+        n = hub.bk_seq
+        self.h.pump(lambda: False, 0.3)
+        self.assertEqual(hub.bk_seq, n)
+        self.flush()
+        self.h.room.store.execmany([("UPDATE backlog SET ts = ts - 8 * 86400 WHERE seq <= ?", [(seq0 + 1,)])])
+        hub.bk_next_prune = 0
+        self.flush()
+        self.assertEqual(self.h.room.store.read("SELECT COUNT(*) FROM backlog WHERE seq <= ?", (seq0 + 1,))[0][0], 0)
+        self.http("POST", "/api/v1/web/users/%s/allow" % me.pub.hex(), {})
+        self.h.pump(lambda: me.pub.hex() in (self.h.cfg.web_approved or []), 5)
+        self.assertEqual(self.http("POST", "/api/v1/web/users/%s/delete" % me.pub.hex(), {})[0], 200)
+        self.assertTrue(self.h.pump(lambda: c.closed.is_set(), 5))
+        self.assertNotIn(me.pub.hex(), hub.wusers)
+        self.assertNotIn(me.pub.hex(), self.h.cfg.web_approved or [])
+        bot.close()
 
 
 class NodesRequestTests(WebTestCase):

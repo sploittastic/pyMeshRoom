@@ -15,7 +15,7 @@ from meshroom import ObserverFeed, PT_ACK, Packet, mqtt_changes
 class IngestionTests(unittest.TestCase):
     def feed(self, queue_max=2):
         room = SimpleNamespace(
-            cfg=SimpleNamespace(mqtt_advert_ingest=True, mqtt_activity=True,
+            cfg=SimpleNamespace(mqtt_advert_ingest=True, mqtt_activity=True, web_backlog_mqtt=False, web_backlog_days=0,
                                 mqtt_topo_ingest=True, mqtt_queue_max=queue_max),
             id=SimpleNamespace(pub_key=b"R" * 32), self_hash=0,
             channel_hashes=lambda: set())

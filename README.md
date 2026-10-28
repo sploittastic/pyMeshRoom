@@ -478,7 +478,9 @@ signatures and encrypted packets.
 It covers the Public channel, hashtag and private channels, DMs, rooms, contacts with a map, adverts, `@` mentions with
 autocomplete, and GIFs from Giphy links.
 
-It also reads and sends reactions, in MeshCore One's format as MeshTrax uses it.
+It also reads and sends reactions, in MeshCore One's format as MeshTrax uses it. While someone is away, the server keeps
+channel messages and DMs (30 days by default, optionally including MQTT), and their browser catches up when they come
+back.
 
 Turn it on with **Allow web logins** on the **Web users** card. A **page password** there keeps the page, and logging
 in through it, to people who know it. Its source is in [web/](web/README.md).

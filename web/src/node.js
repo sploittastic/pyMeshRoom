@@ -139,6 +139,7 @@ export class MeshNode extends EventTarget {
 
   // ACKs and path returns skip the rate limit (the server exempts them: a node must answer what it's sent).
   sendNow(raw) {
+    if (this.readOnly) return Promise.resolve({ status: "dropped", reason: "read only" });
     this.markSeen(raw);
     return this.client.sendNow(raw);
   }
@@ -194,9 +195,19 @@ export class MeshNode extends EventTarget {
 
   // ---------------------------------------------------------------- receiving
 
-  // A packet the radio heard or sent (already de-duplicated by the app).
-  handle(pkt) {
+  // A packet the radio heard or sent (already de-duplicated by the app). readOnly: an old one (a catch-up) or one an
+  // MQTT observer heard: read it, but answer nothing (no ACKs, no paths) and learn no route from it.
+  handle(pkt, { readOnly = false } = {}) {
     if (!pkt.isFlood && pkt.hops > 0) return;           // still on its way through repeaters: not for us yet
+    this.readOnly = readOnly;
+    try {
+      this.dispatch(pkt);
+    } finally {
+      this.readOnly = false;
+    }
+  }
+
+  dispatch(pkt) {
     const t = pkt.ptype, p = pkt.payload;
     if (t === PT_ADVERT) this.rxAdvert(p);
     else if (t === PT_TXT_MSG || t === PT_RESPONSE || t === PT_PATH) this.rxPeer(pkt);
@@ -248,7 +259,7 @@ export class MeshNode extends EventTarget {
     const path = Uint8Array.from(data.subarray(1, k));
     const extraType = k < data.length ? data[k] & 15 : 0xff;
     const extra = data.subarray(k + 1);
-    [c.outPath, c.outLen] = [path, plen];                 // how to reach them directly from now on
+    if (!this.readOnly) [c.outPath, c.outLen] = [path, plen];   // how to reach them directly from now on
     if (extraType === PT_ACK && extra.length >= 4) this.rxAck(extra.subarray(0, 4));
     else if (extraType === PT_RESPONSE && extra.length) this.rxResponse(c, extra);
     if (pkt.isFlood) this.sendNow(directPacket(PT_PATH, this.pathReturn(c, pkt.path, pkt.pathLen), path, plen));

@@ -4,6 +4,7 @@ Everything the radio transmits is printed as "TX <hex>". Lines appended to WORK/
     RX <hex>       the radio hears this packet
     SAY <text>     the room posts this (to its members)
     BOT_ADVERT     EchoBot (a meshroom_kaas Node on its own KaaS key, answering every DM) adverts
+    BOT_DM <pub hex> <text>   EchoBot sends a DM (to a contact it has heard advert)
 
     python3 devserver.py PYMESHROOM_CHECKOUT PORT WORK_DIR"""
 import os, sys, threading, time
@@ -49,6 +50,9 @@ def reader():
                 h.events.put(("rxraw", bytes.fromhex(line[3:].strip())))
             elif line.startswith("SAY "):
                 h.events.put(("say", line[4:]))
+            elif line.startswith("BOT_DM ") and "node" in bot:
+                _, pub, text = line.split(" ", 2)
+                threading.Thread(target=lambda: bot["node"].send_dm(bot["node"].contact(pub), text), daemon=True).start()
             elif line.strip() == "BOT_ADVERT" and "node" in bot:
                 threading.Thread(target=lambda: bot["node"].advert(flood=True), daemon=True).start()
         done = len(lines)

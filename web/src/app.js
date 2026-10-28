@@ -1,6 +1,6 @@
 // The web app: log in, then talk on MeshCore channels, in DMs and in rooms through pyMeshRoom's KaaS API.
 // The private key, channel secrets and room passwords never leave the browser; the server only sees encrypted packets.
-import { bytesToHex, randomBytes, utf8Decode, utf8Encode } from "./bytes.js";
+import { bytesToHex, hexToBytes, randomBytes, utf8Decode, utf8Encode } from "./bytes.js";
 import { QUICK_REACTIONS, emojiOnly, hashTexts, messageHash, parseReaction, reactionText } from "./format.js";
 import { findGifs, gifFallbackUrl, gifPageUrl, gifUrl } from "./gif.js";
 import { AuthError, KaasClient, PagePasswordNeeded, kaasEndpoints } from "./kaas.js";
@@ -11,7 +11,7 @@ import {
 } from "./meshcore.js";
 import { LoginFailed, MAX_ROOM_POST_LEN, MeshNode } from "./node.js";
 import {
-  loadChannels, loadContacts, loadConversations, loadHistory, loadSettings, saveChannels,
+  loadChannels, loadContacts, loadCursor, saveCursor, loadConversations, loadHistory, loadSettings, saveChannels,
   saveContacts, saveConversations, saveHistory, saveSettings,
 } from "./store.js";
 import { seal, unseal } from "./vault.js";
@@ -39,6 +39,9 @@ const app = {
   dirTimer: null,
   lastPkt: null,                // the packet being handled (for a DM's hops and SNR)
   directoryError: null,
+  cursor: null,                 // the last backlog seq handled (the server numbers channel messages and DMs)
+  catchingUp: false,
+  replayQueue: [],
 };
 let autoTried = false;          // connect by ourselves once per page load (not again after logging out)
 
@@ -242,6 +245,8 @@ function startChat(identity, name, client) {
     markSeen: (raw) => markSeen(packetHash(parsePacket(raw))), uniqueTime,
   });
   node.loadContacts(loadContacts(identity.pubHex));
+  app.server = client.endpoints.ws;
+  app.cursor = loadCursor(identity.pubHex, app.server);
   for (const c of node.contacts.values()) if (c.room) c.room.loggedIn = false;
   app.node = node;
   const convs = loadConversations(identity.pubHex);
@@ -256,6 +261,7 @@ function startChat(identity, name, client) {
     scheduleSave();
   });
   client.addEventListener("packet", (e) => onPacket(e.detail));
+  client.addEventListener("replay", (e) => onReplay(e.detail));
   client.addEventListener("state", (e) => onState(e.detail));
   client.addEventListener("hello", () => onHello());
   client.addEventListener("dropped", (e) => toast("The server skipped " + e.detail + " packets (this tab fell behind)."));
@@ -288,6 +294,7 @@ function onHello() {
     app.node.contact(pub, { type: "room", name: h.names?.[pub] });
   refreshDirectory();
   loginRooms();
+  catchUp();
 }
 
 async function refreshDirectory() {
@@ -350,6 +357,7 @@ function flushSave() {
   saveHistory(app.identity.pubHex, app.history);
   saveContacts(app.identity.pubHex, app.node.saveContacts());
   saveConversations(app.identity.pubHex, { dms: app.dms, last: app.active });
+  if (app.cursor != null) saveCursor(app.identity.pubHex, app.server, app.cursor);
 }
 
 function markSeen(hash) {
@@ -398,13 +406,20 @@ function budget(cv = conv()) {
 
 // ---------------------------------------------------------------- receiving
 
-function onPacket({ dir, raw, snr }) {
+// A packet: live from the radio, from an MQTT observer ("mqtt"), or caught up on (old: then `at` is when the server got
+// it). Old and MQTT ones are read only.
+function onPacket({ dir, raw, snr, seq, old = false, at = null }) {
+  if (seq != null) {
+    // while catching up, only the catch-up moves the cursor: a live packet is newer than what's still to come
+    if (app.catchingUp && !old) app.liveSeq = Math.max(app.liveSeq || 0, seq);
+    else if (app.cursor == null || seq > app.cursor) app.cursor = seq;
+  }
   const pkt = parsePacket(raw);
   if (!pkt) return;
   if (markSeen(packetHash(pkt))) return;                     // another copy, or our own packet going out
-  app.lastPkt = { pkt, dir, snr };
+  app.lastPkt = { pkt, dir, snr, old, at };
   if (pkt.ptype === PT_GRP_TXT) onChannelPacket(pkt, dir, snr);
-  else app.node.handle(pkt);
+  else app.node.handle(pkt, { readOnly: old || dir === "mqtt" });
   app.lastPkt = null;
 }
 
@@ -413,24 +428,25 @@ function onChannelPacket(pkt, dir, snr) {
   if (!m) return;
   const msgs = app.history[m.channel.keyHex] || [];
   if (msgs.some((x) => x.ts === m.ts && x.sender === m.sender && x.text === m.text)) return;   // (resent)
-  addIncoming(m.channel.keyHex, { id: newId(), ts: m.ts, at: Date.now(), sender: m.sender, text: m.text,
-    hops: pkt.isFlood ? pkt.hops : null, snr: dir === "rx" ? snr : null, dir });
+  addIncoming(m.channel.keyHex, { id: newId(), ts: m.ts, at: app.lastPkt?.at || Date.now(), sender: m.sender, text: m.text,
+    hops: pkt.isFlood ? pkt.hops : null, snr: dir === "rx" ? snr : null, dir, old: app.lastPkt?.old || undefined });
 }
 
 function routeOf() {
   const l = app.lastPkt;
-  return l ? { hops: l.pkt.isFlood ? l.pkt.hops : null, snr: l.dir === "rx" ? l.snr : null, dir: l.dir } : {};
+  return l ? { hops: l.pkt.isFlood ? l.pkt.hops : null, snr: l.dir === "rx" ? l.snr : null, dir: l.dir, old: l.old || undefined,
+    at: l.at || Date.now() } : {};
 }
 
 function onDm({ contact, text, ts }) {
   app.dms = [contact.pubHex, ...app.dms.filter((p) => p !== contact.pubHex)];
-  addIncoming("dm:" + contact.pubHex, { id: newId(), ts, at: Date.now(), sender: contactName(contact), text, ...routeOf() });
+  addIncoming("dm:" + contact.pubHex, { id: newId(), ts, sender: contactName(contact), text, ...routeOf() });
 }
 
 function onPost({ room, author, text, ts }) {
   const mine = author === app.identity.pubHex.slice(0, 8);
   const who = mine ? app.name : [...app.node.contacts.values()].find((c) => c.pubHex.startsWith(author));
-  const msg = { id: newId(), ts, at: Date.now(), sender: mine ? app.name : who ? contactName(who) : author, author, text, ...routeOf() };
+  const msg = { id: newId(), ts, sender: mine ? app.name : who ? contactName(who) : author, author, text, ...routeOf() };
   if (mine) Object.assign(msg, { mine: true, status: "delivered" });
   addIncoming("room:" + room.pubHex, msg);
 }
@@ -439,10 +455,57 @@ function addIncoming(key, msg) {
   if (takeReaction(key, msg)) return;
   (app.history[key] ||= []).push(msg);
   scheduleSave();
-  if (key === app.active) appendMessage(msg);
   if (key !== app.active || document.hidden) app.unread[key] = (app.unread[key] || 0) + 1;
+  if (app.catchingUp) return void app.touched.add(key);   // (drawn once, in order, when the catch-up ends)
+  if (key === app.active) appendMessage(msg);
   renderSidebar();
   updateTitle();
+}
+
+// ---------------------------------------------------------------- catching up (the server's backlog, for web logins)
+
+// On every connect: what was missed since our cursor. A first visit starts from now. Old packets are read only.
+// Replayed packets, as the server sends them: worked through in chunks, so the page stays responsive.
+function onReplay(packets) {
+  app.replayQueue.push(...packets);
+  if (!app.replayPump) app.replayPump = drainReplay().finally(() => { app.replayPump = null; });
+}
+
+async function drainReplay() {
+  while (app.replayQueue.length) {
+    for (const p of app.replayQueue.splice(0, 100)) {
+      onPacket({ dir: p.dir, raw: hexToBytes(p.raw), snr: p.snr, seq: p.seq, old: true, at: (p.ts || 0) * 1000 || Date.now() });
+      app.replayed++;
+    }
+    $("server-info").textContent = "Catching up… " + app.replayed.toLocaleString() + " packets";
+    await new Promise((r) => setTimeout(r, 0));
+  }
+}
+
+async function catchUp() {
+  const client = app.client, key = client.hello?.key;
+  if (!key?.web || app.catchingUp) return;
+  Object.assign(app, { catchingUp: true, touched: new Set(), replayed: 0, liveSeq: 0 });
+  try {
+    const done = await client.request("replay", {
+      since: app.cursor, channels: [...new Set(app.channels.map((c) => c.hash))], me: app.identity.pub[0],
+    }, 10 * 60 * 1000);
+    while (app.replayPump) await app.replayPump;
+    app.cursor = Math.max(app.cursor ?? 0, done.last, app.liveSeq);
+  } catch (e) {
+    while (app.replayPump) await app.replayPump;
+    if (!/catching up is for web logins|unknown message type/.test(e.message)) toast("Couldn't catch up: " + e.message);
+  } finally {
+    app.catchingUp = false;
+    for (const k of app.touched) app.history[k].sort((a, b) => a.at - b.at);
+    const n = [...app.touched].reduce((s, k) => s + (app.unread[k] || 0), 0);
+    renderSidebar();
+    renderConversation();
+    updateTitle();
+    renderServer();
+    flushSave();
+    if (app.replayed) toast(n ? "Caught up: " + n + " missed message" + (n === 1 ? "" : "s") + "." : "Caught up.");
+  }
 }
 
 function onState({ state, reason }) {
@@ -730,6 +793,8 @@ function messageNode(m) {
   if (m.hops != null) route.push(m.hops === 0 ? "direct" : m.hops + (m.hops === 1 ? " hop" : " hops"));
   if (m.snr != null) route.push("SNR " + Number(m.snr).toFixed(1));
   if (m.dir === "tx" && !m.mine) route.push("via this radio");
+  if (m.dir === "mqtt") route.push("via MQTT");
+  if (m.old) route.push("while you were away");
   return el("div", { class: "msg" + (m.mine ? " mine" : ""), dataset: { id: m.id } },
     el("div", { class: "meta" },
       el("span", { class: "sender", title: m.author ? "key " + m.author + "…" : null }, m.sender || "(no name)"),

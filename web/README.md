@@ -105,7 +105,15 @@ What you get:
   web logins off, or revokes an API key.
 * Dark (the dashboard's look), light, or following the system; it works on phones.
 
-The radio keeps no backlog: you see messages heard while you're connected.
+**Catching up.** pyMeshRoom keeps a backlog of channel messages and DMs, 30 days by default (the admin sets it).
+
+* **On reconnect:** the page asks for what it missed since it was last here and works through it in chunks, so the
+  page stays usable. Missed messages slot into each conversation by the time the server got them, marked "while you
+  were away".
+* **Read only:** nothing is answered for old messages. No ACKs go back, so a sender's app still shows a missed DM as
+  undelivered.
+* **First visit:** the page starts from now.
+* **Per device:** each browser keeps its own place, so a phone and a laptop each catch up.
 
 ## Security notes
 

@@ -36,6 +36,13 @@ export const saveContacts = (pubHex, list) => write("contacts." + pubHex.slice(0
 export const loadConversations = (pubHex) => read("conversations." + pubHex.slice(0, 16), { dms: [], last: null });
 export const saveConversations = (pubHex, c) => write("conversations." + pubHex.slice(0, 16), c);
 
+// How far this browser has caught up, per identity and server: the last backlog seq it has.
+export const loadCursor = (pubHex, server) => {
+  const c = read("cursor." + pubHex.slice(0, 16), null);
+  return c && c.server === server ? c.seq : null;
+};
+export const saveCursor = (pubHex, server, seq) => write("cursor." + pubHex.slice(0, 16), { server, seq });
+
 export function forgetEverything() {
   try {
     for (const k of Object.keys(localStorage)) if (k.startsWith(PREFIX)) localStorage.removeItem(k);
