@@ -320,14 +320,60 @@ class WebLoginTests(WebHelpers):
 
     def test_web_sessions_have_their_own_limit(self):
         self.enable(web_max_clients=1)
-        first = self.connect(self.login(kc.Identity.generate())[1]["ticket"])
+        tickets = [self.login(kc.Identity.generate())[1]["ticket"] for _ in range(2)]   # both while there was room
+        first = self.connect(tickets[0])
         with self.assertRaises(kc.HandshakeError) as e:
-            self.connect(self.login(kc.Identity.generate())[1]["ticket"])
+            self.connect(tickets[1])
         self.assertEqual(e.exception.status, "503")
+        self.assertEqual(self.post("/api/v1/web/ticket", {"ticket": tickets[1]})[1]["outcome"], "full")
         bot = kc.KaasClient(self.url, self.make_key())                        # a bot still gets in
         self.assertEqual(self.h.run_client(bot.connect)["type"], "hello")
         bot.close()
         first.ws.close()
+
+
+class WebsocketDiagnosisTests(WebHelpers):
+    """A browser isn't told why its websocket didn't open: the server keeps what became of each ticket, and logs it."""
+
+    def raw_upgrade(self, ticket, headers):
+        import socket
+        s = socket.create_connection(("127.0.0.1", self.port), timeout=10)
+        s.sendall(("GET /api/v1/kaas?ticket=%s HTTP/1.1\r\nHost: %s\r\n%s"
+                   "Sec-WebSocket-Version: 13\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\r\n" % (
+                       ticket, self.host, "".join("%s: %s\r\n" % kv for kv in headers))).encode())
+        head = s.recv(1000).decode(errors="replace")
+        s.close()
+        return head.split("\r\n")[0]
+
+    def outcome(self, ticket):
+        return self.post("/api/v1/web/ticket", {"ticket": ticket})[1]["outcome"]
+
+    def test_ticket_outcomes(self):
+        self.enable()
+        t = self.login(kc.Identity.generate())[1]["ticket"]
+        self.assertEqual(self.outcome(t), "waiting")              # (a proxy or the browser stopped it)
+        with self.assertLogs("meshroom", "WARNING") as logs:
+            self.assertIn(" 426 ", self.raw_upgrade(t, []))       # a proxy dropped Upgrade and Connection
+        self.assertIn("reverse proxy", logs.output[0])
+        self.assertEqual(self.outcome(t), "no_upgrade")
+        t = self.login(kc.Identity.generate())[1]["ticket"]       # a proxy sending two Connection headers is fine,
+        line = self.raw_upgrade(t, [("Upgrade", "websocket"), ("Connection", "keep-alive"), ("Connection", "Upgrade")])
+        self.assertEqual(line, "HTTP/1.1 101 Switching Protocols")   # and the 101 is HTTP/1.1, as proxies want
+        self.assertEqual(self.outcome(t), "connected")
+        t = self.login(kc.Identity.generate())[1]["ticket"]
+        hub = self.h.room.kaas
+        hub.tickets[t] = (hub.tickets[t][0], time.monotonic() - 1)
+        self.assertEqual(self.outcome(t), "unused")              # expired before reaching us: still never reached
+        self.assertEqual(self.outcome("kt_made_up"), "unknown")
+
+    def test_a_full_server_says_so_at_login(self):
+        self.enable(web_max_clients=1)
+        first = self.connect(self.login(kc.Identity.generate())[1]["ticket"])
+        code, d = self.login(kc.Identity.generate())
+        self.assertEqual((code, d.get("full")), (503, True), d)
+        first.ws.close()
+        self.assertTrue(self.h.pump(lambda: not any(c.web for c in self.h.room.kaas.conns), 10))
+        self.assertEqual(self.login(kc.Identity.generate())[0], 200)
 
 
 def dm(to_hash, from_hash, n=0):

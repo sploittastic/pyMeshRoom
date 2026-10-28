@@ -50,33 +50,22 @@ Connect to `ws://<server>:<web_port>/api/v1/kaas`, on the dashboard's port. The 
 clients connect over the internet, put pyMeshRoom behind an HTTPS reverse proxy that passes websocket upgrades and
 use `wss://`. Otherwise the key travels unencrypted.
 
-### From a browser
-
-A browser can't put an `Authorization` header on a websocket, so it trades the key for a one-time ticket first:
+A reverse proxy has to pass the upgrade on. With nginx:
 
 ```
-POST /api/v1/kaas/ticket HTTP/1.1
-Authorization: Bearer kaas_...
+proxy_http_version 1.1;
+proxy_set_header Upgrade $http_upgrade;
+proxy_set_header Connection "upgrade";
+proxy_read_timeout 1h;
 ```
 
-```json
-{"ticket": "kt_...", "expires_in": 30}
-```
-
-Then it connects to `wss://<server>/api/v1/kaas?ticket=kt_...` with no header. A ticket opens one connection, within
-30 seconds, as the key it was made for; ask for a new one to reconnect. A missing, unknown, revoked or expired key gets
-401 after a one-second delay, and 503 means too many tickets are waiting (at most 64). The ticket endpoint answers
-CORS preflights for any origin: no cookies are involved, so the key itself is the only credential. Use it over HTTPS.
-
-```js
-const r = await fetch("https://meshroom.example/api/v1/kaas/ticket", {method: "POST", headers: {Authorization: "Bearer " + key}});
-const {ticket} = await r.json();
-const ws = new WebSocket("wss://meshroom.example/api/v1/kaas?ticket=" + encodeURIComponent(ticket));
-```
+Caddy and Traefik pass websockets on by themselves. Each refused upgrade is logged, with the reason (for instance
+`websocket from 10.0.0.15 refused (426): no websocket upgrade in the request ...`, when a proxy drops the headers).
 
 ### Logging in with a node's private key (MeshCore Web)
 
-People can log in without an API key, by signing with their MeshCore node's private key. The key never leaves their
+Browsers can't put an `Authorization` header on a websocket, and API keys are for bots, so a browser logs in by
+signing with its MeshCore node's private key. The key never leaves their
 browser; only a signature does. The admin turns this on with **Allow web logins** on the dashboard's **Web users**
 card (`web_login`, off by default).
 
@@ -88,7 +77,24 @@ card (`web_login`, off by default).
    `{"pub": "<64 hex>", "signature": "<128 hex>", "challenge": "wc_...", "host": "...", "name": "pl@web"}`.
    The answer is `{"ticket": "kt_...", "expires_in": 30, "send": true, "state": "allowed"}`, or
    `"send": false, "state": "pending"`.
-4. Connect with `?ticket=`, as above.
+4. Connect to `wss://<server>/api/v1/kaas?ticket=kt_...`, with no header. A ticket opens one connection, within 30
+   seconds; log in again to reconnect.
+
+A login answers 503 with `"full": true` while all `web_max_clients` web sessions are in use.
+
+A browser isn't told why a websocket didn't open, so it can ask: `POST /api/v1/web/ticket` with `{"ticket": "kt_..."}`
+answers `{"outcome": ...}`, kept for 5 minutes:
+
+| outcome | |
+|---|---|
+| `waiting`, `unused` | The websocket never reached the server: a proxy, an extension or a firewall stopped it. |
+| `no_upgrade` | It arrived without its `Upgrade` or `Connection` header: a proxy dropped them. |
+| `bad_version` | Not a version 13 websocket. |
+| `busy`, `full` | Too many requests, or all web sessions in use. |
+| `expired` | It came after the ticket's 30 seconds. |
+| `refused` | Web logins were turned off, or the key was banned, in between. |
+| `connected` | It opened. |
+| `unknown` | No such ticket (or the server restarted). |
 
 A challenge works once. The host must be the one this request arrived at: its `Host` header, `X-Forwarded-Host` from
 a reverse proxy on the same machine, or one listed in `web_hosts`. This stops another site from getting a visitor to
@@ -164,7 +170,8 @@ The admin can also set a **page password** on the card (`web_page_password`, sto
 
 Failed handshakes return:
 
-* 401: missing, unknown, revoked or expired key, after a one-second delay.
+* 401: missing, unknown, revoked or expired key or ticket, after a one-second delay.
+* 426: not a websocket upgrade (a proxy may have dropped the `Upgrade` and `Connection` headers).
 * 503: too many clients. The limit is 16 connections across all API keys, and `web_max_clients` (32) web sessions on
   top of that.
 

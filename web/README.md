@@ -40,8 +40,6 @@ log in and read. You can **send** once the radio has heard your key advertise, f
 within range, or once the admin allows your key. Until then the page says so, and it switches over by itself when
 that happens. The admin can also disconnect or ban a key.
 
-For a server with web logins turned off, **Use an API key instead** takes a KaaS key (`kaas_…`) from its dashboard.
-
 If the admin set a **page password**, the page pyMeshRoom serves asks for it before showing anything. A copy of the
 page opened from elsewhere asks for it when logging in. With **Remember me**, it's saved like the key (sealed, with a
 passphrase).
@@ -101,8 +99,10 @@ What you get:
   messages per conversation are kept in this browser, per identity, as is the conversation you had open. Room
   passwords are saved encrypted with a key derived from your private key, so they can't be read without it.
 * Rooms you've joined log you in again by themselves each time you connect.
-* It reconnects by itself, logging in again each time. It stops if the admin disconnects or bans the key, turns
-  web logins off, or revokes an API key.
+* It reconnects by itself, logging in again each time. It stops if the admin disconnects or bans the key, or turns
+  web logins off.
+* If the login works but the websocket doesn't open, it asks the server what became of it and says why: most often a
+  reverse proxy that doesn't pass websockets on (see [docs/api.md](../docs/api.md#connecting)).
 * Dark (the dashboard's look), light, or following the system; it works on phones.
 
 **Catching up.** pyMeshRoom keeps a backlog of channel messages and DMs, 30 days by default (the admin sets it).
@@ -126,7 +126,6 @@ What you get:
   exact file on unpkg, and is pinned by hash too. Images may come only from Giphy's two image hosts (by GIF id), the
   OpenStreetMap tile servers and Leaflet's own.
   Message text is always added as text, never as HTML.
-* An API key is a credential: anyone who has it can use the radio within the key's permissions. Use HTTPS.
 * Saved room passwords are sealed (AES-128-CTR and HMAC-SHA256) with a key derived one-way from your private key,
   under a label of its own: `HMAC-SHA256(private key, "meshcore-web local storage v1")`. That protects them while
   your key isn't saved, or is saved under a passphrase. A key saved without a passphrase sits in the same storage and
@@ -153,7 +152,7 @@ The end-to-end run starts pyMeshRoom's own test harness with a dashboard, web lo
 * contacts from the server's directory, a DM to and from a Python `meshroom_kaas` bot (delivered once ACKed), joining
   the radio's room with its password, posting, and receiving its posts;
 * `@` autocomplete, the map (OpenStreetMap faked), the theme switch, and the saved login with and without a passphrase;
-* persistence, kick and ban by the admin, logging in with an API key, a bad key, the page served by pyMeshRoom at
+* persistence, kick and ban by the admin, a reverse proxy that drops websockets, a full server, the page served by pyMeshRoom at
   `/meshcore-web/`, and the phone layout.
 
 It needs python3 with `cryptography` and `pyserial`, and node with Playwright.

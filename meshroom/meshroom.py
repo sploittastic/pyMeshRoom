@@ -6999,6 +6999,7 @@ WEB_PATH = "/api/v1/web"
 KAAS_TOKEN_PREFIX = "kaas_"
 KAAS_TICKET_PREFIX = "kt_"
 KAAS_TICKET_S = 30                    # a websocket ticket (for browsers, which can't send Authorization) lasts this long
+KAAS_TICKET_LOG_S = 300               # what became of a ticket, kept this long for /api/v1/web/ticket to tell its browser
 KAAS_MAX_TICKETS = 64                 # tickets waiting to be used, across all keys
 KAAS_MAX_KEYS = 50
 KAAS_MAX_CLIENTS = 16
@@ -7300,7 +7301,8 @@ class KaasHub:
         self.air = collections.deque()      # (monotonic, airtime ms) of clients' transmissions: the shared cap
         self.stats = dict(rx=0, tx=0, sent=0, local=0, dropped=0)
         self.next_check = 0.0
-        self.tickets = {}                   # ticket -> (key id or ("web", pub hex), monotonic expiry): one websocket, once
+        self.tickets = {}                   # ticket -> (web login's pub hex, monotonic expiry): one websocket, once
+        self.ticket_log = {}                # ticket -> (what became of it, monotonic expiry): see ticket_outcome
         self.challenges = {}                # web login challenge -> monotonic expiry
         self.wusers = {}                    # web user (pub hex) -> {"name", "first", "last"}: shown on the dashboard
         self.wusers_path = os.path.join(room.cfg.data_dir, "web_users.json")
@@ -7399,29 +7401,58 @@ class KaasHub:
         return found
 
     def new_ticket(self, key):
-        """A one-time ticket for a key, or None when too many are waiting. Browsers can't put Authorization on a
-        websocket, so they POST the key to /api/v1/kaas/ticket (or log in by signing, /api/v1/web/login) and open the
-        websocket with ?ticket=. Any thread."""
+        """A one-time ticket for a web login, or None when too many are waiting. Browsers can't put Authorization on a
+        websocket, so they log in by signing (/api/v1/web/login) and open the websocket with ?ticket=. Any thread."""
         import secrets
         ticket = KAAS_TICKET_PREFIX + secrets.token_urlsafe(24)
         now = time.monotonic()
         with self.lock:
-            for t in [t for t, e in self.tickets.items() if e[1] <= now]:
-                del self.tickets[t]
+            self._prune_tickets(now)
             if len(self.tickets) >= KAAS_MAX_TICKETS:
                 return None
-            self.tickets[ticket] = (("web", key["web"]) if key.get("web") else key["id"], now + KAAS_TICKET_S)
+            self.tickets[ticket] = (key["web"], now + KAAS_TICKET_S)
         return ticket
 
+    def _prune_tickets(self, now):
+        for t in [t for t, e in self.tickets.items() if e[1] <= now]:
+            del self.tickets[t]
+            self.ticket_log[t] = ("unused", now + KAAS_TICKET_LOG_S)       # (it never reached us)
+        for t in [t for t, e in self.ticket_log.items() if e[1] <= now]:
+            del self.ticket_log[t]
+        while len(self.ticket_log) > 4 * KAAS_MAX_TICKETS:
+            del self.ticket_log[next(iter(self.ticket_log))]
+
     def redeem(self, ticket):
-        """The key a ticket was made for, or None (unknown, used or expired). A ticket works once."""
+        """(the key a ticket was made for, None) or (None, why not: "expired", "unknown", "refused"). A ticket works
+        once."""
         with self.lock:
             e = self.tickets.pop(ticket, None)
-        if e is None or e[1] <= time.monotonic():
-            return None
-        if isinstance(e[0], tuple):
-            return self.web_key(e[0][1])
-        return self.key_by_id(e[0])
+        if e is None:
+            return None, "unknown"
+        if e[1] <= time.monotonic():
+            return None, "expired"
+        key = self.web_key(e[0])
+        return (key, None) if key else (None, "refused")
+
+    def ticket_outcome(self, ticket, outcome):
+        """What became of a ticket's websocket: "connected", or why it was refused ("no_upgrade", "bad_version",
+        "busy", "full", "expired", "refused"). The browser only sees that its websocket didn't open; this tells it
+        why (/api/v1/web/ticket)."""
+        if not str(ticket).startswith(KAAS_TICKET_PREFIX):
+            return
+        with self.lock:
+            self.tickets.pop(ticket, None)
+            self.ticket_log[ticket] = (outcome, time.monotonic() + KAAS_TICKET_LOG_S)
+
+    def ticket_status(self, ticket):
+        """POST /api/v1/web/ticket: "waiting" (made, but its websocket hasn't reached us: a proxy or the browser
+        stopped it), "unused" (the same, and it has expired), an outcome from ticket_outcome, or "unknown"."""
+        with self.lock:
+            self._prune_tickets(time.monotonic())
+            if ticket in self.tickets:
+                return "waiting"
+            e = self.ticket_log.get(ticket)
+        return e[0] if e else "unknown"
 
     # ---------------------------------------------------------------- web logins (any thread unless noted)
 
@@ -7452,7 +7483,7 @@ class KaasHub:
             self.challenges[ch] = now + WEB_CHALLENGE_S
         return ch
 
-    def web_login(self, body, hosts):
+    def web_login(self, body, hosts, ip="?"):
         """POST /api/v1/web/login: {"pub", "signature", "challenge", "host", "name"}, the signature over
         web_login_message(host, challenge, pub). -> (HTTP status, answer): a ticket, and whether this key may send."""
         if not self.room.cfg.web_login:
@@ -7479,6 +7510,10 @@ class KaasHub:
         if self.web_banned(pub):
             return 403, {"error": "this key is banned from this server"}
         name = "".join(c for c in str(body.get("name", "")) if ord(c) >= 0x20)[:32].strip()
+        cap = int(self.room.cfg.web_max_clients or 0)
+        if sum(1 for c in self.conns if c.web and not c.closed) >= cap:
+            log.warning("web login (%s) from %s refused: all %d web sessions are in use", pub[:8], ip, cap)
+            return 503, {"error": "all of this server's web sessions are in use (%d): try again later" % cap, "full": True}
         self.web_seen(pub, name)
         key = self.web_key(pub)
         ticket = self.new_ticket(key) if key else None
@@ -9029,31 +9064,55 @@ class WebUI:
                 finally:
                     slots.release()
 
+            def _tokens(self, name):
+                """A header's comma-separated tokens, lowercased, across every copy of it (a proxy may send two)."""
+                return {t.strip().lower() for v in (self.headers.get_all(name) or []) for t in v.split(",")} - {""}
+
             def _kaas(self):
-                """KaaS: upgrade to a websocket for an API key (Authorization: Bearer ..., or a one-time ?ticket= from
-                POST /api/v1/kaas/ticket for browsers), then stream packets."""
+                """KaaS: upgrade to a websocket for an API key (Authorization: Bearer ...), or for a web login's
+                one-time ?ticket= (browsers can't send Authorization on a websocket), then stream packets."""
                 hub = room.kaas
-                if (self.headers.get("Upgrade") or "").lower() != "websocket" or \
-                        "upgrade" not in (self.headers.get("Connection") or "").lower():
-                    return self._send(426, '{"error":"a websocket endpoint: see docs/api.md"}')
+                ticket = urllib.parse.parse_qs(urllib.parse.urlsplit(self.path).query).get("ticket", [""])[0]
+
+                def refuse(code, error, outcome, why):
+                    log.warning("websocket from %s refused (%d): %s", self.client_address[0], code, why)
+                    if ticket:
+                        hub.ticket_outcome(ticket, outcome)
+                    return self._send(code, json.dumps({"error": error}))
+                if "websocket" not in self._tokens("Upgrade") or "upgrade" not in self._tokens("Connection"):
+                    return refuse(426, "a websocket endpoint: see docs/api.md", "no_upgrade",
+                                  "no websocket upgrade in the request (Upgrade: %r, Connection: %r, %s): a reverse proxy "
+                                  "in front of pyMeshRoom has to pass the Upgrade and Connection headers on" % (
+                                      ", ".join(self.headers.get_all("Upgrade") or []),
+                                      ", ".join(self.headers.get_all("Connection") or []), self.request_version))
                 wkey = self.headers.get("Sec-WebSocket-Key") or ""
                 if not wkey or self.headers.get("Sec-WebSocket-Version") != "13":
-                    return self._send(400, '{"error":"websocket version 13 only"}')
+                    return refuse(400, "websocket version 13 only", "bad_version", "not a version 13 websocket "
+                                  "(Sec-WebSocket-Version: %r)" % self.headers.get("Sec-WebSocket-Version"))
                 if not slots.acquire(blocking=False):
-                    return self._send(503, '{"error":"busy"}')
+                    return refuse(503, "busy", "busy", "too many requests at once")
                 try:
-                    key = self._kaas_key()
-                    if key is None:
-                        ticket = urllib.parse.parse_qs(urllib.parse.urlsplit(self.path).query).get("ticket", [""])[0]
-                        key = hub.redeem(ticket) if ticket else None
+                    key, why = self._kaas_key(), None
+                    if key is None and ticket:
+                        key, why = hub.redeem(ticket)
                     if not hub.valid(key):
+                        if why:
+                            log.warning("websocket from %s refused (401): %s ticket", self.client_address[0], {
+                                "unknown": "an unknown or already used", "expired": "an expired",
+                                "refused": "web logins are off, or the key is banned: a"}[why])
+                            hub.ticket_outcome(ticket, why)
                         time.sleep(1.0)                     # slow down guessing
-                        return self._send(401, '{"error":"missing, unknown, revoked or expired API key"}')
+                        return self._send(401, '{"error":"missing, unknown, revoked or expired API key or ticket"}')
                     conn = KaasConn(hub, self.connection, self.rfile, key, self.client_address[0])
                     if not hub.add(conn):
-                        return self._send(503, json.dumps({"error": "at most %d %s at once" % (
-                            (int(cfg.web_max_clients), "web sessions") if conn.web else (KAAS_MAX_CLIENTS, "API clients"))}))
-                    self.send_response(101, "Switching Protocols")
+                        return refuse(503, "at most %d %s at once" % (
+                            (int(cfg.web_max_clients), "web sessions") if conn.web else (KAAS_MAX_CLIENTS, "API clients")),
+                            "full", "all %d %s are in use" % (
+                                (int(cfg.web_max_clients), "web sessions") if conn.web else (KAAS_MAX_CLIENTS, "API clients")))
+                    if ticket:
+                        hub.ticket_outcome(ticket, "connected")
+                    self.protocol_version = "HTTP/1.1"      # (this upgrade only) an HTTP/1.0 101 isn't valid, and
+                    self.send_response(101, "Switching Protocols")   # a proxy may refuse it or add Connection: close
                     self.send_header("Upgrade", "websocket")
                     self.send_header("Connection", "Upgrade")
                     self.send_header("Sec-WebSocket-Accept", ws_accept(wkey))
@@ -9071,20 +9130,6 @@ class WebUI:
             def _kaas_key(self):
                 auth = self.headers.get("Authorization") or ""
                 return room.kaas.find(auth[7:].strip()) if auth[:7].lower() == "bearer " else None
-
-            def _kaas_ticket(self):
-                """POST /api/v1/kaas/ticket with Authorization: Bearer: a one-time websocket ticket for a browser.
-                No cookies are involved, so any origin may ask (CORS: *); the key is the credential."""
-                cors = {"Access-Control-Allow-Origin": "*"}
-                self._body()                                # (any body is ignored, but read: the connection stays in step)
-                key = self._kaas_key()
-                if not room.kaas.valid(key):
-                    time.sleep(1.0)                         # slow down guessing
-                    return self._send(401, '{"error":"missing, unknown, revoked or expired API key"}', headers=cors)
-                ticket = room.kaas.new_ticket(key)
-                if ticket is None:
-                    return self._send(503, '{"error":"too many tickets waiting: try again shortly"}', headers=cors)
-                return self._send(200, json.dumps({"ticket": ticket, "expires_in": KAAS_TICKET_S}), headers=cors)
 
             def _web_hosts(self):
                 """The host names a web login may be signed for: this request's Host; X-Forwarded-Host from a proxy on
@@ -9163,15 +9208,23 @@ class WebUI:
                         return self._send(503, '{"error":"too many logins at once: try again shortly"}', headers=cors)
                     return self._send(200, json.dumps({"challenge": ch, "expires_in": WEB_CHALLENGE_S,
                                                        "label": WEB_LOGIN_LABEL}), headers=cors)
-                code, answer = room.kaas.web_login(body, self._web_hosts())
+                code, answer = room.kaas.web_login(body, self._web_hosts(), self.client_address[0])
                 if code == 200:
                     log.info("web login %s (%s) from %s: %s", answer["state"], (body or {}).get("pub", "")[:8],
                              self.client_address[0], (body or {}).get("name", ""))
                 return self._send(code, json.dumps(answer), headers=cors)
 
+            def _web_ticket(self):
+                """POST /api/v1/web/ticket {"ticket"}: what became of a web login's websocket, for a browser whose
+                websocket didn't open (it can't see why itself). The ticket is the credential (CORS: *)."""
+                body = self._body()
+                ticket = str((body or {}).get("ticket", "")) if isinstance(body, dict) else ""
+                return self._send(200, json.dumps({"outcome": room.kaas.ticket_status(ticket)}),
+                                  headers={"Access-Control-Allow-Origin": "*"})
+
             def do_OPTIONS(self):
-                """CORS preflight, for the ticket and web login endpoints only."""
-                if self.path.split("?")[0] not in (KAAS_PATH + "/ticket", WEB_PATH + "/challenge", WEB_PATH + "/login"):
+                """CORS preflight, for the web login endpoints only."""
+                if self.path.split("?")[0] not in (WEB_PATH + "/challenge", WEB_PATH + "/login", WEB_PATH + "/ticket"):
                     return self._send(404, '{"error":"not found"}')
                 self._send(204, b"", headers={"Access-Control-Allow-Origin": "*",
                                               "Access-Control-Allow-Methods": "POST",
@@ -9321,8 +9374,8 @@ class WebUI:
                 t, rest = self._tenant_of()
                 if t is not None:
                     return self._tenant(t, "/" + rest, True)
-                if self.path.split("?")[0] == KAAS_PATH + "/ticket":
-                    return self._kaas_ticket()
+                if self.path.split("?")[0] == WEB_PATH + "/ticket":
+                    return self._web_ticket()
                 if self.path.split("?")[0] in (WEB_PATH + "/challenge", WEB_PATH + "/login"):
                     return self._web_public(self.path.split("?")[0])
                 if self.path.split("?")[0] == "/meshcore-web/unlock":

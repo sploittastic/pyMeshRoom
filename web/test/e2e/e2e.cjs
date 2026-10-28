@@ -40,6 +40,33 @@ async function admin(p, body) {
   return r.status;
 }
 
+// A reverse proxy in front of the server that gets websockets wrong: "strip" passes them on without the Upgrade and
+// Connection headers (nginx without proxy_http_version 1.1 and proxy_set_header Upgrade), "drop" hangs up on them.
+function startProxy(mode) {
+  const http = require('http');
+  const target = new URL(SERVER);
+  const forward = (req, headers, res) => {
+    const up = http.request({ host: target.hostname, port: target.port, method: req.method, path: req.url, headers }, (r) => {
+      res.writeHead(r.statusCode, { ...r.headers, 'access-control-allow-origin': r.headers['access-control-allow-origin'] || '' });
+      r.pipe(res);
+    });
+    up.on('error', () => res.destroy());
+    req.pipe(up);
+  };
+  const server = http.createServer((req, res) => forward(req, req.headers, res));
+  server.on('upgrade', (req, socket) => {
+    if (mode === 'drop') return socket.destroy();
+    const { upgrade, connection, ...headers } = req.headers;
+    const up = http.request({ host: target.hostname, port: target.port, method: 'GET', path: req.url, headers }, (r) => {
+      socket.end('HTTP/1.1 ' + r.statusCode + ' X\r\nContent-Length: 0\r\nConnection: close\r\n\r\n');
+      r.resume();
+    });
+    up.on('error', () => socket.destroy());
+    up.end();
+  });
+  return new Promise((resolve) => server.listen(0, '127.0.0.1', () => resolve(server)));
+}
+
 async function newPage(b, opts = {}) {
   const ctx = await b.newContext({ viewport: { width: 1200, height: 760 }, ...opts });
   await ctx.route(/^https:\/\/(media\d?|i)\.giphy\.com\//, (r) => r.fulfill({ status: 200, contentType: 'image/gif', body: TINY_GIF }));
@@ -65,9 +92,8 @@ async function waitOpen(p) {
   }
 }
 
-async function loginWith(p, { url = SERVER, key = null, priv = PRIV, name = 'WebTester' } = {}) {
+async function loginWith(p, { url = SERVER, priv = PRIV, name = 'WebTester' } = {}) {
   if (url !== null) await p.fill('#f-url', url);
-  if (key) { await p.evaluate(() => { document.getElementById('key-box').open = true; }); await p.fill('#f-key', key); }
   await p.fill('#f-priv', priv);
   await p.fill('#f-name', name);
   await p.click('#login-go');
@@ -337,16 +363,33 @@ let b;
   ok(/banned/.test(await banned.textContent('#login-error')), 'banned key can\'t log in: ' + await banned.textContent('#login-error'));
   await admin('/api/v1/web/users/' + PUB + '/unban');
 
-  const apiPage = await newPage(b);
-  await apiPage.goto(pageUrl);
-  await loginWith(apiPage, { key: token, name: 'Bot' });
-  await apiPage.waitForSelector('#conn-dot.open', { timeout: 10000 });
-  ok(await apiPage.isHidden('#banner') && !(await apiPage.isDisabled('#advert')), 'an API key still works, and can send at once');
-  const bad = await newPage(b);
-  await bad.goto(pageUrl);
-  await loginWith(bad, { key: 'kaas_wrong' });
-  await bad.waitForSelector('#login-error:not([hidden])', { timeout: 10000 });
-  ok(/refused the login/.test(await bad.textContent('#login-error')), 'bad API key: ' + await bad.textContent('#login-error'));
+  // a reverse proxy that loses websockets: the login works, and the page says what became of the websocket
+  for (const [mode, want, what] of [['strip', /without its Upgrade header/, 'a proxy dropping the Upgrade header'],
+                                    ['drop', /never reached pyMeshRoom/, 'a proxy that doesn\'t pass websockets on']]) {
+    const proxy = await startProxy(mode);
+    const pp = await newPage(b);
+    await pp.goto(pageUrl);
+    await loginWith(pp, { url: 'http://127.0.0.1:' + proxy.address().port });
+    await pp.waitForSelector('#login-error:not([hidden])', { timeout: 15000 });
+    ok(want.test(await pp.textContent('#login-error')), what + ': ' + await pp.textContent('#login-error'));
+    await pp.context().close();
+    proxy.close();
+  }
+  // all web sessions in use: the login says so, before any websocket
+  const holder = await newPage(b);
+  await holder.goto(pageUrl);
+  await loginWith(holder, { priv: seed(), name: 'Holder' });
+  await holder.waitForSelector('#conn-dot.open', { timeout: 10000 });
+  const users = await (await fetch(SERVER + '/api/v1/web/users', { headers: { Cookie: cookie } })).json();
+  ok(await admin('/api/v1/web/settings', { web_max_clients: users.connected }) === 200, 'admin caps web sessions at ' + users.connected);
+  const full = await newPage(b);
+  await full.goto(pageUrl);
+  await loginWith(full, { priv: seed(), name: 'Late' });
+  await full.waitForSelector('#login-error:not([hidden])', { timeout: 10000 });
+  ok(/web sessions are in use/.test(await full.textContent('#login-error')), 'server full: ' + await full.textContent('#login-error'));
+  await admin('/api/v1/web/settings', { web_max_clients: 32 });
+  await full.context().close();
+  await holder.context().close();
 
   // served by pyMeshRoom itself at /meshcore-web/: the server comes from the page's own address
   const served = await newPage(b);
@@ -400,6 +443,6 @@ let b;
   ok(/ADVERT flood \w+ valid-sig WebTester/.test(tx), 'the radio sent our advert, with a valid signature');
   ok(tx.includes(wantReaction.replace('\n', '\\n')),                      // (readtx prints the line break as \n)
     'the radio sent our reaction, naming the message by its hash: ' + JSON.stringify(wantReaction));
-  for (const pg of [p, banned, apiPage, bad, served, mp]) errors.push(...pg.errors);
+  for (const pg of [p, banned, served, mp]) errors.push(...pg.errors);
   ok(errors.length === 0, 'no page errors' + (errors.length ? ': ' + errors.join(' | ') : ''));
 })().catch(e => { console.log('FAIL', e.message); process.exitCode = 1; }).finally(() => b && b.close());

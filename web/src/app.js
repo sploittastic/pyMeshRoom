@@ -112,10 +112,8 @@ function initLogin() {
   $("f-remember").checked = !!s.remember;
   $("f-pass").value = "";
   $("pass-box").hidden = !s.remember;
-  $("f-key").value = s.remember && !s.vault ? s.apiKey || "" : "";
   $("f-priv").value = s.remember && !s.vault ? s.privateKey || "" : "";
   setUnlockMode(!!(s.remember && s.vault));
-  $("key-box").open = !!$("f-key").value;
   $("f-sitepw").value = s.remember && !s.vault ? s.pagePassword || "" : "";
   $("sitepw-box").hidden = !$("f-sitepw").value;
   updatePubPreview();
@@ -160,7 +158,6 @@ async function login(ev) {
   showError("login-error", "");
   const s = loadSettings();
   const url = $("f-url").value.trim();
-  let apiKey = $("key-box").open ? $("f-key").value.trim() : "";
   let pagePassword = $("f-sitepw").value;
   let priv = $("f-priv").value.trim();
   const name = $("f-name").value.trim();
@@ -173,13 +170,12 @@ async function login(ev) {
     go.disabled = false;
     go.textContent = "Connect";
     if (!opened) return showError("login-error", "That passphrase doesn't unlock the saved key.");
-    ({ privateKey: priv, apiKey = "", pagePassword = pagePassword } = JSON.parse(utf8Decode(opened)));
+    ({ privateKey: priv, pagePassword = pagePassword } = JSON.parse(utf8Decode(opened)));
   }
   let identity;
   try {
     const ep = kaasEndpoints(url);
     if (location.protocol === "https:" && !ep.secure) throw new Error("This page is on HTTPS, so the server must be too (https://).");
-    if (apiKey && !apiKey.startsWith("kaas_")) throw new Error("An API key starts with kaas_.");
     identity = new Identity(priv);
     if (!name) throw new Error("Enter your name.");
     if (utf8Encode(name).length > MAX_NAME_LEN) throw new Error("Your name is at most " + MAX_NAME_LEN + " bytes.");
@@ -194,12 +190,12 @@ async function login(ev) {
   else if ($("f-pass").value) {
     go.textContent = "Saving…";
     await new Promise((r) => setTimeout(r, 20));
-    saveSettings({ ...prefs, vault: seal(utf8Encode(JSON.stringify({ privateKey: identity.privateHex, apiKey, pagePassword })), $("f-pass").value) });
-  } else saveSettings({ ...prefs, apiKey: apiKey || undefined, pagePassword: pagePassword || undefined, privateKey: identity.privateHex });
+    saveSettings({ ...prefs, vault: seal(utf8Encode(JSON.stringify({ privateKey: identity.privateHex, pagePassword })), $("f-pass").value) });
+  } else saveSettings({ ...prefs, pagePassword: pagePassword || undefined, privateKey: identity.privateHex });
 
   go.disabled = true;
   go.textContent = "Connecting…";
-  const client = new KaasClient(url, apiKey ? { apiKey } : { identity, name, pagePassword });
+  const client = new KaasClient(url, { identity, name, pagePassword });
   try {
     await client.start();
   } catch (e) {
@@ -218,7 +214,6 @@ async function login(ev) {
   go.disabled = false;
   go.textContent = "Connect";
   $("f-priv").value = remember && !loadSettings().vault ? $("f-priv").value : "";
-  $("f-key").value = remember && !loadSettings().vault ? $("f-key").value : "";
   $("f-sitepw").value = remember && !loadSettings().vault ? $("f-sitepw").value : "";
   $("f-pass").value = $("f-unlock").value = "";
   startChat(identity, name, client);
@@ -516,13 +511,11 @@ function onState({ state, reason }) {
   const banner = $("banner");
   const key = app.client?.hello?.key || {};
   let text = "", bad = false;
-  if (state === "failed") { text = "Disconnected: " + reason + ". Log out and in again with a working key."; bad = true; }
+  if (state === "failed") { text = "Disconnected: " + reason + ". Log out and in again."; bad = true; }
   else if (state === "closed") text = "Disconnected: " + (reason || "connection lost") + ".";
   else if (state === "connecting") text = "Connecting…";
-  else if (key.receive === false) text = "This API key can't receive, so you won't see messages. Ask for a key with Receive.";
   else if (key.web && !key.send) text = "You can read, but not send yet: this radio hasn't heard your key. Send an advert " +
     "from your MeshCore app within range of the radio, or ask the server's admin to allow your key. This updates by itself.";
-  else if (key.send === false) text = "This API key can't send. You can read, but not post or advertise.";
   banner.textContent = text;
   banner.className = "banner" + (bad ? " bad" : "");
   banner.hidden = !text;

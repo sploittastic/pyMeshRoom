@@ -461,10 +461,8 @@ card lists every key with its last use, live connections, and packets received, 
 total), and **Revoke** disconnects a key's clients at once.
 
 * Protocol: [docs/api.md](docs/api.md), and [docs/asyncapi.yaml](docs/asyncapi.yaml) for tools.
-* Browsers trade the key for a one-time websocket ticket at `/api/v1/kaas/ticket`, since they can't send the
-  `Authorization` header on a websocket.
 * **MeshCore Web logins** (off by default; **Web users** card): people log in by signing with their node's private key,
-  which never leaves their browser, instead of with an API key. Anyone can read. A key can send once this radio has
+  which never leaves their browser. (API keys are for bots; browsers log in this way only.) Anyone can read. A key can send once this radio has
   heard it advertise, or once the admin allows it, and only as itself. The card lists each user's name, key, access,
   last activity and packet counts, with Allow send, Kick and Ban by key. See [docs/api.md](docs/api.md).
 

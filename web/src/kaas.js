@@ -1,5 +1,5 @@
-// The KaaS connection: log in for a one-time ticket over HTTPS (by signing with the node's private key, or with an API
-// key), open the websocket with it, stream packets in, and send raw packets out within the server's per-key rate
+// The KaaS connection: log in for a one-time ticket over HTTPS by signing with the node's private key, open the
+// websocket with it, stream packets in, and send raw packets out within the server's per-key rate
 // limit. Reconnects by itself, logging in again each time.
 import { bytesToHex, hexToBytes, utf8Encode } from "./bytes.js";
 
@@ -13,7 +13,7 @@ export class AuthError extends Error {}
 // The server's MeshCore Web has a page password, and this login didn't give it (or gave a wrong one).
 export class PagePasswordNeeded extends AuthError {}
 
-// "https://host[/prefix]" (or with /api/v1/kaas on the end, or ws(s)://) -> {ticket: https URL, ws: wss URL}
+// "https://host[/prefix]" (or with /api/v1/kaas on the end, or ws(s)://) -> {challenge, login, ticket: https URLs, ws}
 export function kaasEndpoints(input) {
   let s = String(input || "").trim();
   if (!s) throw new Error("Enter the pyMeshRoom URL.");
@@ -22,13 +22,13 @@ export function kaasEndpoints(input) {
   const secure = { https: true, wss: true, http: false, ws: false }[u.protocol.slice(0, -1)];
   if (secure === undefined) throw new Error("The URL must start with https://.");
   let base = u.pathname.replace(/\/+$/, "");
-  for (const tail of [KAAS_PATH + "/ticket", KAAS_PATH]) if (base.endsWith(tail)) base = base.slice(0, -tail.length);
+  if (base.endsWith(KAAS_PATH)) base = base.slice(0, -KAAS_PATH.length);
   const host = u.host + base;
   const http = (secure ? "https://" : "http://") + host;
   return {
-    ticket: http + KAAS_PATH + "/ticket",
     challenge: http + WEB_PATH + "/challenge",
     login: http + WEB_PATH + "/login",
+    ticket: http + WEB_PATH + "/ticket",
     ws: (secure ? "wss://" : "ws://") + host + KAAS_PATH,
     host: u.host,
     secure,
@@ -40,9 +40,23 @@ export function webLoginMessage(host, challenge, pubHex) {
   return utf8Encode([WEB_LOGIN_LABEL, host, challenge, pubHex].join("\n"));
 }
 
+// Why a websocket didn't open, from what the server says became of its ticket (POST /api/v1/web/ticket).
+const TICKET_OUTCOMES = {
+  waiting: "the login worked, but the websocket never reached pyMeshRoom. If a reverse proxy is in front of it, the " +
+    "proxy has to pass websockets on (nginx: proxy_http_version 1.1, and set the Upgrade and Connection headers); " +
+    "otherwise a browser extension or firewall may be blocking websockets",
+  unused: null,                                         // (the same as waiting)
+  no_upgrade: "the websocket reached pyMeshRoom without its Upgrade header: a reverse proxy in front of it is " +
+    "dropping it (nginx: proxy_http_version 1.1, and set the Upgrade and Connection headers)",
+  bad_version: "the websocket reached pyMeshRoom in a version it doesn't speak (a proxy may be changing it)",
+  busy: "the server was too busy",
+  full: "all of this server's web sessions are in use",
+  expired: "the login expired before the websocket opened",
+  refused: "the server refused the session (web logins were turned off, or this key was banned)",
+};
+TICKET_OUTCOMES.unused = TICKET_OUTCOMES.waiting;
+
 const CLOSE_REASONS = {
-  4001: "the API key was revoked",
-  4002: "the API key expired",
   4003: "this key is banned from this server",
   4004: "web logins were turned off on this server",
   4005: "the admin disconnected this session",
@@ -52,14 +66,13 @@ const CLOSE_REASONS = {
 // Events: "state" {state: "connecting" | "open" | "closed" | "failed", reason}, "hello" (the hello message),
 // "packet" ({dir, raw: Uint8Array, snr, rssi, ts, hash}), "dropped" (count), "send" ({id, status, reason}),
 // "access" ({send, state}): a web login may now send, or may not anymore.
-// auth: {identity, name} to log in by signing (MeshCore Web), or {apiKey}.
+// auth: {identity, name, pagePassword?}: logs in by signing with the identity's private key.
 export class KaasClient extends EventTarget {
   constructor(url, auth) {
     super();
     this.endpoints = kaasEndpoints(url);
     this.identity = auth.identity || null;
     this.name = auth.name || "";
-    this.apiKey = String(auth.apiKey || "").trim();
     this.pagePassword = auth.pagePassword || "";        // (a page served by the server itself has its cookie instead)
     this.ws = null;
     this.hello = null;
@@ -118,11 +131,6 @@ export class KaasClient extends EventTarget {
   }
 
   async getTicket() {
-    if (!this.identity) {
-      const r = await this.post(this.endpoints.ticket, { Authorization: "Bearer " + this.apiKey });
-      if (!r.ticket) throw new Error("The server sent no ticket.");
-      return r.ticket;
-    }
     const page = this.pagePassword ? { page_password: this.pagePassword } : {};
     const { challenge } = await this.post(this.endpoints.challenge, {}, page);
     if (!/^wc_[\w-]{8,100}$/.test(String(challenge))) throw new Error("The server sent a malformed challenge.");
@@ -166,10 +174,16 @@ export class KaasClient extends EventTarget {
           if (this.ws !== ws) return;
           this.ws = null;
           this.failAll("connection closed");
-          const reason = CLOSE_REASONS[e.code] || e.reason || (opened ? "connection lost" : "the websocket didn't open");
-          if (!opened) reject(new Error(reason));
-          if (e.code >= 4001 && e.code <= 4005) return this.fail(reason);
-          this.retry(reason);
+          const reason = CLOSE_REASONS[e.code] || e.reason || (opened ? "connection lost" : "");
+          if (reason) {
+            if (!opened) reject(new Error(reason));
+            if (e.code >= 4001 && e.code <= 4005) return this.fail(reason);
+            return this.retry(reason);
+          }
+          this.whyNotOpen(ticket).then((why) => {        // (a browser isn't told why a websocket didn't open: ask)
+            reject(new Error(why));
+            this.retry(why);
+          });
         };
       }).catch((e) => {
         if (e instanceof AuthError) {
@@ -181,6 +195,14 @@ export class KaasClient extends EventTarget {
         this.retry(e.message);
       });
     });
+  }
+
+  async whyNotOpen(ticket) {
+    try {
+      const { outcome } = await this.post(this.endpoints.ticket, {}, { ticket });
+      if (TICKET_OUTCOMES[outcome]) return "The websocket didn't open: " + TICKET_OUTCOMES[outcome];
+    } catch {}
+    return "The websocket didn't open";
   }
 
   fail(reason) {

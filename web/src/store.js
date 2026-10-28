@@ -20,7 +20,7 @@ function write(key, value) {
   }
 }
 
-// {url, name, remember, apiKey?, privateKey?}: the keys only when "remember" was ticked
+// {url, name, remember, privateKey?, pagePassword?}: the keys only when "remember" was ticked
 export const loadSettings = () => read("settings", {});
 export const saveSettings = (s) => write("settings", s);
 

@@ -254,55 +254,19 @@ class EndToEndTests(WebTestCase):
             kc.KaasClient(self.url, "kaas_wrong").connect()
         self.assertEqual(e.exception.status, "401")
 
-    def ticket(self, token=None, method="POST"):
-        req = urllib.request.Request(self.base + "/api/v1/kaas/ticket", method=method, data=b"" if method == "POST" else None,
-                                     headers={"Authorization": "Bearer " + token} if token else {})
-        try:
-            with urllib.request.urlopen(req, timeout=10) as r:
-                return r.status, dict(r.headers), json.loads(r.read() or b"{}")
-        except urllib.error.HTTPError as e:
-            return e.code, dict(e.headers), json.loads(e.read() or b"{}")
-
-    def test_browser_ticket(self):
-        """Browsers can't send Authorization on a websocket: they trade the key for a one-time ticket over HTTPS."""
-        code, hdrs, _ = self.ticket(method="OPTIONS")
-        self.assertEqual(code, 204)
-        self.assertEqual(hdrs["Access-Control-Allow-Origin"], "*")
-        self.assertIn("Authorization", hdrs["Access-Control-Allow-Headers"])
-        code, hdrs, _ = self.ticket("kaas_wrong")
-        self.assertEqual((code, hdrs["Access-Control-Allow-Origin"]), (401, "*"))
-        self.http("POST", "/api/login", {"password": "adminpw"})
-        token = self.make_key(receive=True, send=False)
-        code, hdrs, d = self.ticket(token)
-        self.assertEqual((code, hdrs["Access-Control-Allow-Origin"], d["expires_in"]), (200, "*", mr.KAAS_TICKET_S))
-        url = self.url + "?ticket=" + d["ticket"]
-        c = kc.KaasClient(url, "")
-        c.ws = kc.ws.WebSocket.connect(url, {}, 10)            # (no Authorization at all, as from a browser)
-        hello = json.loads(c.ws.recv()[1])
-        self.assertEqual((hello["type"], hello["key"]["id"]), ("hello", self.h.room.kaas.find(token)["id"]))
-        c.ws.close()
-        with self.assertRaises(kc.HandshakeError) as e:            # once only
-            kc.ws.WebSocket.connect(url, {}, 10)
-        self.assertEqual(e.exception.status, "401")
-        with self.assertRaises(kc.HandshakeError):
-            kc.ws.WebSocket.connect(self.url + "?ticket=kt_made_up", {}, 10)
-        hello = self.h.run_client(kc.KaasClient(self.url, token).connect)   # Authorization: Bearer still works
-        self.assertEqual(hello["type"], "hello")
-
-    def test_ticket_expires_and_follows_its_key(self):
+    def test_api_keys_get_no_browser_ticket(self):
+        """Browsers log in by signing (test_web_login): an API key is for bots, with Authorization: Bearer."""
         self.http("POST", "/api/login", {"password": "adminpw"})
         token = self.make_key()
-        hub = self.h.room.kaas
-        key = hub.find(token)
-        t = hub.new_ticket(key)
-        hub.tickets[t] = (key["id"], time.monotonic() - 1)       # expired
-        self.assertIsNone(hub.redeem(t))
-        t = hub.new_ticket(key)
-        self.assertEqual(self.http("POST", "/api/v1/kaas/keys/%s/revoke" % key["id"], {})[0], 200)
-        self.assertTrue(self.h.pump(lambda: hub.key_by_id(key["id"]) is None, 10))
-        self.assertIsNone(hub.redeem(t))                          # its key was revoked
-        hub.tickets = {("kt_%d" % i): (key["id"], time.monotonic() + 30) for i in range(mr.KAAS_MAX_TICKETS)}
-        self.assertIsNone(hub.new_ticket(key))                    # too many waiting
+        req = urllib.request.Request(self.base + "/api/v1/kaas/ticket", method="POST", data=b"",
+                                     headers={"Authorization": "Bearer " + token})
+        with self.assertRaises(urllib.error.HTTPError) as e:
+            urllib.request.urlopen(req, timeout=10)
+        self.assertIn(e.exception.code, (401, 404))                   # (no such endpoint: the dashboard's login)
+        with self.assertRaises(kc.HandshakeError):
+            kc.ws.WebSocket.connect(self.url + "?ticket=kt_made_up", {}, 10)
+        hello = self.h.run_client(kc.KaasClient(self.url, token).connect)
+        self.assertEqual(hello["type"], "hello")
 
     def test_stream_then_revoke(self):
         self.http("POST", "/api/login", {"password": "adminpw"})
