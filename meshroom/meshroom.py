@@ -8220,7 +8220,7 @@ td.rcell .dir{flex:none}.mono4{font-family:ui-monospace,monospace}
 .rprow input,.rprow select{width:auto;flex:none;padding:4px 6px;background:#0d1014;border:1px solid var(--line);border-radius:4px;color:var(--fg)}.sw{cursor:pointer}
 .mqrow input[type=checkbox]{transform:scale(1.2);margin-right:6px}.mqrow input[type=text],.mqrow input[type=password],.mqrow input[type=number],.mqrow select{width:auto;min-width:110px;padding:4px 6px;background:#0d1014;border:1px solid var(--line);border-radius:4px;color:var(--fg)}.mqnote{margin-top:10px;padding:8px 10px;border-left:3px solid var(--acc);background:#151a20;color:var(--dim);font-size:12px}
 .advrow{display:flex;gap:26px;align-items:center;flex-wrap:wrap}.adv{display:flex;gap:10px;align-items:center}
-.hdesc{color:var(--dim);font-weight:400;text-transform:none;letter-spacing:0;font-size:12px;margin-left:8px}.hdesc a{color:var(--acc)}.wbkey{font-family:ui-monospace,monospace}
+.hdesc{color:var(--dim);font-weight:400;text-transform:none;letter-spacing:0;font-size:12px;margin-left:8px}.hdesc a{color:var(--acc)}.wbkey{font-family:ui-monospace,monospace}.wbacts{display:flex;flex-wrap:wrap;gap:4px;min-width:150px}.wbacts button{white-space:nowrap}.wbacts .wbwarn{color:var(--bad)}
 #members tr.mrow{cursor:pointer}#members tr.mrow:hover td{background:#1e252d}#members tr.mrow.exp td{background:#1b2229}
 .hexr{font-family:ui-monospace,monospace;white-space:nowrap}.caret{color:var(--dim);font-size:11px;margin-right:4px}
 .mbox.wide{width:520px}.ac{position:relative}.aclist{background:#0d1014;border:1px solid var(--line);border-top:none;
@@ -8461,10 +8461,13 @@ async function loadWeb(){if(!MAINADM)return;let d;try{const r=await fetch("api/v
   `<td>${access(u)}</td><td>${ago(u.last)} ago</td><td>${u.connected?'<span class="mqdot on"></span> '+u.connected:'<span class="dim">no</span>'}</td>`+
   ["rx","tx","err"].map(f=>{const v=(u.stats||{})[f]||[0,0];return `<td class="${f==="err"&&v[0]?"poor":""}">${v[0].toLocaleString()} <span class="dim">/ ${v[1].toLocaleString()}</span></td>`}).join("")+
   `<td>${u.connected?'<span class="dim">-</span>':(u.missed||0).toLocaleString()}</td>`+
-  `<td><select data-pub="${esc(u.pub)}" data-name="${esc(u.name)}" onchange="wbAct(this)"><option value="">Actions&hellip;</option>`+
-  `${u.send||u.banned?"":'<option value="allow">Allow send</option>'}${u.approved&&!u.banned?'<option value="unallow">Unallow send</option>':""}`+
-  `${u.connected?'<option value="kick">Kick (disconnect)</option>':""}${u.banned?"":'<option value="ban">Ban</option>'}`+
-  `${u.missed?'<option value="purge">Purge backlog (count as caught up)</option>':""}<option value="delete">Delete (forget, not a ban)</option></select></td></tr>`).join("")}
+  `<td><div class="wbacts">${[[!u.send&&!u.banned,"allow","Allow send","let this key send before the radio hears it"],
+   [u.approved&&!u.banned,"unallow","Unallow","take back Allow send: it sends again once the radio hears it"],
+   [u.connected,"kick","Kick","disconnect now; they can log in again"],
+   [u.missed,"purge","Purge","count them as caught up to now: they won't get what they missed"],
+   [!u.banned,"ban","Ban","disconnect, and refuse this key from now on"],
+   [true,"delete","Delete","disconnect and forget them (not a ban: they can log in again as a new user)"]].filter(x=>x[0]).map(([,a,l,tip])=>
+   `<button data-pub="${esc(u.pub)}" data-name="${esc(u.name)}" data-act="${a}" title="${tip}"${a==="ban"||a==="delete"?' class="wbwarn"':""} onclick="wbAct(this)">${l}</button>`).join("")}</div></td></tr>`).join("")}
  const b=$("wbbanned");b.innerHTML=d.banned.length?"<tr><th>Banned</th><th>Public key</th><th>Since</th><th></th></tr>"+d.banned.map(x=>
   `<tr><td>${esc(x.name)||'<span class="dim">(no name)</span>'}</td><td class="mono">${esc(x.pub)}</td><td>${ago(x.ts)} ago</td>`+
   `<td><button data-pub="${esc(x.pub)}" data-act="unban" onclick="wbAct(this)">Unban</button></td></tr>`).join(""):""}
@@ -8477,7 +8480,7 @@ async function wbPagePw(btn,remove){const pw=remove?"":$("wb_pw").value;
  if(remove&&!confirm("Remove the MeshCore Web page password? Anyone who can reach this server can then open the page."))return;
  btn.disabled=true;await wbSettings({page_password:pw});btn.disabled=false;$("wb_pw").value=""}
 async function wbSettings(o){const m=await tnPost("api/v1/web/settings",o);$("wbmsg").className="poor small";$("wbmsg").textContent=m?" "+m:"";setTimeout(loadWeb,500)}
-async function wbAct(btn){const a=btn.dataset.act||btn.value,p=btn.dataset.pub;if(!a)return;if(btn.tagName==="SELECT")btn.value="";
+async function wbAct(btn){const a=btn.dataset.act,p=btn.dataset.pub;if(!a)return;
  if(a==="ban"&&!confirm("Ban "+(btn.dataset.name||p.slice(0,8))+"? They are disconnected now and can't log in with this key again."))return;
  if(a==="kick"&&!confirm("Disconnect "+p.slice(0,8)+"? They can log in again."))return;
  if(a==="delete"&&!confirm("Delete "+(btn.dataset.name||p.slice(0,8))+"? They are disconnected and forgotten, and lose \"allow send\". It isn't a ban: they can log in again as a new user."))return;
