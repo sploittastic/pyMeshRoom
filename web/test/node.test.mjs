@@ -114,3 +114,25 @@ test("the server's directory fills in contacts", () => {
   again.loadContacts(saved);
   assert.equal(again.contacts.get("ab".repeat(32)).name, "Seaside");
 });
+
+test("room passwords are saved sealed with our private key; old plaintext ones still load", () => {
+  const me = new Identity(P.a_private);
+  const alice = new MeshNode({ hello: {} }, me, "Alice");
+  const room = alice.contact(P.b_public, { type: "room", name: "Pi Room" });
+  room.room = { syncSince: 1760000000, password: "s3cret-pass", loggedIn: true };
+  const saved = alice.saveContacts();
+  const text = JSON.stringify(saved);
+  assert.equal(text.includes("s3cret-pass"), false);
+  assert.equal(text.includes('"password"'), false);
+  const again = new MeshNode({ hello: {} }, me, "Alice");
+  again.loadContacts(saved);
+  assert.equal(again.contacts.get(P.b_public).room.password, "s3cret-pass");
+  assert.equal(again.contacts.get(P.b_public).room.syncSince, 1760000000);
+  const someoneElse = new MeshNode({ hello: {} }, Identity.generate(), "Mallory");
+  someoneElse.loadContacts(saved);
+  assert.equal(someoneElse.contacts.get(P.b_public).room.password, "");     // another key can't open it
+  const legacy = new MeshNode({ hello: {} }, me, "Alice");
+  legacy.loadContacts([{ pub: P.b_public, type: "room", room: { syncSince: 5, password: "old-plain" } }]);
+  assert.equal(legacy.contacts.get(P.b_public).room.password, "old-plain");
+  assert.equal(JSON.stringify(legacy.saveContacts()).includes("old-plain"), false);   // and sealed from then on
+});

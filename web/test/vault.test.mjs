@@ -16,3 +16,14 @@ test("a sealed key opens only with its passphrase", () => {
   assert.equal(unseal(box, "wrong"), null);
   assert.equal(unseal({ ...box, data: "00" + box.data.slice(2) }, "correct horse"), null);
 });
+
+test("a sealer from the private key: only that key opens what it sealed", async () => {
+  const { keySealer } = await import("../src/vault.js");
+  const key = new Uint8Array(64).map((_, i) => i * 3);
+  const box = keySealer(key).seal("room password");
+  assert.equal(JSON.stringify(box).includes("room password"), false);
+  assert.equal(keySealer(key).open(box), "room password");
+  assert.equal(keySealer(key.map((b) => b ^ 1)).open(box), null);
+  assert.equal(keySealer(key).open({ ...box, mac: "00".repeat(32) }), null);
+  assert.equal(keySealer(key).open({}), null);
+});

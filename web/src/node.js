@@ -3,6 +3,7 @@
 // pyMeshRoom); all the crypto happens here, so the server only ever sees encrypted packets.
 import { bytesToHex, concatBytes, equalBytes, hexToBytes, randomBytes, u32le, utf8Cut, utf8Decode, utf8Encode } from "./bytes.js";
 import { sha256 } from "./hash.js";
+import { keySealer } from "./vault.js";
 import {
   ADV_TYPE_CHAT, ADV_TYPE_REPEATER, ADV_TYPE_ROOM, ADV_TYPE_SENSOR, MAX_TEXT_LEN, PT_ACK, PT_ADVERT, PT_ANON_REQ,
   PT_MULTIPART, PT_PATH, PT_RESPONSE, PT_TXT_MSG, TXT_TYPE_PLAIN, TXT_TYPE_SIGNED_PLAIN, directPacket, encryptThenMac,
@@ -29,6 +30,7 @@ export class MeshNode extends EventTarget {
     this.expected = new Map();                // ACK (hex) -> resolve
     this.logins = new Map();                  // room pubHex -> {resolve}
     this.recent = new Set();                  // DMs and posts already delivered (a resend after a lost ACK: once only)
+    this.sealer = keySealer(identity.privateKey);   // room passwords are saved sealed with our private key
   }
 
   emit(type, detail) {
@@ -70,7 +72,7 @@ export class MeshNode extends EventTarget {
     return [...this.contacts.values()].map((c) => ({
       pub: c.pubHex, name: c.name, type: c.type, lat: c.lat, lon: c.lon, lastHeard: c.lastHeard, lastAdvert: c.lastAdvert,
       outPath: c.outLen == null ? null : bytesToHex(c.outPath), outLen: c.outLen,
-      room: c.room ? { syncSince: c.room.syncSince, password: c.room.password || "" } : null,
+      room: c.room ? { syncSince: c.room.syncSince, sealedPassword: this.sealer.seal(c.room.password || "") } : null,
     }));
   }
 
@@ -79,7 +81,11 @@ export class MeshNode extends EventTarget {
       try {
         const c = this.contact(s.pub, { name: s.name, type: s.type, lat: s.lat, lon: s.lon, lastHeard: s.lastHeard, lastAdvert: s.lastAdvert });
         if (s.outLen != null && pathValid(s.outLen)) [c.outPath, c.outLen] = [hexToBytes(s.outPath || ""), s.outLen];
-        if (s.room) c.room = { syncSince: s.room.syncSince || 0, password: s.room.password || "", loggedIn: false };
+        if (s.room) {
+          // (a password saved in the clear by an older version is read too, and sealed when next saved)
+          const password = s.room.sealedPassword ? this.sealer.open(s.room.sealedPassword) : s.room.password;
+          c.room = { syncSince: s.room.syncSince || 0, password: password || "", loggedIn: false };
+        }
       } catch {
         // a damaged entry: skip it
       }

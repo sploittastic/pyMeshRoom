@@ -78,7 +78,8 @@ What you get:
 * **Advertise me** sends a signed advert, flood or zero-hop, so other people's apps learn your name and key.
 * **Details** shows a private channel's secret, or a contact's or room's public key, to share or check. Channels,
   DMs, rooms (with their passwords and where their posts left off), contacts with their routes, and the last 300
-  messages per conversation are kept in this browser, per identity, as is the conversation you had open.
+  messages per conversation are kept in this browser, per identity, as is the conversation you had open. Room
+  passwords are saved encrypted with a key derived from your private key, so they can't be read without it.
 * Rooms you've joined log you in again by themselves each time you connect.
 * It reconnects by itself, logging in again each time. It stops if the admin disconnects or bans the key, turns
   web logins off, or revokes an API key.
@@ -98,6 +99,10 @@ The radio keeps no backlog: you see messages heard while you're connected.
   OpenStreetMap tile servers and Leaflet's own.
   Message text is always added as text, never as HTML.
 * An API key is a credential: anyone who has it can use the radio within the key's permissions. Use HTTPS.
+* Saved room passwords are sealed (AES-128-CTR and HMAC-SHA256) with a key derived one-way from your private key,
+  under a label of its own: `HMAC-SHA256(private key, "meshcore-web local storage v1")`. That protects them while
+  your key isn't saved, or is saved under a passphrase. A key saved without a passphrase sits in the same storage and
+  could open them.
 
 ## Development
 

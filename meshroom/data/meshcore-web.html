@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'sha256-2xEaDuCYqbDxxLIeRsrSeq9W0IBcdOF9v2Q34mCcS0U=' 'self' https://unpkg.com/leaflet@1.9.4/dist/leaflet.js; style-src 'sha256-u2xfhdUKUKTY+Y30FjvCbYloc7aaSFWX9BQkZ1wgESg=' 'self' https://unpkg.com/leaflet@1.9.4/dist/leaflet.css; img-src 'self' data: https://media.giphy.com https://i.giphy.com https://*.tile.openstreetmap.org https://unpkg.com/leaflet@1.9.4/dist/images/; connect-src https: wss: http: ws:; base-uri 'none'; form-action 'none'">
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'sha256-ADHl61abDXPZWqVwVHioe5EiLw+Os9yd1iBGvFUCEMU=' 'self' https://unpkg.com/leaflet@1.9.4/dist/leaflet.js; style-src 'sha256-u2xfhdUKUKTY+Y30FjvCbYloc7aaSFWX9BQkZ1wgESg=' 'self' https://unpkg.com/leaflet@1.9.4/dist/leaflet.css; img-src 'self' data: https://media.giphy.com https://i.giphy.com https://*.tile.openstreetmap.org https://unpkg.com/leaflet@1.9.4/dist/images/; connect-src https: wss: http: ws:; base-uri 'none'; form-action 'none'">
 <meta name="referrer" content="no-referrer">
 <title>MeshCore Web</title>
 <style>:root {
@@ -1330,6 +1330,97 @@ function readChannelMessage(channels, payload) {
 return { ROUTE_TRANSPORT_FLOOD, ROUTE_FLOOD, ROUTE_DIRECT, ROUTE_TRANSPORT_DIRECT, PT_REQ, PT_RESPONSE, PT_TXT_MSG, PT_ACK, PT_ADVERT, PT_GRP_TXT, PT_ANON_REQ, PT_PATH, PT_TRACE, PT_MULTIPART, ADV_TYPE_CHAT, ADV_TYPE_REPEATER, ADV_TYPE_ROOM, ADV_TYPE_SENSOR, TXT_TYPE_PLAIN, TXT_TYPE_SIGNED_PLAIN, MAX_TEXT_LEN, MAX_NAME_LEN, PUBLIC_CHANNEL_KEY, pathBytes, pathValid, parsePacket, floodPacket, zeroHopPacket, directPacket, packetHash, Identity, readAdvert, advertPayload, hashtagChannelKey, channelHash, encryptThenMac, macThenDecrypt, makeChannel, textBudget, channelMessagePacket, readChannelMessage };
 })();
 
+// src/vault.js
+const __src_vault_js = (() => {
+// Sealing what this browser saves. The private key, with a passphrase: PBKDF2-HMAC-SHA256 makes the keys. Room
+// passwords, with the private key itself: only someone holding it can read them. Either way AES-128-CTR hides the data
+// and HMAC-SHA256 checks it. Plain JS, like the rest: WebCrypto exists only on secure origins.
+const { aesEncryptBlock, aesExpandKey } = __src_aes_js;
+const { bytesToHex, concatBytes, equalBytes, hexToBytes, randomBytes, u32le, utf8Decode, utf8Encode } = __src_bytes_js;
+const { hmacSha256 } = __src_hash_js;
+const ROUNDS = 50000;                     // about a second in a browser: slow for guessing, fine for logging in
+
+function pbkdf2(password, salt, rounds, length = 32) {
+  const out = new Uint8Array(length);
+  for (let block = 1, done = 0; done < length; block++) {
+    let u = hmacSha256(password, concatBytes(salt, new Uint8Array([block >>> 24, block >>> 16, block >>> 8, block])));
+    const t = Uint8Array.from(u);
+    for (let i = 1; i < rounds; i++) {
+      u = hmacSha256(password, u);
+      for (let j = 0; j < t.length; j++) t[j] ^= u[j];
+    }
+    out.set(t.subarray(0, length - done), done);
+    done += t.length;
+  }
+  return out;
+}
+
+function ctr(key16, iv, data) {
+  const w = aesExpandKey(key16);
+  const out = new Uint8Array(data.length);
+  for (let i = 0; i < data.length; i += 16) {
+    const ks = aesEncryptBlock(w, concatBytes(iv.subarray(0, 12), u32le(i / 16)));
+    for (let j = 0; j < 16 && i + j < data.length; j++) out[i + j] = data[i + j] ^ ks[j];
+  }
+  return out;
+}
+
+function keys(passphrase, salt, rounds) {
+  const k = pbkdf2(utf8Encode(passphrase), salt, rounds, 48);
+  return { enc: k.subarray(0, 16), mac: k.subarray(16, 48) };
+}
+
+function sealWith(k, secret, salt) {
+  const iv = randomBytes(12);
+  const data = ctr(k.enc, iv, secret);
+  const mac = hmacSha256(k.mac, concatBytes(salt, iv, data));
+  return { iv: bytesToHex(iv), data: bytesToHex(data), mac: bytesToHex(mac) };
+}
+
+function unsealWith(k, box, salt) {
+  const iv = hexToBytes(box.iv), data = hexToBytes(box.data);
+  if (!equalBytes(hmacSha256(k.mac, concatBytes(salt, iv, data)), hexToBytes(box.mac))) return null;
+  return ctr(k.enc, iv, data);
+}
+
+// -> {v: 1, rounds, salt, iv, data, mac} (hex), for localStorage
+function seal(secret, passphrase) {
+  const salt = randomBytes(16);
+  return { v: 1, rounds: ROUNDS, salt: bytesToHex(salt), ...sealWith(keys(passphrase, salt, ROUNDS), secret, salt) };
+}
+
+// The secret, or null for a wrong passphrase (or a damaged record).
+function unseal(box, passphrase) {
+  try {
+    const salt = hexToBytes(box.salt);
+    return unsealWith(keys(passphrase, salt, Math.min(Math.max(box.rounds | 0, 1000), 1000000)), box, salt);
+  } catch {
+    return null;
+  }
+}
+
+// What this browser saves for an identity, sealed with a key that comes from its private key (one-way, and under a
+// label of its own, so it is never usable as the node's key). A sealer: {seal(text) -> box, open(box) -> text | null}.
+function keySealer(privateKey) {
+  const root = hmacSha256(privateKey, utf8Encode("meshcore-web local storage v1"));
+  const k = { enc: hmacSha256(root, utf8Encode("enc")).subarray(0, 16), mac: hmacSha256(root, utf8Encode("mac")) };
+  const none = new Uint8Array(0);
+  return {
+    seal: (text) => ({ v: 1, ...sealWith(k, utf8Encode(text), none) }),
+    open: (box) => {
+      try {
+        const b = unsealWith(k, box, none);
+        return b && utf8Decode(b);
+      } catch {
+        return null;
+      }
+    },
+  };
+}
+
+return { pbkdf2, seal, unseal, keySealer };
+})();
+
 // src/node.js
 const __src_node_js = (() => {
 // A MeshCore chat node in the browser: contacts (from adverts and the server's directory), DMs with their ACKs and
@@ -1337,6 +1428,7 @@ const __src_node_js = (() => {
 // pyMeshRoom); all the crypto happens here, so the server only ever sees encrypted packets.
 const { bytesToHex, concatBytes, equalBytes, hexToBytes, randomBytes, u32le, utf8Cut, utf8Decode, utf8Encode } = __src_bytes_js;
 const { sha256 } = __src_hash_js;
+const { keySealer } = __src_vault_js;
 const { ADV_TYPE_CHAT, ADV_TYPE_REPEATER, ADV_TYPE_ROOM, ADV_TYPE_SENSOR, MAX_TEXT_LEN, PT_ACK, PT_ADVERT, PT_ANON_REQ, PT_MULTIPART, PT_PATH, PT_RESPONSE, PT_TXT_MSG, TXT_TYPE_PLAIN, TXT_TYPE_SIGNED_PLAIN, directPacket, encryptThenMac, floodPacket, macThenDecrypt, parsePacket, pathBytes, pathValid, readAdvert } = __src_meshcore_js;
 const MAX_ROOM_POST_LEN = 151;       // a room keeps 9 bytes of each post for the author and timestamp
 const TYPE_NAMES = { [ADV_TYPE_CHAT]: "chat", [ADV_TYPE_REPEATER]: "repeater", [ADV_TYPE_ROOM]: "room", [ADV_TYPE_SENSOR]: "sensor" };
@@ -1358,6 +1450,7 @@ class MeshNode extends EventTarget {
     this.expected = new Map();                // ACK (hex) -> resolve
     this.logins = new Map();                  // room pubHex -> {resolve}
     this.recent = new Set();                  // DMs and posts already delivered (a resend after a lost ACK: once only)
+    this.sealer = keySealer(identity.privateKey);   // room passwords are saved sealed with our private key
   }
 
   emit(type, detail) {
@@ -1399,7 +1492,7 @@ class MeshNode extends EventTarget {
     return [...this.contacts.values()].map((c) => ({
       pub: c.pubHex, name: c.name, type: c.type, lat: c.lat, lon: c.lon, lastHeard: c.lastHeard, lastAdvert: c.lastAdvert,
       outPath: c.outLen == null ? null : bytesToHex(c.outPath), outLen: c.outLen,
-      room: c.room ? { syncSince: c.room.syncSince, password: c.room.password || "" } : null,
+      room: c.room ? { syncSince: c.room.syncSince, sealedPassword: this.sealer.seal(c.room.password || "") } : null,
     }));
   }
 
@@ -1408,7 +1501,11 @@ class MeshNode extends EventTarget {
       try {
         const c = this.contact(s.pub, { name: s.name, type: s.type, lat: s.lat, lon: s.lon, lastHeard: s.lastHeard, lastAdvert: s.lastAdvert });
         if (s.outLen != null && pathValid(s.outLen)) [c.outPath, c.outLen] = [hexToBytes(s.outPath || ""), s.outLen];
-        if (s.room) c.room = { syncSince: s.room.syncSince || 0, password: s.room.password || "", loggedIn: false };
+        if (s.room) {
+          // (a password saved in the clear by an older version is read too, and sealed when next saved)
+          const password = s.room.sealedPassword ? this.sealer.open(s.room.sealedPassword) : s.room.password;
+          c.room = { syncSince: s.room.syncSince || 0, password: password || "", loggedIn: false };
+        }
       } catch {
         // a damaged entry: skip it
       }
@@ -1656,69 +1753,6 @@ function forgetEverything() {
 }
 
 return { loadSettings, saveSettings, loadChannels, saveChannels, loadHistory, saveHistory, loadContacts, saveContacts, loadConversations, saveConversations, forgetEverything };
-})();
-
-// src/vault.js
-const __src_vault_js = (() => {
-// A saved private key, sealed with a passphrase: PBKDF2-HMAC-SHA256 makes the keys, AES-128-CTR hides the private key,
-// HMAC-SHA256 checks it. Plain JS, like the rest: WebCrypto exists only on secure origins.
-const { aesEncryptBlock, aesExpandKey } = __src_aes_js;
-const { bytesToHex, concatBytes, equalBytes, hexToBytes, randomBytes, u32le, utf8Encode } = __src_bytes_js;
-const { hmacSha256 } = __src_hash_js;
-const ROUNDS = 50000;                     // about a second in a browser: slow for guessing, fine for logging in
-
-function pbkdf2(password, salt, rounds, length = 32) {
-  const out = new Uint8Array(length);
-  for (let block = 1, done = 0; done < length; block++) {
-    let u = hmacSha256(password, concatBytes(salt, new Uint8Array([block >>> 24, block >>> 16, block >>> 8, block])));
-    const t = Uint8Array.from(u);
-    for (let i = 1; i < rounds; i++) {
-      u = hmacSha256(password, u);
-      for (let j = 0; j < t.length; j++) t[j] ^= u[j];
-    }
-    out.set(t.subarray(0, length - done), done);
-    done += t.length;
-  }
-  return out;
-}
-
-function ctr(key16, iv, data) {
-  const w = aesExpandKey(key16);
-  const out = new Uint8Array(data.length);
-  for (let i = 0; i < data.length; i += 16) {
-    const ks = aesEncryptBlock(w, concatBytes(iv.subarray(0, 12), u32le(i / 16)));
-    for (let j = 0; j < 16 && i + j < data.length; j++) out[i + j] = data[i + j] ^ ks[j];
-  }
-  return out;
-}
-
-function keys(passphrase, salt, rounds) {
-  const k = pbkdf2(utf8Encode(passphrase), salt, rounds, 48);
-  return { enc: k.subarray(0, 16), mac: k.subarray(16, 48) };
-}
-
-// -> {v: 1, rounds, salt, iv, data, mac} (hex), for localStorage
-function seal(secret, passphrase) {
-  const salt = randomBytes(16), iv = randomBytes(12);
-  const k = keys(passphrase, salt, ROUNDS);
-  const data = ctr(k.enc, iv, secret);
-  const mac = hmacSha256(k.mac, concatBytes(salt, iv, data));
-  return { v: 1, rounds: ROUNDS, salt: bytesToHex(salt), iv: bytesToHex(iv), data: bytesToHex(data), mac: bytesToHex(mac) };
-}
-
-// The secret, or null for a wrong passphrase (or a damaged record).
-function unseal(box, passphrase) {
-  try {
-    const salt = hexToBytes(box.salt), iv = hexToBytes(box.iv), data = hexToBytes(box.data);
-    const k = keys(passphrase, salt, Math.min(Math.max(box.rounds | 0, 1000), 1000000));
-    if (!equalBytes(hmacSha256(k.mac, concatBytes(salt, iv, data)), hexToBytes(box.mac))) return null;
-    return ctr(k.enc, iv, data);
-  } catch {
-    return null;
-  }
-}
-
-return { pbkdf2, seal, unseal };
 })();
 
 // src/app.js

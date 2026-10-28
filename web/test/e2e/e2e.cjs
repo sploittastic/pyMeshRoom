@@ -197,6 +197,13 @@ let b;
   command('SAY welcome, web user');
   await p.waitForSelector('.msg .text:text("welcome, web user")', { timeout: 30000 });
   ok(true, 'the room\'s post arrives');
+  await p.waitForTimeout(800);                                           // (saved half a second after a change)
+  const savedRoom = await p.evaluate((pub16) => {
+    const list = JSON.parse(localStorage.getItem('meshcore-web.contacts.' + pub16) || '[]');
+    return list.find((c) => c.room)?.room || null;
+  }, PUB.slice(0, 16));
+  ok(savedRoom && savedRoom.sealedPassword && !('password' in savedRoom) && !JSON.stringify(savedRoom).includes('hello'),
+    'the room password is saved sealed with the private key, never in the clear');
 
   // @mentions: people who wrote here first
   await p.click('#channel-list button:has-text("Public")');
