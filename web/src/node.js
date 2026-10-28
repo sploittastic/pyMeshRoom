@@ -284,6 +284,9 @@ export class MeshNode extends EventTarget {
       const text = utf8Decode(data.subarray(5, e));
       if (this.fresh(c.pubHex + "|" + ts + "|" + text)) this.emit("dm", { contact: c, text, ts });
     } else if (kind === TXT_TYPE_SIGNED_PLAIN && data.length > 9 && c.room) {
+      // a room on the server we're connected to is read through the server instead: what it pushes over the air is for
+      // our radio (the same key on a companion app), so it's left for that radio to ACK
+      if (this.isLocalRoom?.(c.pubHex)) return;
       const e = end(9);
       this.replyAck(pkt, c, sha256(concatBytes(data.subarray(0, e), this.id.pub)).subarray(0, 4));
       c.room.syncSince = Math.max(c.room.syncSince || 0, ts);

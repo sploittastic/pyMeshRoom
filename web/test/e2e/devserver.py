@@ -5,6 +5,7 @@ Everything the radio transmits is printed as "TX <hex>". Lines appended to WORK/
     SAY <text>     the room posts this (to its members)
     BOT_ADVERT     EchoBot (a meshroom_kaas Node on its own KaaS key, answering every DM) adverts
     BOT_DM <pub hex> <text>   EchoBot sends a DM (to a contact it has heard advert)
+    MEMBER_POST <pub hex> <text>   a post to the room by that member, as if from their radio (a companion app)
 
     python3 devserver.py PYMESHROOM_CHECKOUT PORT WORK_DIR"""
 import os, sys, threading, time
@@ -54,14 +55,20 @@ def reader():
             elif line.startswith("BOT_DM ") and "node" in bot:
                 _, pub, text = line.split(" ", 2)
                 threading.Thread(target=lambda: bot["node"].send_dm(bot["node"].contact(pub), text), daemon=True).start()
+            elif line.startswith("MEMBER_POST "):
+                _, pub, text = line.split(" ", 2)
+                main_jobs.append(lambda pub=pub, text=text: h.room.store_post(bytes.fromhex(pub), text))
             elif line.strip() == "BOT_ADVERT" and "node" in bot:
                 threading.Thread(target=lambda: bot["node"].advert(flood=True), daemon=True).start()
         done = len(lines)
         time.sleep(0.1)
+main_jobs = []
 threading.Thread(target=reader, daemon=True).start()
 seen = 0
 while True:
     h.pump(lambda: False, 0.2)
+    while main_jobs:
+        main_jobs.pop(0)()                                  # (the room is the main loop's)
     sent = getattr(h.modem, "sent", None)
     if sent is not None:
         while seen < len(sent):

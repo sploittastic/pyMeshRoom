@@ -107,6 +107,11 @@ What you get:
   messages per conversation are kept in this browser, per identity, as is the conversation you had open. Room
   passwords are saved encrypted with a key derived from your private key, so they can't be read without it.
 * Rooms you've joined log you in again by themselves each time you connect.
+* **The room on the server you're connected to** (and its tenant rooms) is read and posted to through the server, not
+  over the air. So you can use the same key on a companion app at the same time: the room's sync point and route for
+  your key stay your radio's, and posts you make from the companion show here too. (Posts you make here don't reach
+  your companion: no room sends anyone their own posts.) Other rooms are logged in to over the air, which a companion
+  using the same key will fight over.
 * It reconnects by itself, logging in again each time: after 1 s, then twice as long each try up to 15 s, and at once
   when the network comes back or the tab is shown again. A server restart doesn't need the page password again (the
   page session is a signed cookie, not something the server has to remember). It stops if the admin disconnects or

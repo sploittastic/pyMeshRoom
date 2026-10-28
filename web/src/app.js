@@ -255,6 +255,7 @@ function startChat(identity, name, client) {
     markSeen: (raw) => markSeen(packetHash(parsePacket(raw))), uniqueTime,
   });
   node.loadContacts(loadContacts(identity.pubHex));
+  node.isLocalRoom = isLocalRoom;
   app.server = client.endpoints.ws;
   app.cursor = loadCursor(identity.pubHex, app.server);
   for (const c of node.contacts.values()) if (c.room) c.room.loggedIn = false;
@@ -274,6 +275,10 @@ function startChat(identity, name, client) {
   client.addEventListener("replay", (e) => onReplay(e.detail));
   client.addEventListener("state", (e) => onState(e.detail));
   client.addEventListener("hello", () => onHello());
+  client.addEventListener("room_post", (e) => {
+    const c = app.node.contacts.get(String(e.detail.room).toLowerCase());
+    if (c?.room?.local) addLocalPost(c, e.detail);
+  });
   client.addEventListener("dropped", (e) => toast("The server skipped " + e.detail + " packets (this tab fell behind)."));
   client.addEventListener("access", (e) => {
     toast(e.detail.send ? "Your key was heard on the mesh: you can send now." : "Sending was turned off for your key.");
@@ -319,13 +324,55 @@ async function refreshDirectory() {
 }
 
 function loginRooms() {
-  if (!canSend()) return;
-  for (const c of app.node.contacts.values()) if (c.room && !c.room.loggedIn) roomLogin(c, c.room.password || "", true);
+  for (const c of app.node.contacts.values())
+    if (c.room && !c.room.loggedIn && (isLocalRoom(c.pubHex) || canSend())) roomLogin(c, c.room.password || "", true);
+}
+
+// A room on the server we're connected to (its own room, or a tenant room).
+function isLocalRoom(pubHex) {
+  const n = app.client?.hello?.nodes, k = String(pubHex).toLowerCase();
+  return !!n && [n.room, ...(n.tenants || [])].some((x) => String(x || "").toLowerCase() === k);
+}
+
+// A room on this server is read through the server, not logged in to over the air: the room keeps one sync point and
+// one route per key, and those belong to our radio (the same key on a companion app), which would lose posts to us.
+async function readLocalRoom(c, password) {
+  let r;
+  try {
+    r = await app.client.request("room", { room: c.pubHex, since: c.room?.syncSince || 0, password: password || "" });
+  } catch (e) {
+    throw new LoginFailed(e.message);
+  }
+  c.room ||= { syncSince: 0, password: "", loggedIn: false };
+  Object.assign(c.room, { password, loggedIn: true, local: true, isAdmin: r.admin, perms: r.perms, canPost: r.can_post });
+  if (r.name && !c.name) c.name = r.name;
+  for (const p of r.posts || []) addLocalPost(c, p);
+  app.node.emit("contacts");
+}
+
+// A post from a room on this server ({ts, author: full key, name, text, private}), as an "over the air" one would be.
+function addLocalPost(c, p) {
+  c.room.syncSince = Math.max(c.room.syncSince || 0, p.ts);
+  const author = String(p.author).slice(0, 8).toLowerCase();
+  if (!app.node.fresh(c.pubHex + "|" + p.ts + "|" + author + "|" + p.text)) return;
+  const key = "room:" + c.pubHex;
+  if (String(p.author).toLowerCase() === app.identity.pubHex) {
+    // ours: the one we're posting from this page becomes it (the room's stamp is the one reactions use)
+    const ours = (app.history[key] || []).find((m) => m.mine && m.text === p.text && !m.roomTs && m.status !== "failed");
+    if (ours) {
+      Object.assign(ours, { ts: p.ts, roomTs: true, status: "delivered", reason: "" });
+      reactionHashes.delete(ours);
+      updateMessage(ours);
+      return scheduleSave();
+    }
+  }
+  onPost({ room: c, author, text: p.text, ts: p.ts, name: p.name });
 }
 
 async function roomLogin(c, password, quiet = false) {
   try {
-    await app.node.joinRoom(c.pubHex, password);
+    if (isLocalRoom(c.pubHex)) await readLocalRoom(c, password);
+    else await app.node.joinRoom(c.pubHex, password);
     if (!quiet) toast("Joined " + contactName(c) + ".");
     renderSidebar();
     if (app.active === "room:" + c.pubHex) renderConversation();
@@ -462,10 +509,10 @@ function onDm({ contact, text, ts }) {
   addIncoming("dm:" + contact.pubHex, { id: newId(), ts, sender: contactName(contact), text, ...routeOf() });
 }
 
-function onPost({ room, author, text, ts }) {
+function onPost({ room, author, text, ts, name }) {
   const mine = author === app.identity.pubHex.slice(0, 8);
   const who = mine ? app.name : [...app.node.contacts.values()].find((c) => c.pubHex.startsWith(author));
-  const msg = { id: newId(), ts, sender: mine ? app.name : who ? contactName(who) : author, author, text, ...routeOf() };
+  const msg = { id: newId(), ts, sender: mine ? app.name : who ? contactName(who) : name || author, author, text, ...routeOf() };
   if (mine) Object.assign(msg, { mine: true, status: "delivered" });
   addIncoming("room:" + room.pubHex, msg);
 }
@@ -697,6 +744,22 @@ async function deliver(cv, msg) {
     const res = await app.client.send(raw);
     msg.status = res.status === "sent" || res.status === "local" ? res.status : "failed";
     msg.reason = res.reason || "";
+  } else if (cv.kind === "room" && isLocalRoom(cv.contact.pubHex)) {
+    const c = cv.contact;
+    msg.status = "sending";
+    updateMessage(msg);
+    if (!c.room.loggedIn && !(await roomLogin(c, c.room.password || "", true)))
+      Object.assign(msg, { status: "failed", reason: "couldn't open the room" });
+    else {
+      try {
+        const r = await app.client.request("room_post", { room: c.pubHex, text: msg.text });
+        if (r.status === "duplicate") Object.assign(msg, { status: "failed", reason: "the room already has this post from you" });
+        else if (!msg.roomTs) Object.assign(msg, { ts: r.ts, roomTs: true, status: "delivered", reason: "" });
+        reactionHashes.delete(msg);
+      } catch (e) {
+        Object.assign(msg, { status: "failed", reason: e.message });
+      }
+    }
   } else {
     const c = cv.contact;
     if (cv.kind === "room" && !c.room.loggedIn) {
@@ -1291,7 +1354,7 @@ async function joinRoomFromDialog(ev) {
     else return showError("r-error", byName.length ? "Several rooms have that name: use its public key." :
       "No room by that name has been heard. Give its public key (64 hex characters).");
   }
-  if (!canSend()) return showError("r-error", "You can't send yet, so you can't log in to a room.");
+  if (!canSend() && !isLocalRoom(c.pubHex)) return showError("r-error", "You can't send yet, so you can't log in to a room.");
   $("r-go").disabled = true;
   $("r-go").textContent = "Logging in…";
   try {

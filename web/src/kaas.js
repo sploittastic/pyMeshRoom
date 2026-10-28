@@ -257,6 +257,8 @@ export class KaasClient extends EventTarget {
       this.queries.delete(msg.id);
       if (msg.type === "error") q.reject(new Error(msg.error || "the server couldn't answer"));
       else q.resolve(msg);
+    } else if (msg.type === "room_post") {
+      this.emit("room_post", msg);
     } else if (msg.type === "dropped") {
       this.emit("dropped", msg.count);
     } else if (msg.type === "access" && this.hello?.key) {

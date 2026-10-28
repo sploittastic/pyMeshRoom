@@ -221,7 +221,8 @@ let b;
   ok(true, 'DM received: the bot\'s answer, decrypted here');
   ok(await p.locator('#dm-list button:has-text("EchoBot")').count() === 1, 'the DM is listed in the sidebar');
 
-  // the room on this radio: log in, post, and get its posts
+  // the room on this radio: read and posted to through the server, not over the air (that's for our companion app)
+  const txBefore = fs.readFileSync(W + '/dev.log', 'utf8').split('\n').filter((l) => l.startsWith('TX ')).length;
   await p.click('#join-room');
   const roomName = await p.evaluate(() => document.querySelector('#r-known option')?.value || '');
   ok(!!roomName, 'the room on this radio is offered by name: ' + roomName);
@@ -237,6 +238,14 @@ let b;
   command('SAY welcome, web user');
   await p.waitForSelector('.msg .text:text("welcome, web user")', { timeout: 30000 });
   ok(true, 'the room\'s post arrives');
+  command('MEMBER_POST ' + PUB + ' sent from my companion');
+  await p.waitForSelector('.msg.mine .text:text("sent from my companion")', { timeout: 10000 });
+  ok(true, 'a post made with the same key from a companion app shows here, as ours');
+  await p.waitForTimeout(1500);
+  const roomTx = py === null ? [] : fs.readFileSync(W + '/dev.log', 'utf8').split('\n').filter((l) => l.startsWith('TX ')).slice(txBefore)
+    .map((l) => execFileSync('python3', ['-c', 'import sys,os;sys.path.insert(0,os.path.join(os.environ["PYMESHROOM"],"client"));' +
+      'from meshroom_kaas import Packet;print(Packet.parse(bytes.fromhex(sys.argv[1])).type_name)', l.slice(3)]).toString().trim());
+  ok(!roomTx.some((t) => /ANON_REQ|ACK|TXT_MSG/.test(t)), 'nothing went over the air for the room on this radio: ' + (roomTx.join(' ') || 'nothing'));
   await p.waitForTimeout(800);                                           // (saved half a second after a change)
   const savedRoom = await p.evaluate((pub16) => {
     const list = JSON.parse(localStorage.getItem('meshcore-web.contacts.' + pub16) || '[]');

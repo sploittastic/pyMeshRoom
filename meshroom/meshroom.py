@@ -295,7 +295,8 @@ SUSPENDED_PROBE_S = 6 * 3600     # while suspended: a single flood this often, i
 MAX_NEIGHBOURS = 50
 NAME_CACHE_MAX = 1000
 NODES_MAX = 5000                 # every node heard advertising (any type), kept with its full key: the oldest go first
-NODES_ANSWER_MAX = 2000          # a KaaS "nodes" answer: at most this many, the most recently heard
+NODES_ANSWER_MAX = 2000                # a KaaS "nodes" answer: at most this many, the most recently heard
+ROOM_ANSWER_MAX = 500                 # posts in one "room" answer (a web login reading a room on this server)
 
 SLOT_FLOOD = "flood"
 
@@ -2029,6 +2030,9 @@ class RoomServer:
             prune = public[-self.cfg.max_posts][0]          # private messages are kept until delivered
             self.posts = [p for p in self.posts if p[3] is not None or p[0] >= prune]
         self.store.add_post(ts, author, text, to, prune)    # written by the db thread
+        hub = (self.host if self.TENANT else self).kaas
+        if hub is not None:
+            hub.room_post_added(self, (ts, author, text, to))
         if to is None:
             self.stats["posted"] += 1
         self.next_push = time.monotonic() + PUSH_NOTIFY_DELAY
@@ -7199,6 +7203,7 @@ class KaasConn:
         self.hub, self.sock, self.rfile, self.peer = hub, sock, rfile, peer
         self.key_id, self.can_receive, self.can_send = key["id"], bool(key.get("receive")), bool(key.get("send"))
         self.web = key.get("web")                           # a web login: its public key (hex); None for an API key
+        self.rooms = set()                                  # rooms on this server it follows (web logins: "room")
         self.out = collections.deque()
         self.cv = threading.Condition()
         self.wlock = threading.Lock()
@@ -7621,6 +7626,9 @@ class KaasHub:
         if kind == "kaas_web_admin":
             self.web_admin(*ev[1:])
             return
+        if kind == "kaas_room":
+            self.room_request(*ev[1:])
+            return
         if kind == "kaas_key_add":
             cfg.set("kaas_keys", self.keys() + [ev[1]])
         elif kind == "kaas_key_del":
@@ -7726,6 +7734,8 @@ class KaasHub:
             return self.ask(conn, t, msg, rid)
         if t == "replay":
             return self.replay(conn, msg, rid)
+        if t in ("room", "room_post"):
+            return self.room_ask(conn, t, msg, rid)
         if t != "send":
             return conn.send_json({"type": "error", "id": rid,
                                    "error": "unknown message type: use send, near, routes, route, nodes or ping"})
@@ -7922,6 +7932,105 @@ class KaasHub:
                 return err("too many requests waiting: wait for their answers")
             conn.inflight += 1
         self.room.events_put(("kaas_query", conn, t, key, limit, rid))
+
+    # ---------------------------------------------------------------- this server's rooms, for web logins
+
+    def room_ask(self, conn, t, msg, rid):
+        """A web login's "room" (read a room on this server: its posts, then each new one as it's stored) or
+        "room_post" (post to it). Straight to the room, not over the air: the member's sync point and routes, which
+        their radio companion relies on, are left alone. Checked here, done in the main loop."""
+        def err(e):
+            conn.send_json({"type": "error", "id": rid, "error": e})
+        if not conn.web:
+            return err("rooms on this server: for web logins only (an API key logs in over the air)")
+        try:
+            pub = bytes.fromhex(str(msg.get("room", "")))
+        except ValueError:
+            pub = b""
+        if len(pub) != PUB_KEY_SIZE:
+            return err("room: the room's public key in hex")
+        if t == "room":
+            since, pw = msg.get("since", 0), msg.get("password", "")
+            if isinstance(since, bool) or not isinstance(since, int) or since < 0 or not isinstance(pw, str):
+                return err("since: a timestamp (0 for the latest posts); password: text")
+            arg = (since, pw[:15])
+        else:
+            text = msg.get("text")
+            if not isinstance(text, str) or not text.strip() or len(text.strip().encode()) > MAX_POST_TEXT_LEN:
+                return err("text: 1 to %d bytes" % MAX_POST_TEXT_LEN)
+            if not conn.can_send:
+                return err("your key hasn't been heard on this radio yet: the admin can let it send")
+            arg = text.strip()
+        with conn.cv:
+            if conn.inflight >= KAAS_MAX_INFLIGHT:
+                return err("too many requests waiting: wait for their answers")
+            conn.inflight += 1
+        self.room.events_put(("kaas_room", conn, t, pub, arg, rid))
+
+    def local_room(self, pub):
+        room = self.room
+        return room if pub == room.id.pub_key else room.tenants.get(pub)
+
+    def room_request(self, conn, t, pub, arg, rid):
+        """In the main loop. room: (since, password) -> the posts this member may see after since (all of the newest
+        catchup_max when 0), and from now on each new one as "room_post". room_post: text -> stored as their post."""
+        with conn.cv:
+            conn.inflight = max(0, conn.inflight - 1)
+        r, me = self.local_room(pub), bytes.fromhex(conn.web)
+
+        def err(e, **kw):
+            conn.send_json(dict({"type": "error", "id": rid, "error": e}, **kw))
+        if r is None:
+            return err("not a room on this server", local=False)
+        if me in r.bans:
+            return err("you're banned from this room")
+        m = r.members.get(me)
+        if t == "room":
+            since, pw = arg
+            if m is None or (pw and m.role == PERM_GUEST):  # (a member is known by their key: no password needed)
+                if r.cfg.admin_password and pw == r.cfg.admin_password:
+                    perm = PERM_ADMIN
+                elif pw == r.cfg.room_password:
+                    perm = PERM_READ_WRITE
+                elif r.cfg.allow_read_only:
+                    perm = PERM_GUEST
+                else:
+                    return err("the room refused the login (a wrong password?)", refused=True)
+                if m is None:
+                    m = r.put_member(me)
+                    m.secret = r.id.shared_secret(me)
+                    public = [p for p in r.posts if p[3] is None]          # what a new member's radio would get
+                    m.sync_since = public[-r.cfg.catchup_max - 1][0] if 0 < r.cfg.catchup_max < len(public) else 0
+                m.perms = (m.perms & ~3) | perm
+                r.mark_dirty()
+            # (last_activity is left alone: it's what makes the room push over the air. A member who joined here has
+            # none until their radio logs in, so the room never pushes to a radio that isn't there.)
+            seen = [p for p in r.posts if p[0] > since and (p[3] is None or p[3] == me)]
+            if since == 0:
+                seen = seen[-max(1, int(r.cfg.catchup_max or 50)):]
+            conn.rooms.add(pub)
+            conn.send_json({"type": "room_result", "id": rid, "room": pub.hex(), "name": r.cfg.name,
+                            "admin": m.is_admin, "perms": m.perms, "can_post": m.role != PERM_GUEST,
+                            "posts": [self.room_post_json(r, p) for p in seen[-ROOM_ANSWER_MAX:]]})
+            return
+        if m is None or m.role == PERM_GUEST:
+            return err("log in to the room with its password to post", refused=m is None)
+        if r.is_manual_resend(m, arg):
+            return conn.send_json({"type": "room_post_result", "id": rid, "status": "duplicate"})
+        r.store_post(me, arg)
+        conn.send_json({"type": "room_post_result", "id": rid, "status": "posted", "ts": r.posts[-1][0]})
+
+    def room_post_json(self, r, p):
+        ts, author, text, to = p
+        return {"ts": ts, "author": author.hex(), "name": r.chat_label(author), "text": text, "private": to is not None}
+
+    def room_post_added(self, r, p):
+        """A post was just stored in room r (main loop): to the web sessions following it that may see it."""
+        pub = r.id.pub_key
+        for c in self.conns:
+            if c.web and pub in c.rooms and not c.closed and (p[3] is None or p[3].hex() == c.web) \
+                    and bytes.fromhex(c.web) not in r.bans:
+                c.send_json(dict(self.room_post_json(r, p), type="room_post", room=pub.hex()))
 
     # ---------------------------------------------------------------- the main loop's side
 

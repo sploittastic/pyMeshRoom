@@ -347,6 +347,73 @@ class PageSessionTests(unittest.TestCase):
         self.assertFalse(mr.web_page_session_ok(tok, ""))
 
 
+class LocalRoomTests(WebHelpers):
+    """A web login reads and posts to a room on this server through the server, leaving the member's over-the-air
+    state (sync point, route, activity) to their radio: the same key on a companion app."""
+
+    def request(self, c, msg, want):
+        c.ws.send_text(json.dumps(msg))
+        got = lambda: next((m for m in c.msgs if m.get("id") == msg["id"]), None)
+        self.assertTrue(self.h.pump(lambda: got() is not None, 10), c.msgs)
+        m = got()
+        self.assertEqual(m["type"], want, m)
+        return m
+
+    def live(self, c, text):
+        self.assertTrue(self.h.pump(lambda: any(m.get("type") == "room_post" and m["text"] == text for m in c.msgs), 10), c.msgs)
+        return next(m for m in c.msgs if m.get("type") == "room_post" and m["text"] == text)
+
+    def test_room_through_the_server(self):
+        self.enable()
+        r, me = self.h.room, kc.Identity.generate()
+        room = r.id.pub_key.hex()
+        companion = r.put_member(me.pub)                                      # their companion app logged in already
+        companion.perms, companion.secret = mr.PERM_READ_WRITE, r.id.shared_secret(me.pub)
+        companion.sync_since, companion.out_path, companion.out_path_len, companion.last_activity = 1234, b"\x11", 1, 999
+        r.store_post(r.id.pub_key, "before")
+        self.heard_on_air(me, "Me")
+        c = self.connect(self.login(me)[1]["ticket"])
+        a = self.request(c, {"type": "room", "id": 1, "room": room}, "room_result")   # (a member: no password)
+        self.assertEqual(([p["text"] for p in a["posts"]], a["can_post"]), (["before"], True))
+        r.store_post(me.pub, "from my companion")                            # the same key, from their radio
+        self.assertEqual(self.live(c, "from my companion")["author"], me.pub.hex())
+        b = self.request(c, {"type": "room_post", "id": 2, "room": room, "text": " from the web "}, "room_post_result")
+        self.assertEqual((b["status"], r.posts[-1][1:3]), ("posted", (me.pub, "from the web")))
+        self.assertEqual(self.live(c, "from the web")["ts"], b["ts"])
+        self.assertEqual(self.request(c, {"type": "room_post", "id": 3, "room": room, "text": "from the web"},
+                                      "room_post_result")["status"], "duplicate")
+        self.assertEqual((companion.sync_since, companion.out_path, companion.out_path_len, companion.last_activity),
+                         (1234, b"\x11", 1, 999))                            # their radio's state, untouched
+        again = self.request(c, {"type": "room", "id": 4, "room": room, "since": b["ts"] - 1}, "room_result")
+        self.assertEqual([p["text"] for p in again["posts"]], ["from the web"])
+        self.assertIn("not a room", self.request(c, {"type": "room", "id": 5, "room": "ab" * 32}, "error")["error"])
+
+    def test_joining_from_the_web(self):
+        self.enable()
+        r = self.h.room
+        room = r.id.pub_key.hex()
+        guest = kc.Identity.generate()
+        c = self.connect(self.login(guest)[1]["ticket"])
+        self.assertTrue(self.request(c, {"type": "room", "id": 1, "room": room, "password": "nope"}, "error").get("refused"))
+        self.assertNotIn(guest.pub, r.members)
+        ok = self.request(c, {"type": "room", "id": 2, "room": room, "password": "hello"}, "room_result")
+        m = r.members[guest.pub]
+        self.assertEqual((ok["can_post"], m.role, m.last_activity), (True, mr.PERM_READ_WRITE, 0))
+        self.assertFalse(r.push_eligible(m))                                 # no radio: the room never pushes to it
+        self.assertIn("heard on this radio", self.request(c, {"type": "room_post", "id": 3, "room": room, "text": "hi"},
+                                                         "error")["error"])   # (pending: can read, not post)
+        r.bans[guest.pub] = "test"
+        self.assertIn("banned", self.request(c, {"type": "room", "id": 4, "room": room}, "error")["error"])
+
+    def test_api_keys_log_in_over_the_air(self):
+        self.http("POST", "/api/login", {"password": "adminpw"})
+        bot = kc.KaasClient(self.url, self.make_key())
+        self.h.run_client(bot.connect)
+        bot.ws.send_text(json.dumps({"type": "room", "id": 1, "room": self.h.room.id.pub_key.hex()}))
+        self.assertTrue(self.h.pump(lambda: False, 1.0) is False)
+        bot.close()
+
+
 class WebsocketDiagnosisTests(WebHelpers):
     """A browser isn't told why its websocket didn't open: the server keeps what became of each ticket, and logs it."""
 

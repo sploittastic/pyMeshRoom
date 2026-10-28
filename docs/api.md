@@ -255,6 +255,34 @@ Other messages:
 
 **ping**: `{"type": "ping", "id": 1}`
 
+### Rooms on this server (web logins only)
+
+A web login reads and posts to this server's own room, and its tenant rooms, through the server rather than over the
+air. A room keeps one sync point and one route per key, and those belong to the member's radio: the same key on a
+companion app would otherwise lose posts to the web page, or get them sent down the page's route.
+
+**room**: `{"type": "room", "id": 1, "room": "<64 hex>", "since": 0, "password": ""}` answers `room_result`, with the
+posts this key may see newer than `since` (its room's latest `catchup_max` when 0, at most 500), its own and
+private ones included:
+
+```json
+{"type": "room_result", "id": 1, "room": "<64 hex>", "name": "Pi Room", "admin": false, "perms": 2, "can_post": true,
+ "posts": [{"ts": 1761700000, "author": "<64 hex>", "name": "Alice", "text": "hi", "private": false}]}
+```
+
+From then on, each new post it may see comes as `{"type": "room_post", "room": ..., ...}` with the same fields, until
+the connection closes; ask again after reconnecting. A member is known by their key, so no password is needed. A key
+that isn't a member joins with the password, checked as a radio login is (admin password, room password, or a guest
+when the room allows read-only), and an error has `"refused": true` when it's wrong. The member's over-the-air state
+(sync point, route, last activity) is never changed, and a member who only ever joined here gets nothing pushed over
+the air. A room not on this server answers an error with `"local": false`: log in over the air instead.
+
+**room_post**: `{"type": "room_post", "id": 2, "room": "<64 hex>", "text": "hello"}` stores a post as this key's
+(read-write or admin members; a key that may send). It answers `{"type": "room_post_result", "id": 2, "status":
+"posted", "ts": ...}`, or `"status": "duplicate"` for the same text again within the room's dedupe window. The
+room pushes it over the air to its other members as usual. (Not to this key's own radio: a room never sends anyone
+their own posts.)
+
 ### Route questions
 
 Any key may ask these. They come from what the room has learned of the mesh. The answers are routes from this
