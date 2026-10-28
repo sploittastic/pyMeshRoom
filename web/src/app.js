@@ -101,6 +101,20 @@ function servedBy() {
   return m ? location.origin + m[1] : null;
 }
 
+// A phone's on-screen keyboard covers the page without resizing it (iOS, and Chrome without interactive-widget): keep
+// the chat, and so the composer, within what's visible.
+function fitToKeyboard() {
+  const vv = window.visualViewport;
+  if (!vv) return;
+  const fit = () => {
+    const covered = window.innerHeight - vv.height > 60;     // (more than the browser's bars: a keyboard)
+    document.documentElement.style.setProperty("--app-h", covered ? vv.height + "px" : "");
+    if (covered) window.scrollTo(0, 0);                        // (iOS pans the page up instead)
+  };
+  vv.addEventListener("resize", fit);
+  vv.addEventListener("scroll", fit);
+}
+
 function initLogin() {
   const s = loadSettings();
   const served = servedBy();
@@ -741,7 +755,7 @@ function renderConversation() {
   box.replaceChildren();
   if (!msgs.length) {
     box.append(el("p", { class: "empty" }, {
-      channel: "No messages yet. Messages heard from now on show up here; the radio doesn't keep a backlog.",
+      channel: "No messages yet. Messages heard from now on show up here.",
       dm: "No messages yet. Only the two of you can read a direct message.",
       room: "No posts yet. The room sends the posts you missed when you log in.",
     }[cv.kind]));
@@ -1204,6 +1218,7 @@ function wire() {
     updateGifPreview();
   });
   $("composer").addEventListener("submit", sendMessage);
+  $("send").addEventListener("mousedown", (e) => e.preventDefault());   // (a tap on Send leaves the keyboard up)
   $("text").addEventListener("input", () => { autosize(); updateComposer(); updateGifPreview(); updateMentions(); });
   $("text").addEventListener("click", updateMentions);
   $("text").addEventListener("blur", () => setTimeout(closeMentions, 150));
@@ -1273,4 +1288,5 @@ function wire() {
 
 wire();
 applyTheme();
+fitToKeyboard();
 initLogin();

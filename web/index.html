@@ -2,7 +2,7 @@
 <html lang="en">
 <head>
 <meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover, interactive-widget=resizes-content">
 <meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'self' https://unpkg.com/leaflet@1.9.4/dist/leaflet.js; style-src 'self' https://unpkg.com/leaflet@1.9.4/dist/leaflet.css; img-src 'self' data: https://media.giphy.com https://i.giphy.com https://*.tile.openstreetmap.org https://unpkg.com/leaflet@1.9.4/dist/images/; connect-src https: wss: http: ws:; base-uri 'none'; form-action 'none'">
 <meta name="referrer" content="no-referrer">
 <title>MeshCore Web</title>
@@ -110,8 +110,9 @@
     <div class="messages" id="messages" aria-live="polite"></div>
     <div class="gif-preview" id="gif-preview" hidden></div>
     <div class="mentions" id="mentions" role="listbox" aria-label="Mention someone" hidden></div>
-    <form class="composer" id="composer">
-      <textarea id="text" rows="1" placeholder="Message" aria-label="Message"></textarea>
+    <form class="composer" id="composer" autocomplete="off">
+      <textarea id="text" rows="1" placeholder="Message" aria-label="Message" autocomplete="off" autocapitalize="sentences"
+        enterkeyhint="send" inputmode="text" data-1p-ignore data-lpignore="true" data-bwignore data-form-type="other"></textarea>
       <span class="count" id="count"></span>
       <button type="submit" id="send" class="primary">Send</button>
     </form>

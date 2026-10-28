@@ -43,6 +43,7 @@
 [hidden] { display: none !important; }
 
 html, body { height: 100%; margin: 0; }
+@supports (height: 100dvh) { html, body { height: 100dvh; } }   /* phones: the part not under the browser's bars */
 body {
   background: var(--bg);
   color: var(--text);
@@ -104,7 +105,7 @@ label.check input { width: auto; }
 .login button.primary { width: 100%; margin-top: 18px; padding: 11px; }
 
 /* chat */
-.chat { display: grid; grid-template-columns: 270px 1fr; height: 100%; }
+.chat { display: grid; grid-template-columns: 270px 1fr; height: var(--app-h, 100%); }   /* (--app-h: above a phone's keyboard) */
 .sidebar {
   background: var(--side);
   border-right: 1px solid var(--line);
@@ -170,8 +171,9 @@ label.check input { width: auto; }
 .mention { background: color-mix(in srgb, var(--accent) 16%, transparent); border-radius: 4px; padding: 0 2px; font-weight: 600; }
 .mention.me { background: var(--mention); }
 
-.composer { display: flex; gap: 8px; align-items: flex-end; padding: 10px 16px 14px; border-top: 1px solid var(--line); background: var(--panel); }
-.composer textarea { resize: none; max-height: 140px; }
+.composer { display: flex; gap: 8px; align-items: flex-end; padding: 10px 16px max(14px, env(safe-area-inset-bottom)); border-top: 1px solid var(--line); background: var(--panel); }
+.composer textarea { flex: 1; min-width: 0; resize: none; max-height: 140px; }
+.composer button { flex: none; }
 .composer .count { color: var(--muted); font-size: 12px; min-width: 30px; text-align: right; padding-bottom: 10px; }
 .composer .count.over { color: var(--danger); font-weight: 700; }
 
@@ -196,6 +198,9 @@ dialog::backdrop { background: rgb(0 0 0 / .45); }
   .sidebar.open { transform: none; box-shadow: 0 0 30px rgb(0 0 0 / .3); }
   #toggle-side { display: inline-block; }
   .room-head, .messages, .composer, .banner { padding-left: 16px; padding-right: 16px; }
+  .composer { gap: 6px; padding-left: max(12px, env(safe-area-inset-left)); padding-right: max(12px, env(safe-area-inset-right)); }
+  .composer .count { min-width: 0; }
+  input, textarea, select { font-size: 16px; }   /* iOS zooms into a field under 16px, pushing Send off the screen */
   .msg { max-width: 92%; }
 }
 

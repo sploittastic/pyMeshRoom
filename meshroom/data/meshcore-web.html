@@ -2,8 +2,8 @@
 <html lang="en">
 <head>
 <meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'sha256-cR3Q4ApWkD1HxJzkMsIRurl69G900PNSMtK3yS7vbTs=' 'self' https://unpkg.com/leaflet@1.9.4/dist/leaflet.js; style-src 'sha256-MR/U7r6289lDmFT6czlrddrwJEDJYjKykxOcVDnLLVI=' 'self' https://unpkg.com/leaflet@1.9.4/dist/leaflet.css; img-src 'self' data: https://media.giphy.com https://i.giphy.com https://*.tile.openstreetmap.org https://unpkg.com/leaflet@1.9.4/dist/images/; connect-src https: wss: http: ws:; base-uri 'none'; form-action 'none'">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover, interactive-widget=resizes-content">
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'sha256-8fxUTBG+pS4w6Hii0DRr24KsPIV0IifyEJd+MT4lyV0=' 'self' https://unpkg.com/leaflet@1.9.4/dist/leaflet.js; style-src 'sha256-9FjzK/Bv2jDEWj9ZYFSfryEYCFU9c11okrOqtTaG/K4=' 'self' https://unpkg.com/leaflet@1.9.4/dist/leaflet.css; img-src 'self' data: https://media.giphy.com https://i.giphy.com https://*.tile.openstreetmap.org https://unpkg.com/leaflet@1.9.4/dist/images/; connect-src https: wss: http: ws:; base-uri 'none'; form-action 'none'">
 <meta name="referrer" content="no-referrer">
 <title>MeshCore Web</title>
 <style>:root {
@@ -51,6 +51,7 @@
 [hidden] { display: none !important; }
 
 html, body { height: 100%; margin: 0; }
+@supports (height: 100dvh) { html, body { height: 100dvh; } }   /* phones: the part not under the browser's bars */
 body {
   background: var(--bg);
   color: var(--text);
@@ -112,7 +113,7 @@ label.check input { width: auto; }
 .login button.primary { width: 100%; margin-top: 18px; padding: 11px; }
 
 /* chat */
-.chat { display: grid; grid-template-columns: 270px 1fr; height: 100%; }
+.chat { display: grid; grid-template-columns: 270px 1fr; height: var(--app-h, 100%); }   /* (--app-h: above a phone's keyboard) */
 .sidebar {
   background: var(--side);
   border-right: 1px solid var(--line);
@@ -178,8 +179,9 @@ label.check input { width: auto; }
 .mention { background: color-mix(in srgb, var(--accent) 16%, transparent); border-radius: 4px; padding: 0 2px; font-weight: 600; }
 .mention.me { background: var(--mention); }
 
-.composer { display: flex; gap: 8px; align-items: flex-end; padding: 10px 16px 14px; border-top: 1px solid var(--line); background: var(--panel); }
-.composer textarea { resize: none; max-height: 140px; }
+.composer { display: flex; gap: 8px; align-items: flex-end; padding: 10px 16px max(14px, env(safe-area-inset-bottom)); border-top: 1px solid var(--line); background: var(--panel); }
+.composer textarea { flex: 1; min-width: 0; resize: none; max-height: 140px; }
+.composer button { flex: none; }
 .composer .count { color: var(--muted); font-size: 12px; min-width: 30px; text-align: right; padding-bottom: 10px; }
 .composer .count.over { color: var(--danger); font-weight: 700; }
 
@@ -204,6 +206,9 @@ dialog::backdrop { background: rgb(0 0 0 / .45); }
   .sidebar.open { transform: none; box-shadow: 0 0 30px rgb(0 0 0 / .3); }
   #toggle-side { display: inline-block; }
   .room-head, .messages, .composer, .banner { padding-left: 16px; padding-right: 16px; }
+  .composer { gap: 6px; padding-left: max(12px, env(safe-area-inset-left)); padding-right: max(12px, env(safe-area-inset-right)); }
+  .composer .count { min-width: 0; }
+  input, textarea, select { font-size: 16px; }   /* iOS zooms into a field under 16px, pushing Send off the screen */
   .msg { max-width: 92%; }
 }
 
@@ -2053,6 +2058,20 @@ function servedBy() {
   return m ? location.origin + m[1] : null;
 }
 
+// A phone's on-screen keyboard covers the page without resizing it (iOS, and Chrome without interactive-widget): keep
+// the chat, and so the composer, within what's visible.
+function fitToKeyboard() {
+  const vv = window.visualViewport;
+  if (!vv) return;
+  const fit = () => {
+    const covered = window.innerHeight - vv.height > 60;     // (more than the browser's bars: a keyboard)
+    document.documentElement.style.setProperty("--app-h", covered ? vv.height + "px" : "");
+    if (covered) window.scrollTo(0, 0);                        // (iOS pans the page up instead)
+  };
+  vv.addEventListener("resize", fit);
+  vv.addEventListener("scroll", fit);
+}
+
 function initLogin() {
   const s = loadSettings();
   const served = servedBy();
@@ -2693,7 +2712,7 @@ function renderConversation() {
   box.replaceChildren();
   if (!msgs.length) {
     box.append(el("p", { class: "empty" }, {
-      channel: "No messages yet. Messages heard from now on show up here; the radio doesn't keep a backlog.",
+      channel: "No messages yet. Messages heard from now on show up here.",
       dm: "No messages yet. Only the two of you can read a direct message.",
       room: "No posts yet. The room sends the posts you missed when you log in.",
     }[cv.kind]));
@@ -3156,6 +3175,7 @@ function wire() {
     updateGifPreview();
   });
   $("composer").addEventListener("submit", sendMessage);
+  $("send").addEventListener("mousedown", (e) => e.preventDefault());   // (a tap on Send leaves the keyboard up)
   $("text").addEventListener("input", () => { autosize(); updateComposer(); updateGifPreview(); updateMentions(); });
   $("text").addEventListener("click", updateMentions);
   $("text").addEventListener("blur", () => setTimeout(closeMentions, 150));
@@ -3225,6 +3245,7 @@ function wire() {
 
 wire();
 applyTheme();
+fitToKeyboard();
 initLogin();
 
 return {  };
@@ -3332,8 +3353,9 @@ return {  };
     <div class="messages" id="messages" aria-live="polite"></div>
     <div class="gif-preview" id="gif-preview" hidden></div>
     <div class="mentions" id="mentions" role="listbox" aria-label="Mention someone" hidden></div>
-    <form class="composer" id="composer">
-      <textarea id="text" rows="1" placeholder="Message" aria-label="Message"></textarea>
+    <form class="composer" id="composer" autocomplete="off">
+      <textarea id="text" rows="1" placeholder="Message" aria-label="Message" autocomplete="off" autocapitalize="sentences"
+        enterkeyhint="send" inputmode="text" data-1p-ignore data-lpignore="true" data-bwignore data-form-type="other"></textarea>
       <span class="count" id="count"></span>
       <button type="submit" id="send" class="primary">Send</button>
     </form>
