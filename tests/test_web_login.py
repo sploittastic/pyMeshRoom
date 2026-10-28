@@ -347,6 +347,25 @@ class NodesRequestTests(WebTestCase):
         self.assertEqual([r["name"] for r in self.h.run_client(lambda: c.nodes(days=1))], ["Bob"])
         with self.assertRaises(kc.RequestError):
             self.h.run_client(lambda: c.nodes(days=0))
+
+        # what the room kept before the directory existed: the repeater map, members, and the name cache (8-byte keys)
+        r, now = self.h.room, int(time.time())
+        rpt, member, named = kc.Identity.generate(), kc.Identity.generate(), kc.Identity.generate()
+        r.repeaters[rpt.pub] = dict(name="Seaside", lat=36.6, lon=-121.9, adv_ts=now, last_advert=now - 100)
+        m = mr.Member(member.pub)
+        m.last_heard = now - 200
+        r.members[member.pub] = m
+        r.names[member.pub[:8]] = (now - 300, "Dana")
+        r.names[named.pub[:8]] = (now - 400, "Eve")
+        r.names[a.pub[:8]] = (now, "Alice")                                   # (known in full: not listed twice)
+        rows = self.h.run_client(lambda: c.nodes(days=30))
+        by = {x["pub"]: x for x in rows}
+        self.assertEqual((by[rpt.pub.hex()]["type"], by[rpt.pub.hex()]["name"], by[rpt.pub.hex()]["lat"]), ("repeater", "Seaside", 36.6))
+        self.assertEqual((by[member.pub.hex()]["type"], by[member.pub.hex()]["name"]), ("chat", "Dana"))
+        self.assertEqual(by[named.pub[:8].hex()], {"pub": named.pub[:8].hex(), "partial": True, "type": "chat", "name": "Eve",
+                                                   "lat": None, "lon": None, "last_heard": now - 400, "rf": None, "obs": None})
+        self.assertEqual(sum(1 for x in rows if x["pub"].startswith(a.pub[:8].hex())), 1)
+        self.assertIsNone(r.heard_on_rf(member.pub))                         # (listed, but not "heard" for logins)
         c.close()
 
 

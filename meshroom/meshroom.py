@@ -7741,19 +7741,50 @@ class KaasHub:
         conn.send_json({"type": "routes_result", "id": rid, "repeater": target.hex(), "name": name(target), "routes": rows})
 
     def nodes_answer(self, conn, days, limit, rid):
-        """nodes: the node directory, newest first: every node heard advertising in the last `days`, on this radio or
-        by an MQTT observer. For contact lists and maps."""
+        """nodes: everyone this server knows of, heard in the last `days`, newest first, for contact lists and maps. The
+        node directory (adverts heard here or by an MQTT observer), plus what the room already kept: the repeater map
+        and neighbours, room members (main and tenant rooms), the virtual companion's contacts, and the name cache.
+        The name cache holds only the first 8 bytes of a key: those come as "partial", with that much of the key."""
+        r = self.room
         since = now_s() - days * 86400
-        rows = []
-        for pub, n in self.room.nodes.items():
-            last = max(n["rf"] or 0, n["obs"] or 0)
-            if last >= since:
-                rows.append((last, pub, n))
-        rows.sort(key=lambda x: -x[0])
         types = {ADV_TYPE_CHAT: "chat", ADV_TYPE_REPEATER: "repeater", ADV_TYPE_ROOM: "room", ADV_TYPE_SENSOR: "sensor"}
-        conn.send_json({"type": "nodes_result", "id": rid, "nodes": [
-            {"pub": pub.hex(), "type": types.get(n["type"], n["type"]), "name": n["name"], "lat": n["lat"], "lon": n["lon"],
-             "last_heard": last, "rf": n["rf"], "obs": n["obs"]} for last, pub, n in rows[:limit]]})
+        found = {}                                          # pub -> row; a later source only fills in what's missing
+
+        def add(pub, kind, name, last, lat=None, lon=None, rf=None, obs=None):
+            pub = bytes(pub)
+            if len(pub) != PUB_KEY_SIZE or pub in self.own_keys():
+                return
+            row = found.get(pub)
+            if row is None:
+                row = found[pub] = {"pub": pub.hex(), "type": kind, "name": "", "lat": None, "lon": None,
+                                    "last_heard": 0, "rf": rf, "obs": obs}
+            row["name"] = row["name"] or name or ""
+            if row["lat"] is None and lat is not None and (lat or lon):
+                row["lat"], row["lon"] = lat, lon
+            row["last_heard"] = max(row["last_heard"], int(last or 0))
+
+        for pub, n in list(r.nodes.items()):
+            add(pub, types.get(n["type"], n["type"]), n["name"], max(n["rf"] or 0, n["obs"] or 0), n["lat"], n["lon"],
+                n["rf"], n["obs"])
+        for pub, x in list(r.repeaters.items()):
+            add(pub, "repeater", x.get("name"), x.get("last_advert"), x.get("lat"), x.get("lon"))
+        for pub, x in list(r.neighbours.items()):
+            add(pub, "repeater", x.get("name"), x.get("heard"))
+        for room in [r] + list(r.tenants.values()):
+            for pub, m in list(room.members.items()):
+                nm = r.names.get(pub[:8])
+                add(pub, "chat", nm[1] if nm else "", max(m.last_heard or 0, m.last_activity or 0))
+        if r.vc is not None:
+            for pub, c in list(r.vc.contacts.items()):
+                add(pub, types.get(c.type, "chat"), c.name, c.lastmod or c.adv_ts,
+                    c.lat / 1e6 if c.lat else None, c.lon / 1e6 if c.lon else None)
+        prefixes = {pub[:8] for pub in found}
+        partial = [{"pub": k8.hex(), "partial": True, "type": "chat", "name": name, "lat": None, "lon": None,
+                    "last_heard": int(ts or 0), "rf": None, "obs": None}
+                   for k8, (ts, name) in list(r.names.items()) if k8 not in prefixes and name]
+        rows = [x for x in list(found.values()) + partial if x["last_heard"] >= since]
+        rows.sort(key=lambda x: -x["last_heard"])
+        conn.send_json({"type": "nodes_result", "id": rid, "nodes": rows[:limit]})
 
     def route(self, conn, ends, limit, rid, name):
         """route: suggested repeater chains from one node (or repeater) to another, through the links the room

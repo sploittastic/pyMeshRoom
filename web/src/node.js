@@ -41,12 +41,22 @@ export class MeshNode extends EventTarget {
 
   // The contact for a public key, added if new. {pub, pubHex, name, type: "chat" | "repeater" | "room" | "sensor",
   // lat, lon, lastHeard (s), lastAdvert (advert ts), outPath, outLen (null: flood), room: {syncSince, loggedIn, ...}}
+  // A "partial" contact is known by the first 8 bytes of its key only (the server's name cache): listed and mentioned,
+  // but no DM until its full key turns up, which replaces it.
   contact(pubHex, fields = {}) {
     pubHex = pubHex.toLowerCase();
     let c = this.contacts.get(pubHex);
     if (!c) {
+      const partial = pubHex.length === 16;
+      if (!partial) {
+        const stub = this.contacts.get(pubHex.slice(0, 16));
+        if (stub?.partial) {
+          this.contacts.delete(stub.pubHex);
+          fields = { name: stub.name, lastHeard: stub.lastHeard, ...fields };
+        }
+      }
       c = { pub: hexToBytes(pubHex), pubHex, name: "", type: "chat", lat: null, lon: null, lastHeard: null,
-        lastAdvert: null, outPath: new Uint8Array(0), outLen: null, room: null };
+        lastAdvert: null, outPath: new Uint8Array(0), outLen: null, room: null, partial };
       this.contacts.set(pubHex, c);
     }
     for (const [k, v] of Object.entries(fields)) if (v !== undefined && v !== null && v !== "") c[k] = v;
@@ -56,8 +66,12 @@ export class MeshNode extends EventTarget {
   // The server's node directory (KaaS "nodes"): fills in names, types, positions and when each was last heard.
   mergeDirectory(rows) {
     for (const r of rows || []) {
-      if (!/^[0-9a-f]{64}$/i.test(r.pub) || r.pub.toLowerCase() === this.id.pubHex) continue;
-      const c = this.contact(r.pub);
+      const pub = String(r.pub || "").toLowerCase();
+      if (pub === this.id.pubHex || pub === this.id.pubHex.slice(0, 16)) continue;
+      if (r.partial) {
+        if (!/^[0-9a-f]{16}$/.test(pub) || [...this.contacts.keys()].some((k) => k.length === 64 && k.startsWith(pub))) continue;
+      } else if (!/^[0-9a-f]{64}$/.test(pub)) continue;
+      const c = this.contact(pub);
       if (!c.lastHeard || (r.last_heard || 0) >= c.lastHeard) {
         Object.assign(c, { type: typeof r.type === "string" ? r.type : TYPE_NAMES[r.type] || c.type, lastHeard: r.last_heard });
         if (r.name) c.name = r.name;
@@ -217,7 +231,7 @@ export class MeshNode extends EventTarget {
     const p = pkt.payload;
     if (p.length <= 4 || p[0] !== this.id.pub[0]) return;
     for (const c of this.contacts.values()) {
-      if (c.pub[0] !== p[1]) continue;
+      if (c.partial || c.pub[0] !== p[1]) continue;
       const data = macThenDecrypt(this.id.sharedSecret(c.pub), p.subarray(2));
       if (!data) continue;
       if (pkt.ptype === PT_PATH) this.rxPath(pkt, c, data);

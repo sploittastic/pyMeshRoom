@@ -19,7 +19,7 @@ import { seal, unseal } from "./vault.js";
 const HISTORY_PER_CONVERSATION = 300;
 const SEEN_MAX = 4096;
 const DIRECTORY_EVERY_MS = 15 * 60 * 1000;     // the server's node directory, refreshed this often
-const DIRECTORY_DAYS = 7;
+const DIRECTORY_DAYS = 30;
 const REACTION_WINDOW_MS = 48 * 3600 * 1000;   // a reaction is matched against messages this recent
 const $ = (id) => document.getElementById(id);
 
@@ -1030,12 +1030,14 @@ function renderContacts() {
 
 function contactRow(c) {
   const acts = [];
-  if (c.type === "chat") acts.push(el("button", { type: "button", class: "primary", onclick: () => { $("dlg-contacts").close(); openDm(c); } }, "Message"));
+  if (c.type === "chat" && !c.partial) acts.push(el("button", { type: "button", class: "primary", onclick: () => { $("dlg-contacts").close(); openDm(c); } }, "Message"));
   if (c.type === "room") acts.push(el("button", { type: "button", class: "primary", onclick: () => { $("dlg-contacts").close(); openRoom(c); } }, c.room ? "Open" : "Join"));
   if (c.lat != null) acts.push(el("button", { type: "button", class: "ghost", onclick: () => { $("dlg-contacts").close(); openMap(c); } }, "Map"));
   return el("div", { class: "contact" },
     el("div", { class: "who" }, el("b", {}, contactName(c)),
-      el("span", { class: "mono" }, c.pubHex.slice(0, 8)), el("span", {}, " · heard " + ago(c.lastHeard))),
+      el("span", { class: "mono" }, c.pubHex.slice(0, 8)), el("span", {}, " · heard " + ago(c.lastHeard)),
+      c.partial ? el("span", { title: "The server knows only part of this key. You can message them once their app adverts within range." },
+        " · can't DM yet") : null),
     el("div", { class: "acts" }, ...acts));
 }
 

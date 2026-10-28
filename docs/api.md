@@ -273,8 +273,14 @@ strongest scores 1, one with a quarter of that traffic 0.5. A link seen only onc
 at half, and every hop costs 5%, so shorter routes win ties. Routes use 2-byte ids, at most 10 hops. This radio is a hop only while its
 virtual repeater relays. A node with no recent location (it hasn't flood-adverted lately) is an error, and so is an
 unknown name. An empty list means no chain of seen links joins the two ends.
-**nodes**: the server's directory of nodes: every one heard advertising in the last `days` (default 7, at most 365),
-by this radio or by an MQTT observer, most recently heard first, at most 2000. For contact lists and maps.
+**nodes**: everyone this server knows of, heard in the last `days` (default 7, at most 365), most recently heard first,
+at most 2000. For contact lists and maps. It merges these sources:
+
+* the node directory: adverts heard by this radio or by an MQTT observer;
+* what the room kept before: the repeater map and neighbours, the members of the room and of tenant rooms, and the
+  virtual companion's contacts;
+* the name cache, which holds only the first 8 bytes of a key. Those come with `"partial": true`, a 16-hex-character
+  `pub`, and no position. They can be shown and mentioned, but not sent a DM until their full key is known.
 
 ```json
 {"type": "nodes", "id": "q4", "days": 7}
@@ -282,8 +288,9 @@ by this radio or by an MQTT observer, most recently heard first, at most 2000. F
  "lon": -121.9, "last_heard": 1760313600, "rf": 1760313600, "obs": null}]}
 ```
 
-`type` is `chat`, `repeater`, `room` or `sensor`. `rf` and `obs` say when this radio, or an observer, last heard it.
-Name and position come from its newest signed advert.
+`type` is `chat`, `repeater`, `room` or `sensor`. For directory entries, `rf` and `obs` say when this radio, or an
+observer, last heard it; name and position come from its newest signed advert. Only the directory's `rf` counts as
+"heard on the air" for web logins.
 
 Bad input gets `{"type": "error", "id": ..., "error": ...}`. Questions share the 4-at-a-time limit with sends.
 

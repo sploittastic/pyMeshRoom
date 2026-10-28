@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'sha256-36XTyex0vUI5tTiBCHkYJdIbCYECr3o22jq6/aPEYjw=' 'self' https://unpkg.com/leaflet@1.9.4/dist/leaflet.js; style-src 'sha256-MR/U7r6289lDmFT6czlrddrwJEDJYjKykxOcVDnLLVI=' 'self' https://unpkg.com/leaflet@1.9.4/dist/leaflet.css; img-src 'self' data: https://media.giphy.com https://i.giphy.com https://*.tile.openstreetmap.org https://unpkg.com/leaflet@1.9.4/dist/images/; connect-src https: wss: http: ws:; base-uri 'none'; form-action 'none'">
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'sha256-V4ZRMVz388pMU0PWMwAm5/WqR+pSvRwu1euwj5bk8V8=' 'self' https://unpkg.com/leaflet@1.9.4/dist/leaflet.js; style-src 'sha256-MR/U7r6289lDmFT6czlrddrwJEDJYjKykxOcVDnLLVI=' 'self' https://unpkg.com/leaflet@1.9.4/dist/leaflet.css; img-src 'self' data: https://media.giphy.com https://i.giphy.com https://*.tile.openstreetmap.org https://unpkg.com/leaflet@1.9.4/dist/images/; connect-src https: wss: http: ws:; base-uri 'none'; form-action 'none'">
 <meta name="referrer" content="no-referrer">
 <title>MeshCore Web</title>
 <style>:root {
@@ -1605,12 +1605,22 @@ class MeshNode extends EventTarget {
 
   // The contact for a public key, added if new. {pub, pubHex, name, type: "chat" | "repeater" | "room" | "sensor",
   // lat, lon, lastHeard (s), lastAdvert (advert ts), outPath, outLen (null: flood), room: {syncSince, loggedIn, ...}}
+  // A "partial" contact is known by the first 8 bytes of its key only (the server's name cache): listed and mentioned,
+  // but no DM until its full key turns up, which replaces it.
   contact(pubHex, fields = {}) {
     pubHex = pubHex.toLowerCase();
     let c = this.contacts.get(pubHex);
     if (!c) {
+      const partial = pubHex.length === 16;
+      if (!partial) {
+        const stub = this.contacts.get(pubHex.slice(0, 16));
+        if (stub?.partial) {
+          this.contacts.delete(stub.pubHex);
+          fields = { name: stub.name, lastHeard: stub.lastHeard, ...fields };
+        }
+      }
       c = { pub: hexToBytes(pubHex), pubHex, name: "", type: "chat", lat: null, lon: null, lastHeard: null,
-        lastAdvert: null, outPath: new Uint8Array(0), outLen: null, room: null };
+        lastAdvert: null, outPath: new Uint8Array(0), outLen: null, room: null, partial };
       this.contacts.set(pubHex, c);
     }
     for (const [k, v] of Object.entries(fields)) if (v !== undefined && v !== null && v !== "") c[k] = v;
@@ -1620,8 +1630,12 @@ class MeshNode extends EventTarget {
   // The server's node directory (KaaS "nodes"): fills in names, types, positions and when each was last heard.
   mergeDirectory(rows) {
     for (const r of rows || []) {
-      if (!/^[0-9a-f]{64}$/i.test(r.pub) || r.pub.toLowerCase() === this.id.pubHex) continue;
-      const c = this.contact(r.pub);
+      const pub = String(r.pub || "").toLowerCase();
+      if (pub === this.id.pubHex || pub === this.id.pubHex.slice(0, 16)) continue;
+      if (r.partial) {
+        if (!/^[0-9a-f]{16}$/.test(pub) || [...this.contacts.keys()].some((k) => k.length === 64 && k.startsWith(pub))) continue;
+      } else if (!/^[0-9a-f]{64}$/.test(pub)) continue;
+      const c = this.contact(pub);
       if (!c.lastHeard || (r.last_heard || 0) >= c.lastHeard) {
         Object.assign(c, { type: typeof r.type === "string" ? r.type : TYPE_NAMES[r.type] || c.type, lastHeard: r.last_heard });
         if (r.name) c.name = r.name;
@@ -1781,7 +1795,7 @@ class MeshNode extends EventTarget {
     const p = pkt.payload;
     if (p.length <= 4 || p[0] !== this.id.pub[0]) return;
     for (const c of this.contacts.values()) {
-      if (c.pub[0] !== p[1]) continue;
+      if (c.partial || c.pub[0] !== p[1]) continue;
       const data = macThenDecrypt(this.id.sharedSecret(c.pub), p.subarray(2));
       if (!data) continue;
       if (pkt.ptype === PT_PATH) this.rxPath(pkt, c, data);
@@ -1915,7 +1929,7 @@ const { seal, unseal } = __src_vault_js;
 const HISTORY_PER_CONVERSATION = 300;
 const SEEN_MAX = 4096;
 const DIRECTORY_EVERY_MS = 15 * 60 * 1000;     // the server's node directory, refreshed this often
-const DIRECTORY_DAYS = 7;
+const DIRECTORY_DAYS = 30;
 const REACTION_WINDOW_MS = 48 * 3600 * 1000;   // a reaction is matched against messages this recent
 const $ = (id) => document.getElementById(id);
 
@@ -2926,12 +2940,14 @@ function renderContacts() {
 
 function contactRow(c) {
   const acts = [];
-  if (c.type === "chat") acts.push(el("button", { type: "button", class: "primary", onclick: () => { $("dlg-contacts").close(); openDm(c); } }, "Message"));
+  if (c.type === "chat" && !c.partial) acts.push(el("button", { type: "button", class: "primary", onclick: () => { $("dlg-contacts").close(); openDm(c); } }, "Message"));
   if (c.type === "room") acts.push(el("button", { type: "button", class: "primary", onclick: () => { $("dlg-contacts").close(); openRoom(c); } }, c.room ? "Open" : "Join"));
   if (c.lat != null) acts.push(el("button", { type: "button", class: "ghost", onclick: () => { $("dlg-contacts").close(); openMap(c); } }, "Map"));
   return el("div", { class: "contact" },
     el("div", { class: "who" }, el("b", {}, contactName(c)),
-      el("span", { class: "mono" }, c.pubHex.slice(0, 8)), el("span", {}, " · heard " + ago(c.lastHeard))),
+      el("span", { class: "mono" }, c.pubHex.slice(0, 8)), el("span", {}, " · heard " + ago(c.lastHeard)),
+      c.partial ? el("span", { title: "The server knows only part of this key. You can message them once their app adverts within range." },
+        " · can't DM yet") : null),
     el("div", { class: "acts" }, ...acts));
 }
 

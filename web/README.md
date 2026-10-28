@@ -14,8 +14,13 @@ dashboard's port, and it reaches the mesh through that radio over the KaaS API. 
 * **Direct messages**, delivered and confirmed the way the MeshCore apps do it: retried until the other node ACKs,
   the last try by flood, and sent direct once a route is learned.
 * **Rooms**: log in with the room's password, read the posts you missed, and post.
-* **Contacts and a map**: the people, rooms and repeaters the server has heard advertise in the last 7 days
-  (refreshed every 15 minutes), plus any advert heard while you're here. The map shows those that share a position.
+* **Contacts and a map**: everyone the server knows of from the last 30 days, refreshed every 15 minutes, plus any
+  advert heard while you're here.
+  * **Where they come from:** its node directory, repeater map, room members, its virtual companion's contacts and
+    its name cache.
+  * **Partial keys:** people known only from the name cache are listed and can be mentioned. They can't be sent a DM
+    until their app adverts within range, because the cache holds only part of each key.
+  * **The map** shows those that share a position.
 
 ## Logging in
 

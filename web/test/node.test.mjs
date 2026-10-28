@@ -136,3 +136,18 @@ test("room passwords are saved sealed with our private key; old plaintext ones s
   assert.equal(legacy.contacts.get(P.b_public).room.password, "old-plain");
   assert.equal(JSON.stringify(legacy.saveContacts()).includes("old-plain"), false);   // and sealed from then on
 });
+
+test("partial contacts (8-byte keys from the name cache): listed, never DMed, replaced by the full key", async () => {
+  const { advertPayload } = await import("../src/meshcore.js");
+  const alice = new MeshNode({ hello: {} }, new Identity(P.a_private), "Alice");
+  const bob = new Identity(P.b_private);
+  alice.mergeDirectory([{ pub: bob.pubHex.slice(0, 16), partial: true, type: "chat", name: "Bob", last_heard: 5 },
+    { pub: "cd".repeat(8), partial: true, type: "chat", name: "Eve", last_heard: 4 }]);
+  assert.equal(alice.contacts.get(bob.pubHex.slice(0, 16)).partial, true);
+  alice.handle(parsePacket(floodPacket(4, advertPayload(bob, "Bob", 300))));      // his advert: the full key
+  assert.equal(alice.contacts.has(bob.pubHex.slice(0, 16)), false);
+  assert.equal(alice.contacts.get(bob.pubHex).name, "Bob");
+  alice.mergeDirectory([{ pub: bob.pubHex.slice(0, 16), partial: true, type: "chat", name: "Bob", last_heard: 6 }]);
+  assert.equal(alice.contacts.has(bob.pubHex.slice(0, 16)), false);             // (not back as a stub)
+  assert.deepEqual([...alice.contacts.values()].map((c) => [c.name, c.partial]), [["Eve", true], ["Bob", false]]);
+});
