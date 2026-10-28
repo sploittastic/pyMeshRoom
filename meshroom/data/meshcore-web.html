@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover, interactive-widget=resizes-content">
-<meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'sha256-8UWOyQ+JSR/gN3Xatdz+8/y2dliCqOkIy+zdDXAs42s=' 'self' https://unpkg.com/leaflet@1.9.4/dist/leaflet.js; style-src 'sha256-H4R3hSzOToYncAmlANpU7VdX8Mx1SfSYzYInLvbD8Xs=' 'self' https://unpkg.com/leaflet@1.9.4/dist/leaflet.css; img-src 'self' data: https://media.giphy.com https://i.giphy.com https://tile.openstreetmap.org https://*.tile.openstreetmap.org https://unpkg.com/leaflet@1.9.4/dist/images/; connect-src https: wss: http: ws:; base-uri 'none'; form-action 'none'">
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'sha256-EzAXClCTnwqGjRcgHRICSG77l7YeaUm2ZlhlB6Y3Rfs=' 'self' https://unpkg.com/leaflet@1.9.4/dist/leaflet.js; style-src 'sha256-H4R3hSzOToYncAmlANpU7VdX8Mx1SfSYzYInLvbD8Xs=' 'self' https://unpkg.com/leaflet@1.9.4/dist/leaflet.css; img-src 'self' data: https://media.giphy.com https://i.giphy.com https://tile.openstreetmap.org https://*.tile.openstreetmap.org https://unpkg.com/leaflet@1.9.4/dist/images/; connect-src https: wss: http: ws:; base-uri 'none'; form-action 'none'">
 <meta name="referrer" content="no-referrer">
 <title>MeshCore Web</title>
 <style>:root {
@@ -1042,6 +1042,13 @@ const COLORS = { repeater: "#5cb3ff", room: "#c38bff", chat: "#4caf7a", sensor: 
 
 let loading = null;
 
+// A name as text (Leaflet puts a string tooltip in as HTML, and names come from adverts and servers).
+function textNode(text) {
+  const e = document.createElement("span");
+  e.textContent = text;
+  return e;
+}
+
 function load(tag, attrs) {
   return new Promise((resolve, reject) => {
     const e = document.createElement(tag);
@@ -1081,7 +1088,7 @@ async function showMap(box, nodes, { serverBase, center, popup }) {
   for (const n of placed) {
     L.circleMarker([n.lat, n.lon], {
       radius: n.type === "repeater" ? 7 : 6, color: "#0b1420", weight: 1, fillColor: COLORS[n.type] || COLORS.chat, fillOpacity: 0.9,
-    }).bindPopup(() => popup(n)).bindTooltip(n.name || n.pubHex.slice(0, 8)).addTo(layer);
+    }).bindPopup(() => popup(n)).bindTooltip(textNode(n.name || n.pubHex.slice(0, 8))).addTo(layer);
   }
   map.invalidateSize();
   if (center) map.setView([center.lat, center.lon], 12);
@@ -1312,13 +1319,23 @@ function decodePoint(b) {
   return [x, y, 1n, mod(x * y)];
 }
 
-// Checks [S]B == R + [h]A, h = SHA-512(R || A || msg). (Adverts: a forged one can't rename a contact.)
+// A key of small order: not a real node's (such a key "verifies" signatures nobody made, and its shared secret is
+// known to everyone). False for anything that isn't a point at all.
+function isWeakKey(pub) {
+  const A = pub.length === 32 ? decodePoint(pub) : null;
+  if (!A) return false;
+  const e = encodePoint(mulPoint(8n, A));
+  return e[0] === 1 && e.subarray(1).every((v) => v === 0);
+}
+
+// Checks [S]B == R + [h]A, h = SHA-512(R || A || msg). (Adverts: a forged one can't rename a contact.) A key of small
+// order never verifies.
 function ed25519Verify(pub, sig, msg) {
   if (pub.length !== 32 || sig.length !== 64) return false;
   const A = decodePoint(pub);
   const R = decodePoint(sig.subarray(0, 32));
   const S = bytesToBig(sig.subarray(32, 64));
-  if (!A || !R || S >= L) return false;
+  if (!A || !R || S >= L || isWeakKey(pub)) return false;
   const h = mod(bytesToBig(sha512(concatBytes(sig.subarray(0, 32), pub, msg))), L);
   const left = encodePoint(mulPoint(S, BASE));
   const right = encodePoint(add(R, mulPoint(h, A)));
@@ -1351,7 +1368,7 @@ function edPubToX25519(pub) {
   return bigToBytes(mod((1n + y) * inv(mod(1n - y))));
 }
 
-return { expandSeed, ed25519PublicKey, ed25519Sign, ed25519Verify, x25519, edPubToX25519 };
+return { expandSeed, ed25519PublicKey, ed25519Sign, isWeakKey, ed25519Verify, x25519, edPubToX25519 };
 })();
 
 // src/meshcore.js
@@ -1472,7 +1489,11 @@ class Identity {
     const k = bytesToHex(otherPub);
     this.secrets ||= new Map();
     let s = this.secrets.get(k);
-    if (!s) this.secrets.set(k, (s = x25519(this.privateKey.subarray(0, 32), edPubToX25519(otherPub))));
+    if (!s) {
+      s = x25519(this.privateKey.subarray(0, 32), edPubToX25519(otherPub));
+      if (s.every((v) => v === 0)) throw new Error("that key can't be used (a weak key: anyone could read its messages)");
+      this.secrets.set(k, s);
+    }
     return s;
   }
 }
@@ -1591,11 +1612,22 @@ return { ROUTE_TRANSPORT_FLOOD, ROUTE_FLOOD, ROUTE_DIRECT, ROUTE_TRANSPORT_DIREC
 const __src_vault_js = (() => {
 // Sealing what this browser saves. The private key, with a passphrase: PBKDF2-HMAC-SHA256 makes the keys. Room
 // passwords, with the private key itself: only someone holding it can read them. Either way AES-128-CTR hides the data
-// and HMAC-SHA256 checks it. Plain JS, like the rest: WebCrypto exists only on secure origins.
+// and HMAC-SHA256 checks it. Plain JS, like the rest (WebCrypto exists only on secure origins), except the
+// passphrase's PBKDF2: WebCrypto's where there is one (many more rounds in the same time), plain JS where not.
 const { aesEncryptBlock, aesExpandKey } = __src_aes_js;
 const { bytesToHex, concatBytes, equalBytes, hexToBytes, randomBytes, u32le, utf8Decode, utf8Encode } = __src_bytes_js;
 const { hmacSha256 } = __src_hash_js;
-const ROUNDS = 50000;                     // about a second in a browser: slow for guessing, fine for logging in
+const ROUNDS = 50000;                     // plain JS: about a second in a browser, slow for guessing, fine for logging in
+const ROUNDS_WEBCRYPTO = 600000;          // WebCrypto: OWASP's figure for PBKDF2-HMAC-SHA256, well under a second
+const subtle = () => (typeof crypto !== "undefined" && crypto.subtle) || null;
+
+// pbkdf2(), by WebCrypto when the page has it.
+async function pbkdf2Fast(password, salt, rounds, length) {
+  const s = subtle();
+  if (!s) return pbkdf2(password, salt, rounds, length);
+  const key = await s.importKey("raw", password, "PBKDF2", false, ["deriveBits"]);
+  return new Uint8Array(await s.deriveBits({ name: "PBKDF2", hash: "SHA-256", salt, iterations: rounds }, key, length * 8));
+}
 
 function pbkdf2(password, salt, rounds, length = 32) {
   const out = new Uint8Array(length);
@@ -1622,8 +1654,8 @@ function ctr(key16, iv, data) {
   return out;
 }
 
-function keys(passphrase, salt, rounds) {
-  const k = pbkdf2(utf8Encode(passphrase), salt, rounds, 48);
+async function keys(passphrase, salt, rounds) {
+  const k = await pbkdf2Fast(utf8Encode(passphrase), salt, rounds, 48);
   return { enc: k.subarray(0, 16), mac: k.subarray(16, 48) };
 }
 
@@ -1640,17 +1672,17 @@ function unsealWith(k, box, salt) {
   return ctr(k.enc, iv, data);
 }
 
-// -> {v: 1, rounds, salt, iv, data, mac} (hex), for localStorage
-function seal(secret, passphrase) {
-  const salt = randomBytes(16);
-  return { v: 1, rounds: ROUNDS, salt: bytesToHex(salt), ...sealWith(keys(passphrase, salt, ROUNDS), secret, salt) };
+// -> (a promise of) {v: 1, rounds, salt, iv, data, mac} (hex), for localStorage. The rounds are kept with it.
+async function seal(secret, passphrase) {
+  const salt = randomBytes(16), rounds = subtle() ? ROUNDS_WEBCRYPTO : ROUNDS;
+  return { v: 1, rounds, salt: bytesToHex(salt), ...sealWith(await keys(passphrase, salt, rounds), secret, salt) };
 }
 
-// The secret, or null for a wrong passphrase (or a damaged record).
-function unseal(box, passphrase) {
+// (A promise of) the secret, or null for a wrong passphrase (or a damaged record).
+async function unseal(box, passphrase) {
   try {
     const salt = hexToBytes(box.salt);
-    return unsealWith(keys(passphrase, salt, Math.min(Math.max(box.rounds | 0, 1000), 1000000)), box, salt);
+    return unsealWith(await keys(passphrase, salt, Math.min(Math.max(box.rounds | 0, 1000), 1000000)), box, salt);
   } catch {
     return null;
   }
@@ -1685,6 +1717,7 @@ const __src_node_js = (() => {
 // pyMeshRoom); all the crypto happens here, so the server only ever sees encrypted packets.
 const { bytesToHex, concatBytes, equalBytes, hexToBytes, randomBytes, u32le, utf8Cut, utf8Decode, utf8Encode } = __src_bytes_js;
 const { sha256 } = __src_hash_js;
+const { isWeakKey } = __src_ed25519_js;
 const { keySealer } = __src_vault_js;
 const { ADV_TYPE_CHAT, ADV_TYPE_REPEATER, ADV_TYPE_ROOM, ADV_TYPE_SENSOR, MAX_TEXT_LEN, PT_ACK, PT_ADVERT, PT_ANON_REQ, PT_MULTIPART, PT_PATH, PT_RESPONSE, PT_TXT_MSG, TXT_TYPE_PLAIN, TXT_TYPE_SIGNED_PLAIN, directPacket, encryptThenMac, floodPacket, macThenDecrypt, parsePacket, pathBytes, pathValid, readAdvert } = __src_meshcore_js;
 const MAX_ROOM_POST_LEN = 151;       // a room keeps 9 bytes of each post for the author and timestamp
@@ -1747,7 +1780,7 @@ class MeshNode extends EventTarget {
       if (pub === this.id.pubHex || pub === this.id.pubHex.slice(0, 16)) continue;
       if (r.partial) {
         if (!/^[0-9a-f]{16}$/.test(pub) || [...this.contacts.keys()].some((k) => k.length === 64 && k.startsWith(pub))) continue;
-      } else if (!/^[0-9a-f]{64}$/.test(pub)) continue;
+      } else if (!/^[0-9a-f]{64}$/.test(pub) || isWeakKey(hexToBytes(pub))) continue;
       const c = this.contact(pub);
       if (!c.lastHeard || (r.last_heard || 0) >= c.lastHeard) {
         Object.assign(c, { type: typeof r.type === "string" ? r.type : TYPE_NAMES[r.type] || c.type, lastHeard: r.last_heard });
@@ -1920,7 +1953,13 @@ class MeshNode extends EventTarget {
     if (p.length <= 4 || p[0] !== this.id.pub[0]) return;
     for (const c of this.contacts.values()) {
       if (c.partial || c.pub[0] !== p[1]) continue;
-      const data = macThenDecrypt(this.id.sharedSecret(c.pub), p.subarray(2));
+      let secret;
+      try {
+        secret = this.id.sharedSecret(c.pub);
+      } catch {
+        continue;                                         // (a weak key: never a real node)
+      }
+      const data = macThenDecrypt(secret, p.subarray(2));
       if (!data) continue;
       if (pkt.ptype === PT_PATH) this.rxPath(pkt, c, data);
       else if (pkt.ptype === PT_TXT_MSG) this.rxTxt(pkt, c, data);
@@ -2229,7 +2268,7 @@ async function login(ev) {
     go.disabled = true;
     go.textContent = "Unlocking…";
     await new Promise((r) => setTimeout(r, 20));        // (let the button repaint: unlocking takes about a second)
-    const opened = unseal(s.vault || {}, $("f-unlock").value);
+    const opened = await unseal(s.vault || {}, $("f-unlock").value);
     go.disabled = false;
     go.textContent = "Connect";
     if (!opened) return showError("login-error", "That passphrase doesn't unlock the saved key.");
@@ -2253,7 +2292,7 @@ async function login(ev) {
   else if ($("f-pass").value) {
     go.textContent = "Saving…";
     await new Promise((r) => setTimeout(r, 20));
-    saveSettings({ ...prefs, vault: seal(utf8Encode(JSON.stringify({ privateKey: identity.privateHex, pagePassword })), $("f-pass").value) });
+    saveSettings({ ...prefs, vault: await seal(utf8Encode(JSON.stringify({ privateKey: identity.privateHex, pagePassword })), $("f-pass").value) });
   } else saveSettings({ ...prefs, pagePassword: pagePassword || undefined, privateKey: identity.privateHex });
 
   go.disabled = true;

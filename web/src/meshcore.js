@@ -118,7 +118,11 @@ export class Identity {
     const k = bytesToHex(otherPub);
     this.secrets ||= new Map();
     let s = this.secrets.get(k);
-    if (!s) this.secrets.set(k, (s = x25519(this.privateKey.subarray(0, 32), edPubToX25519(otherPub))));
+    if (!s) {
+      s = x25519(this.privateKey.subarray(0, 32), edPubToX25519(otherPub));
+      if (s.every((v) => v === 0)) throw new Error("that key can't be used (a weak key: anyone could read its messages)");
+      this.secrets.set(k, s);
+    }
     return s;
   }
 }

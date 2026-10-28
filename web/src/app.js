@@ -181,7 +181,7 @@ async function login(ev) {
     go.disabled = true;
     go.textContent = "Unlocking…";
     await new Promise((r) => setTimeout(r, 20));        // (let the button repaint: unlocking takes about a second)
-    const opened = unseal(s.vault || {}, $("f-unlock").value);
+    const opened = await unseal(s.vault || {}, $("f-unlock").value);
     go.disabled = false;
     go.textContent = "Connect";
     if (!opened) return showError("login-error", "That passphrase doesn't unlock the saved key.");
@@ -205,7 +205,7 @@ async function login(ev) {
   else if ($("f-pass").value) {
     go.textContent = "Saving…";
     await new Promise((r) => setTimeout(r, 20));
-    saveSettings({ ...prefs, vault: seal(utf8Encode(JSON.stringify({ privateKey: identity.privateHex, pagePassword })), $("f-pass").value) });
+    saveSettings({ ...prefs, vault: await seal(utf8Encode(JSON.stringify({ privateKey: identity.privateHex, pagePassword })), $("f-pass").value) });
   } else saveSettings({ ...prefs, pagePassword: pagePassword || undefined, privateKey: identity.privateHex });
 
   go.disabled = true;

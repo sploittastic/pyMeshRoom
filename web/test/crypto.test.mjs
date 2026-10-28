@@ -71,3 +71,16 @@ test("text is cut to fit, never mid-character", () => {
   assert.equal(msg.text, "é".repeat((budget - 1) / 2));
   assert.equal(utf8Cut(utf8Encode("aé"), 2).length, 1);
 });
+
+test("keys of small order: they never verify, and can't be talked to", async () => {
+  const { ed25519Verify, isWeakKey } = await import("../src/ed25519.js");
+  const { Identity } = await import("../src/meshcore.js");
+  const identity = hexToBytes("01" + "00".repeat(31));                  // the identity point: [8]A is itself
+  const order2 = hexToBytes("ec" + "ff".repeat(30) + "7f");              // (0, -1)
+  assert.equal(isWeakKey(identity) && isWeakKey(order2), true);
+  // R = the identity point, S = 0: [S]B = R + [h]A for any message, when A is the identity too
+  assert.equal(ed25519Verify(identity, hexToBytes("01" + "00".repeat(63)), utf8Encode("anything at all")), false);
+  const me = new Identity(bytesToHex(new Uint8Array(32).fill(7)));
+  assert.equal(isWeakKey(me.pub), false);
+  assert.throws(() => me.sharedSecret(identity), /weak key/);
+});

@@ -464,7 +464,8 @@ def main(argv=None):
     ap.add_argument("--sf", type=int)
     ap.add_argument("--cr", type=int)
     ap.add_argument("--tx-power", type=int, help="dBm (default: the config's, else the modem's own)")
-    ap.add_argument("--host", default="0.0.0.0", help="web UI address (default all interfaces)")
+    ap.add_argument("--host", default="127.0.0.1", help="web UI address (default this machine only: the UI has no "
+                    "login and makes the radio transmit; 0.0.0.0 for every interface)")
     ap.add_argument("--port", type=int, default=8095, help="web UI port (default 8095)")
     ap.add_argument("--discover-minutes", type=float, default=DISCOVER_S / 60.0)
     ap.add_argument("--rounds", type=int, default=ROUNDS)

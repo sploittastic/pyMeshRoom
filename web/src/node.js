@@ -3,6 +3,7 @@
 // pyMeshRoom); all the crypto happens here, so the server only ever sees encrypted packets.
 import { bytesToHex, concatBytes, equalBytes, hexToBytes, randomBytes, u32le, utf8Cut, utf8Decode, utf8Encode } from "./bytes.js";
 import { sha256 } from "./hash.js";
+import { isWeakKey } from "./ed25519.js";
 import { keySealer } from "./vault.js";
 import {
   ADV_TYPE_CHAT, ADV_TYPE_REPEATER, ADV_TYPE_ROOM, ADV_TYPE_SENSOR, MAX_TEXT_LEN, PT_ACK, PT_ADVERT, PT_ANON_REQ,
@@ -70,7 +71,7 @@ export class MeshNode extends EventTarget {
       if (pub === this.id.pubHex || pub === this.id.pubHex.slice(0, 16)) continue;
       if (r.partial) {
         if (!/^[0-9a-f]{16}$/.test(pub) || [...this.contacts.keys()].some((k) => k.length === 64 && k.startsWith(pub))) continue;
-      } else if (!/^[0-9a-f]{64}$/.test(pub)) continue;
+      } else if (!/^[0-9a-f]{64}$/.test(pub) || isWeakKey(hexToBytes(pub))) continue;
       const c = this.contact(pub);
       if (!c.lastHeard || (r.last_heard || 0) >= c.lastHeard) {
         Object.assign(c, { type: typeof r.type === "string" ? r.type : TYPE_NAMES[r.type] || c.type, lastHeard: r.last_heard });
@@ -243,7 +244,13 @@ export class MeshNode extends EventTarget {
     if (p.length <= 4 || p[0] !== this.id.pub[0]) return;
     for (const c of this.contacts.values()) {
       if (c.partial || c.pub[0] !== p[1]) continue;
-      const data = macThenDecrypt(this.id.sharedSecret(c.pub), p.subarray(2));
+      let secret;
+      try {
+        secret = this.id.sharedSecret(c.pub);
+      } catch {
+        continue;                                         // (a weak key: never a real node)
+      }
+      const data = macThenDecrypt(secret, p.subarray(2));
       if (!data) continue;
       if (pkt.ptype === PT_PATH) this.rxPath(pkt, c, data);
       else if (pkt.ptype === PT_TXT_MSG) this.rxTxt(pkt, c, data);

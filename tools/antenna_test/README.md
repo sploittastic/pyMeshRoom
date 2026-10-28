@@ -33,7 +33,7 @@ sudo systemctl stop meshroom          # or scripts/stop-pymeshroom.sh
 .venv/bin/python tools/antenna_test/antenna_test.py      # or python3, with pyserial and cryptography installed
 ```
 
-Then open `http://<pi address>:8095/` and press **Start**. Start the room again when you are done.
+Then open `http://localhost:8095/` on the Pi (or through an SSH tunnel: `ssh -L 8095:localhost:8095 pi@<pi address>`, then the same address on your computer) and press **Start**. To open it from another machine directly, add `--host 0.0.0.0`: anyone on the network can then start a test. Start the room again when you are done.
 
 By default the serial port and radio settings (frequency, bandwidth, SF, CR, TX power) come from the room's
 `meshroom/meshroom.json`. Any of them can be overridden:
@@ -42,7 +42,7 @@ By default the serial port and radio settings (frequency, bandwidth, SF, CR, TX 
 python3 tools/antenna_test/antenna_test.py --serial /dev/ttyUSB0 --freq 910.525 --bw 62.5 --sf 7 --cr 5 --tx-power 22
 ```
 
-Other options: `--port` (web UI, default 8095), `--host` (default all interfaces), `--discover-minutes` (10),
+Other options: `--port` (web UI, default 8095), `--host` (default `127.0.0.1`, this machine only: the UI has no login and makes the radio transmit; `0.0.0.0` to reach it from the network), `--discover-minutes` (10),
 `--rounds` (20), `--interval` (10 s between rounds), `--trace-timeout` (5 s), `--results-dir`.
 
 The web page has no password: anyone who can reach the port can start a test.

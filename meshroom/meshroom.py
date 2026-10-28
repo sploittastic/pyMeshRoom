@@ -104,7 +104,8 @@ DEFAULT_CONFIG = {
     "trace_min_interval_s": 120,    # ... but never more often than this
     "extra_acks": 1,                # ACKs for posts: 1 = send a second ACK (on a 2nd confident route if there is one), 0 = single
     "mqtt_enabled": False,          # MQTT augmentation: also listen to the observer network (RF stays the fallback)
-    "mqtt_ack_ingest": True,        #   ACK ingestion: observers' ACKs confirm deliveries (no route credit)
+    "mqtt_ack_ingest": False,       #   ACK ingestion: observers' ACKs confirm deliveries (no route credit). Off by
+                                    #   default: anyone who can publish to the feed could mark a post delivered
     "mqtt_msg_ingest": True,        #   message ingestion: posts to the room captured by observers
     "mqtt_topo_ingest": True,       #   topology ingestion: links + SNR between repeaters we already know (never routes)
     "mqtt_advert_ingest": True,     #   advert ingestion: names, positions, where companions are (half weight)
@@ -201,6 +202,7 @@ HTTP_TIMEOUT_S = 30                   # a dashboard / API connection idle (or tr
 HTTP_MAX_BODY = 64 * 1024             # a request body larger than this is refused (413)
 FAIL_LIMIT = 20                       # wrong passwords / keys / tickets from one address within FAIL_WINDOW_S...
 FAIL_WINDOW_S = 600                   # ...and its POSTs and websockets get 429 until the oldest is this old
+CROSS_SITE_POSTS = {"/api/v1/web/challenge", "/api/v1/web/login", "/api/v1/web/ticket"}   # (CORS: any origin)
 HTTP_MAX_THREADS = 400                # connections beyond this many threads in the process are closed at once
 
 REPEATERS_MAX = 2000                  # repeaters known by key (heard, or from MQTT): beyond it the longest silent go
@@ -1289,6 +1291,7 @@ class RoomServer:
         self.next_discovery = time.monotonic() + 60        # first one a minute after start
         self.disc_due_since = 0.0
         self.posts = []                   # [(ts, author32, text)], oldest first
+        self.login_fails = {}             # member key -> recent wrong passwords (monotonic): see login_failed
         self.max_issued = 0
         self.names = {}                   # key8 -> (ts, name)
         self.neighbours = {}              # pubkey -> dict(advert_ts, heard, snr4, name)
@@ -1818,15 +1821,18 @@ class RoomServer:
                 self.member_active(m, pkt)
                 self.mark_dirty()
         if m is None:
+            if self.login_blocked(sender):
+                return                                      # too many wrong passwords from this key lately: no answer
             # An empty admin password disables RF admin access; without this
             # guard, a blank login would accidentally become an admin login.
-            if self.cfg.admin_password and password == self.cfg.admin_password:
+            if self.cfg.admin_password and same_text(password, self.cfg.admin_password):
                 perm = PERM_ADMIN
-            elif password == self.cfg.room_password:
+            elif same_text(password, self.cfg.room_password):
                 perm = PERM_READ_WRITE
             elif self.cfg.allow_read_only:
                 perm = PERM_GUEST
             else:
+                self.login_failed(sender)
                 return                                      # no response: client times out
             m = self.members.get(sender) or self.put_member(sender)
             if sender_ts <= m.last_timestamp:
@@ -1862,6 +1868,22 @@ class RoomServer:
             self.send_flood(pr, SERVER_RESPONSE_DELAY, pkt.hash_size)
         else:
             self.send_to(m, self.make_datagram(PT_RESPONSE, sender, secret, reply), SERVER_RESPONSE_DELAY, pkt)
+
+    def login_blocked(self, pub):
+        q = self.login_fails.get(pub)
+        now = time.monotonic()
+        while q and now - q[0] >= ROOM_LOGIN_FAIL_WINDOW_S:
+            q.popleft()
+        return bool(q) and len(q) >= ROOM_LOGIN_FAILS
+
+    def login_failed(self, pub):
+        """A wrong room / admin password from this key: after ROOM_LOGIN_FAILS in ROOM_LOGIN_FAIL_WINDOW_S, its logins
+        go unanswered until they age (a key is free to make, but each try costs airtime, or a web key's send budget)."""
+        self.login_fails.setdefault(pub, collections.deque(maxlen=ROOM_LOGIN_FAILS)).append(time.monotonic())
+        if len(self.login_fails) > 4096:
+            now = time.monotonic()
+            for k in [k for k, q in self.login_fails.items() if not q or now - q[-1] >= ROOM_LOGIN_FAIL_WINDOW_S]:
+                del self.login_fails[k]
 
     def suggest_route(self, pub, hops):
         """Admin-suggested route (list of repeater id bytes, room side first): stored as a proven-route
@@ -3438,11 +3460,7 @@ class RoomServer:
             return log.error("tenant room %r not created: the limit is %d rooms", spec["name"], TENANT_MAX)
         if spec["path"] in {t.cfg.path for t in self.tenants.values()}:
             return log.error("tenant room %r not created: path /%s/ is taken", spec["name"], spec["path"])
-        taken = {self.id.pub_key, *self.tenants}
-        if self.vr is not None:
-            taken.add(self.vr.pub)
-        if self.vc is not None:
-            taken.add(self.vc.pub)
+        taken = self.own_node_keys()
         if spec["private_key"]:
             key = bytes.fromhex(spec["private_key"])
         else:
@@ -3942,11 +3960,18 @@ class RoomServer:
         self.nodes_dirty.add(pub)
 
     def own_node_keys(self):
+        """Every node identity this server has: the room, tenants, and the virtual repeater and companion (their
+        configured keys too, while they're off: turning one back on mustn't give two nodes one key)."""
         keys = {self.id.pub_key} | {t.id.pub_key for t in self.tenants.values()}
         if self.vr is not None:
             keys.add(self.vr.pub)
         if self.vc is not None:
             keys.add(self.vc.pub)
+        for k in (self.cfg.repeater_key, self.cfg.companion_key):
+            try:
+                keys.add(RepeaterIdentity(bytes.fromhex(str(k))).pub_key) if k else None
+            except ValueError:
+                pass
         return keys
 
     def heard_on_rf(self, pub, trust_observers=False):
@@ -6469,6 +6494,15 @@ def hash_web_password(pw):
 WEB_PAGE_SESSION_S = 30 * 86400        # a MeshCore Web page session (page password) lasts this long
 
 
+def same_text(a, b):
+    """a == b, in constant time (passwords)."""
+    return hmac.compare_digest(str(a).encode(), str(b).encode())
+
+
+ROOM_LOGIN_FAILS = 5                  # wrong room / admin passwords from one key within ROOM_LOGIN_FAIL_WINDOW_S...
+ROOM_LOGIN_FAIL_WINDOW_S = 600        # ...and its logins go unanswered until the oldest is this old
+
+
 def web_page_session(stored, now=None):
     """A MeshCore Web page session (the mr_web cookie): its expiry, signed with the stored page password hash (a secret:
     salted, and only in the config). Nothing is kept, so it outlives a restart; a new password ends every one."""
@@ -7211,6 +7245,8 @@ def web_packet_check(pkt, pub):
         return "a login must be from your own key"
     if t in (PT_TXT_MSG, PT_REQ, PT_RESPONSE, PT_PATH) and (len(p) < 2 or p[1] != pub[0]):
         return "a message must be from your own key"
+    if pkt.is_flood and pkt.path_len & 63:
+        return "a flood starts with no hops: the repeaters add them"
     return None
 
 
@@ -8196,13 +8232,16 @@ class KaasHub:
         if t == "room":
             since, pw = arg
             if m is None or (pw and m.role == PERM_GUEST):  # (a member is known by their key: no password needed)
-                if r.cfg.admin_password and pw == r.cfg.admin_password:
+                if r.login_blocked(me):
+                    return err("too many wrong passwords: try again later", refused=True)
+                if r.cfg.admin_password and same_text(pw, r.cfg.admin_password):
                     perm = PERM_ADMIN
-                elif pw == r.cfg.room_password:
+                elif same_text(pw, r.cfg.room_password):
                     perm = PERM_READ_WRITE
                 elif r.cfg.allow_read_only:
                     perm = PERM_GUEST
                 else:
+                    r.login_failed(me)
                     return err("the room refused the login (a wrong password?)", refused=True)
                 if m is None:
                     m = r.put_member(me)
@@ -8588,7 +8627,7 @@ Separate with commas. Type a name or id for suggestions.</div>
 <div class="card" id="mqcard" style="display:none"><h2>MQTT augmentation <span class="hdesc">listen to the observer network as well as the radio</span></h2>
 <div class="mqrow"><label class="sw"><input type="checkbox" id="mq_en" onchange="mqSet({enabled:this.checked})"> <b>MQTT augmentation</b></label>
 <span id="mqstat" class="dim small"></span></div>
-<div class="mqrow sub"><label class="sw"><input type="checkbox" id="mq_ack" onchange="mqSet({ack_ingest:this.checked})"> ACK ingestion <span class="dim">&mdash; determine delivery via observers</span></label></div>
+<div class="mqrow sub"><label class="sw" title="Trusts the feed: anyone who can publish to it could mark a post delivered that never arrived, so the member misses it. Off by default"><input type="checkbox" id="mq_ack" onchange="mqSet({ack_ingest:this.checked})"> ACK ingestion <span class="dim">&mdash; determine delivery via observers (trusts the feed)</span></label></div>
 <div class="mqrow sub"><label class="sw"><input type="checkbox" id="mq_msg" onchange="mqSet({msg_ingest:this.checked})"> Message ingestion <span class="dim">&mdash; capture room posts via observers</span></label></div>
 <div class="mqrow sub"><label class="sw"><input type="checkbox" id="mq_topo" onchange="mqSet({topo_ingest:this.checked})"> Topology ingestion <span class="dim">&mdash; collect route, SNR, and path reliability data for known infrastructure</span></label></div>
 <div class="mqrow sub"><label class="sw"><input type="checkbox" id="mq_adv" onchange="mqSet({advert_ingest:this.checked})"> Advert ingestion <span class="dim">&mdash; discover users and their locations</span></label></div>
@@ -9260,6 +9299,30 @@ class WebUI:
                     self._body_bytes = self.rfile.read(n) if 0 < n <= HTTP_MAX_BODY else b""
                 return self._body_bytes
 
+            def _https(self):
+                """The browser reached us over HTTPS: a TLS proxy on a private address says so (X-Forwarded-Proto)."""
+                if (self.headers.get("X-Forwarded-Proto") or "").split(",")[0].strip().lower() != "https":
+                    return False
+                try:
+                    return ipaddress.ip_address(self.client_address[0].replace("::ffff:", "")).is_private
+                except ValueError:
+                    return False
+
+            def _cross_site(self):
+                """A POST another site's page sent (its Origin isn't this server): refused unless it's one of the
+                public login endpoints. SameSite=Strict cookies already keep the admin session out of those; this is
+                the second lock."""
+                if self.path.split("?")[0] in CROSS_SITE_POSTS:
+                    return False
+                site = (self.headers.get("Sec-Fetch-Site") or "").lower()
+                if site:                                    # (browsers say so even where Origin is "null": no-referrer)
+                    return site == "cross-site"
+                origin = self.headers.get("Origin")
+                if origin is None:
+                    return False                            # (not a browser's request: no cookie to misuse)
+                host = urllib.parse.urlsplit(origin).netloc.lower()
+                return host not in {(self.headers.get("Host") or "").lower()} | self._web_hosts()
+
             def _client_ip(self):
                 """Who's asking: the connecting address, or behind a proxy on a private address, the address it says
                 it forwarded for (X-Forwarded-For, last entry). Else everyone behind a proxy would share one lockout."""
@@ -9457,7 +9520,7 @@ class WebUI:
                 if code == 503:
                     self.send_header("Retry-After", "1")
                 if cookie:
-                    self.send_header("Set-Cookie", cookie)
+                    self.send_header("Set-Cookie", cookie + ("; Secure" if self._https() else ""))
                 for k, v in (headers or {}).items():
                     self.send_header(k, v)
                 self.end_headers()
@@ -9488,6 +9551,8 @@ class WebUI:
                     return self._send(413 if n > 0 else 400, '{"error":"a request body is at most %d bytes"}' % HTTP_MAX_BODY)
                 if self._locked_out():
                     return
+                if self._cross_site():
+                    return self._send(403, '{"error":"a request from another site"}')
                 self._raw_body()                            # (before a slot: a slow body only holds its own thread)
                 if not slots.acquire(blocking=False):
                     return self._send(503, '{"error":"busy"}')
@@ -9624,7 +9689,8 @@ class WebUI:
                 tok = web_page_session(cfg.web_page_password)
                 self.send_response(303)
                 self.send_header("Location", "./")
-                self.send_header("Set-Cookie", "mr_web=%s; HttpOnly; SameSite=Strict; Path=/; Max-Age=%d" % (tok, WEB_PAGE_SESSION_S))
+                self.send_header("Set-Cookie", "mr_web=%s; HttpOnly; SameSite=Strict; Path=/; Max-Age=%d%s" % (
+                    tok, WEB_PAGE_SESSION_S, "; Secure" if self._https() else ""))
                 self.send_header("Content-Length", "0")
                 self.end_headers()
 
@@ -9913,7 +9979,7 @@ class WebUI:
                 if parts == ["api", "tenants"]:
                     if len(room.web_tenants) >= TENANT_MAX:
                         return self._send(409, json.dumps({"error": "the limit is %d tenant rooms" % TENANT_MAX}))
-                    keys = {x.id.pub_key for x in room.web_tenants.values()} | {room.id.pub_key}
+                    keys = {x.id.pub_key for x in room.web_tenants.values()} | room.own_node_keys()
                     try:
                         spec = tenant_spec(self._body(), set(room.web_tenants), keys)
                     except ValueError as e:

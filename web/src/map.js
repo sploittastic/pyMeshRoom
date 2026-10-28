@@ -9,6 +9,13 @@ const COLORS = { repeater: "#5cb3ff", room: "#c38bff", chat: "#4caf7a", sensor: 
 
 let loading = null;
 
+// A name as text (Leaflet puts a string tooltip in as HTML, and names come from adverts and servers).
+function textNode(text) {
+  const e = document.createElement("span");
+  e.textContent = text;
+  return e;
+}
+
 function load(tag, attrs) {
   return new Promise((resolve, reject) => {
     const e = document.createElement(tag);
@@ -48,7 +55,7 @@ export async function showMap(box, nodes, { serverBase, center, popup }) {
   for (const n of placed) {
     L.circleMarker([n.lat, n.lon], {
       radius: n.type === "repeater" ? 7 : 6, color: "#0b1420", weight: 1, fillColor: COLORS[n.type] || COLORS.chat, fillOpacity: 0.9,
-    }).bindPopup(() => popup(n)).bindTooltip(n.name || n.pubHex.slice(0, 8)).addTo(layer);
+    }).bindPopup(() => popup(n)).bindTooltip(textNode(n.name || n.pubHex.slice(0, 8))).addTo(layer);
   }
   map.invalidateSize();
   if (center) map.setView([center.lat, center.lon], 12);

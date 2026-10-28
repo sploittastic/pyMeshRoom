@@ -102,13 +102,23 @@ function decodePoint(b) {
   return [x, y, 1n, mod(x * y)];
 }
 
-// Checks [S]B == R + [h]A, h = SHA-512(R || A || msg). (Adverts: a forged one can't rename a contact.)
+// A key of small order: not a real node's (such a key "verifies" signatures nobody made, and its shared secret is
+// known to everyone). False for anything that isn't a point at all.
+export function isWeakKey(pub) {
+  const A = pub.length === 32 ? decodePoint(pub) : null;
+  if (!A) return false;
+  const e = encodePoint(mulPoint(8n, A));
+  return e[0] === 1 && e.subarray(1).every((v) => v === 0);
+}
+
+// Checks [S]B == R + [h]A, h = SHA-512(R || A || msg). (Adverts: a forged one can't rename a contact.) A key of small
+// order never verifies.
 export function ed25519Verify(pub, sig, msg) {
   if (pub.length !== 32 || sig.length !== 64) return false;
   const A = decodePoint(pub);
   const R = decodePoint(sig.subarray(0, 32));
   const S = bytesToBig(sig.subarray(32, 64));
-  if (!A || !R || S >= L) return false;
+  if (!A || !R || S >= L || isWeakKey(pub)) return false;
   const h = mod(bytesToBig(sha512(concatBytes(sig.subarray(0, 32), pub, msg))), L);
   const left = encodePoint(mulPoint(S, BASE));
   const right = encodePoint(add(R, mulPoint(h, A)));

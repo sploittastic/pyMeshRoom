@@ -15,7 +15,7 @@ sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1] / "meshroom")
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1] / "client"))
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
 import meshroom as mr
-from test_web_login import WebHelpers
+from test_web_login import WebHelpers, channel_msg
 
 import meshroom_kaas as kc
 
@@ -194,6 +194,62 @@ class HardeningTests(WebHelpers):
         hub.kstats_dirty = True
         hub.save_stats()
         self.assertNotIn(mr.WEB_ID_PREFIX + "ab" * 32, hub.kstats)
+
+    def test_a_web_flood_starts_with_no_hops(self):
+        self.enable()
+        me = kc.Identity.generate()
+        self.heard_on_air(me, "Me")
+        c = self.connect(self.login(me)[1]["ticket"])
+        p = kc.Packet.parse(channel_msg("Me: hi"))
+        p.path_len, p.path = 3, b"\x11\x22\x33"                                 # (as if it had come 3 hops)
+        r = self.send(c, p.encode(), 1)
+        self.assertIn("no hops", r.get("reason", ""))
+        self.assertEqual(self.send(c, channel_msg("Me: hi"), 2)["status"], "sent")
+
+    def test_wrong_room_passwords_from_a_key_are_limited(self):
+        self.enable()
+        me = kc.Identity.generate()
+        self.heard_on_air(me, "Me")
+        c = self.connect(self.login(me)[1]["ticket"])
+        room = self.h.room.id.pub_key.hex()
+        for i in range(mr.ROOM_LOGIN_FAILS):
+            self.assertIn("wrong password", self.ask(c, {"type": "room", "id": i, "room": room, "password": "nope"})["error"])
+        self.assertIn("too many", self.ask(c, {"type": "room", "id": 99, "room": room, "password": "hello"})["error"])
+
+    def test_cookies_and_other_sites(self):
+        def post(path, body, headers):
+            req = urllib.request.Request(self.base + path, data=json.dumps(body).encode(), method="POST",
+                                         headers={"Content-Type": "application/json", **headers})
+            try:
+                with urllib.request.urlopen(req, timeout=10) as r:
+                    return r.status, r.headers.get("Set-Cookie", "")
+            except urllib.error.HTTPError as e:
+                return e.code, e.headers.get("Set-Cookie", "")
+        code, cookie = post("/api/login", {"password": "adminpw"}, {"X-Forwarded-Proto": "https"})
+        self.assertEqual(code, 200)
+        self.assertIn("; Secure", cookie)                                           # (TLS at a proxy on this LAN)
+        self.assertNotIn("Secure", post("/api/login", {"password": "adminpw"}, {})[1])
+        self.assertEqual(post("/api/login", {"password": "adminpw"}, {"Origin": "https://evil.example"})[0], 403)
+        self.assertEqual(post("/api/login", {"password": "adminpw"}, {"Origin": self.base})[0], 200)
+        self.assertEqual(post("/api/login", {"password": "adminpw"}, {"Sec-Fetch-Site": "cross-site", "Origin": "null"})[0], 403)
+        self.assertEqual(post("/api/login", {"password": "adminpw"}, {"Sec-Fetch-Site": "same-origin", "Origin": "null"})[0], 200)
+        self.enable()
+        self.assertEqual(post("/api/v1/web/challenge", {}, {"Origin": "https://anywhere.example"})[0], 200)  # (public)
+
+    def test_ack_ingest_is_off_by_default(self):
+        self.assertFalse(mr.DEFAULT_CONFIG["mqtt_ack_ingest"])
+
+    def test_a_tenant_cant_take_a_switched_off_companions_key(self):
+        key = "11" * 32
+        self.h.cfg.set("companion_key", key)
+        pub = mr.RepeaterIdentity(bytes.fromhex(key)).pub_key
+        self.assertIsNone(self.h.room.vc)
+        self.assertIn(pub, self.h.room.own_node_keys())
+        self.http("POST", "/api/login", {"password": "adminpw"})
+        code, d = self.http("POST", "/api/tenants", {"name": "Copy", "path": "copy", "private_key": key,
+                                                       "web_password": "tenantpw1"})
+        self.assertEqual(code, 400, d)
+        self.assertIn("already used", d["error"])
 
 
 class RepeaterTableTests(unittest.TestCase):
