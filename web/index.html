@@ -1,0 +1,160 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'self'; style-src 'self'; img-src 'self' data: https://media.giphy.com https://i.giphy.com; connect-src https: wss: http: ws:; base-uri 'none'; form-action 'none'">
+<meta name="referrer" content="no-referrer">
+<title>MeshCore Web</title>
+<link rel="stylesheet" href="src/style.css">
+<script type="module" src="src/app.js"></script>
+</head>
+<body>
+
+<main id="login" class="login" hidden>
+  <form id="login-form" class="card" autocomplete="off" novalidate>
+    <h1>MeshCore Web</h1>
+    <p class="sub">Chat on MeshCore channels through a pyMeshRoom radio. Your private key stays in this browser:
+      every message is encrypted and signed here.</p>
+
+    <p class="server-auto" id="url-auto" hidden>Server: <b id="url-host"></b>
+      <button type="button" id="url-change" class="linkish">Use another server</button></p>
+    <div id="url-box">
+      <label for="f-url">pyMeshRoom URL</label>
+      <input id="f-url" type="url" placeholder="https://meshroom.example.com" spellcheck="false" required>
+    </div>
+
+    <label for="f-priv">Private key</label>
+    <div class="row">
+      <input id="f-priv" type="password" placeholder="128 hex characters (or a 32-byte seed)" spellcheck="false" required>
+      <button type="button" id="f-priv-show" class="ghost" aria-label="Show private key">Show</button>
+      <button type="button" id="f-priv-gen" class="ghost">New</button>
+    </div>
+    <p class="hint" id="f-pub">Exported from a MeshCore app, or press New to make one. Keep a copy: a new key is a new node.</p>
+
+    <label for="f-name">Your name</label>
+    <input id="f-name" type="text" maxlength="31" placeholder="Shown before your messages" required>
+
+    <details id="key-box">
+      <summary>Use an API key instead</summary>
+      <label for="f-key">API key</label>
+      <input id="f-key" type="password" placeholder="kaas_…" spellcheck="false">
+      <p class="hint">Only for a server with web logins turned off: a KaaS key from its dashboard. Leave it empty to
+        log in with your private key.</p>
+    </details>
+
+    <label class="check"><input id="f-remember" type="checkbox"> Remember my private key on this device</label>
+
+    <p class="error" id="login-error" role="alert" hidden></p>
+    <button type="submit" id="login-go" class="primary">Connect</button>
+  </form>
+</main>
+
+<div id="chat" class="chat" hidden>
+  <aside id="sidebar" class="sidebar">
+    <header class="side-head">
+      <div class="identity">
+        <span class="dot" id="conn-dot" title="Disconnected"></span>
+        <div>
+          <div class="me-name" id="me-name"></div>
+          <div class="me-key" id="me-key"></div>
+        </div>
+      </div>
+    </header>
+    <h2 class="sect">Channels</h2>
+    <nav class="channels" id="channel-list" aria-label="Channels"></nav>
+    <div class="side-actions">
+      <button type="button" id="add-channel" class="ghost wide">+ Join a channel</button>
+      <button type="button" id="advert" class="ghost wide">Advertise me</button>
+      <label class="check side-check"><input id="show-gifs" type="checkbox"> Show GIFs from Giphy</label>
+      <button type="button" id="logout" class="ghost wide">Log out</button>
+    </div>
+    <footer class="server" id="server-info"></footer>
+  </aside>
+
+  <section class="room">
+    <header class="room-head">
+      <button type="button" id="toggle-side" class="ghost icon" aria-label="Channels">☰</button>
+      <div class="room-title">
+        <h2 id="room-name"></h2>
+        <div class="room-sub" id="room-sub"></div>
+      </div>
+      <button type="button" id="channel-info" class="ghost">Details</button>
+    </header>
+    <div class="banner" id="banner" hidden></div>
+    <div class="messages" id="messages" aria-live="polite"></div>
+    <div class="gif-preview" id="gif-preview" hidden></div>
+    <form class="composer" id="composer">
+      <textarea id="text" rows="1" placeholder="Message" aria-label="Message"></textarea>
+      <span class="count" id="count"></span>
+      <button type="submit" id="send" class="primary">Send</button>
+    </form>
+  </section>
+</div>
+
+<dialog id="dlg-add">
+  <form method="dialog" id="add-form" class="card" novalidate>
+    <h3>Join a channel</h3>
+    <div class="tabs" role="tablist">
+      <button type="button" role="tab" data-kind="hashtag" class="tab on">Hashtag</button>
+      <button type="button" role="tab" data-kind="private" class="tab">Private</button>
+    </div>
+    <div data-pane="hashtag">
+      <label for="a-tag">Hashtag</label>
+      <input id="a-tag" type="text" placeholder="#weather" spellcheck="false">
+      <p class="hint">Anyone who knows the name can read a hashtag channel: its key comes from the name.</p>
+    </div>
+    <div data-pane="private" hidden>
+      <label for="a-name">Name</label>
+      <input id="a-name" type="text" placeholder="Ops" maxlength="32">
+      <label for="a-secret">Secret</label>
+      <div class="row">
+        <input id="a-secret" type="text" placeholder="32 hex characters" spellcheck="false">
+        <button type="button" id="a-gen" class="ghost">New</button>
+      </div>
+      <p class="hint">Paste the secret you were given, or press New to make a channel and share its secret.</p>
+    </div>
+    <p class="error" id="add-error" role="alert" hidden></p>
+    <div class="buttons">
+      <button type="button" class="ghost" data-close>Cancel</button>
+      <button type="submit" class="primary" id="add-go">Join</button>
+    </div>
+  </form>
+</dialog>
+
+<dialog id="dlg-info">
+  <div class="card">
+    <h3 id="i-name"></h3>
+    <p id="i-kind"></p>
+    <div id="i-secret-box" hidden>
+      <label for="i-secret">Secret</label>
+      <div class="row">
+        <input id="i-secret" type="text" readonly spellcheck="false">
+        <button type="button" id="i-copy" class="ghost">Copy</button>
+      </div>
+      <p class="hint">Anyone with this secret can read and send on the channel.</p>
+    </div>
+    <div class="buttons">
+      <button type="button" class="danger" id="i-leave">Leave channel</button>
+      <button type="button" class="ghost" id="i-clear">Clear history</button>
+      <button type="button" class="primary" data-close>Done</button>
+    </div>
+  </div>
+</dialog>
+
+<dialog id="dlg-advert">
+  <div class="card">
+    <h3>Advertise me</h3>
+    <p>An advert tells other nodes your name and public key, so their apps can show who you are and DM you.
+      It is signed with your private key, here in the browser.</p>
+    <div class="buttons stack">
+      <button type="button" class="primary" data-advert="flood">To the whole mesh (flood)</button>
+      <button type="button" class="ghost" data-advert="zero">Only to nodes near the radio</button>
+      <button type="button" class="ghost" data-close>Cancel</button>
+    </div>
+  </div>
+</dialog>
+
+<div class="toast" id="toast" role="status" hidden></div>
+</body>
+</html>

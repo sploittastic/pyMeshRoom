@@ -240,6 +240,27 @@ class WebLoginTests(WebTestCase):
         names = [u["name"] for u in self.http("GET", "/api/v1/web/users")[1]["users"]]
         self.assertEqual(names, ["B", "A"])
 
+    def test_meshcore_web_is_served(self):
+        """pyMeshRoom serves the built app at /meshcore-web/, never in a frame, and no tenant room can take the path."""
+        import http.client
+        c = http.client.HTTPConnection("127.0.0.1", self.port, timeout=10)
+        c.request("GET", "/meshcore-web")
+        r = c.getresponse()
+        r.read()
+        self.assertEqual((r.status, r.getheader("Location")), (301, "meshcore-web/"))
+        c.request("GET", "/meshcore-web/", headers={"Accept-Encoding": "gzip"})
+        r = c.getresponse()
+        import gzip
+        body = gzip.decompress(r.read()).decode()
+        self.assertEqual(r.status, 200)
+        self.assertTrue(r.getheader("Content-Type").startswith("text/html"))
+        self.assertEqual((r.getheader("X-Frame-Options"), r.getheader("Content-Security-Policy")), ("DENY", "frame-ancestors 'none'"))
+        self.assertIn("<title>MeshCore Web</title>", body)
+        self.assertIn("script-src 'sha256-", body)                         # the built file, with its pinned CSP
+        c.close()
+        with self.assertRaisesRegex(ValueError, "already in use"):
+            mr.tenant_spec({"name": "Web", "path": "meshcore-web", "web_password": "x" * 12})
+
     def test_web_sessions_have_their_own_limit(self):
         self.enable(web_max_clients=1)
         first = self.connect(self.login(kc.Identity.generate())[1]["ticket"])

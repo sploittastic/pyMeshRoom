@@ -467,6 +467,18 @@ total), and **Revoke** disconnects a key's clients at once.
   which never leaves their browser, instead of with an API key. Anyone can read. A key can send once this radio has
   heard it advertise, or once the admin allows it, and only as itself. The card lists each user's name, key, access,
   last activity and packet counts, with Allow send, Kick and Ban by key. See [docs/api.md](docs/api.md).
+
+### MeshCore Web
+
+pyMeshRoom serves a MeshCore chat client at `/meshcore-web/` on the dashboard's port, for example
+`https://mesh.example.com/meshcore-web/`. People log in with their node's private key and a name. The key never leaves
+their browser: the page signs a login challenge, and encrypts and signs messages itself, so the server only sees
+signatures and encrypted packets.
+
+It covers the Public channel, hashtag and private channels, adverts, `@` mentions and GIFs from Giphy links. Rooms and
+DMs aren't supported yet.
+
+Turn it on with **Allow web logins** on the **Web users** card. Its source is in [web/](web/README.md).
 * Python client: [client/](client/README.md). It works with raw packets, or as a full chat node: adverts, contacts,
   DMs, hashtag and private channels, and joining rooms.
 

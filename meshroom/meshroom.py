@@ -6304,7 +6304,7 @@ TENANT_KEYS = {"name", "path", "private_key", "lat", "lon", "admin_password", "r
                "ban_message", "advert_interval_min", "flood_advert_interval_h", "max_posts", "catchup_max"}
 TENANT_DEFAULTS = {"lat": 0.0, "lon": 0.0, "admin_password": "", "room_password": "", "allow_read_only": False,
                    "web_password_hash": "", "advert_interval_min": 60, "flood_advert_interval_h": 24}
-TENANT_RESERVED_PATHS = {"api", "static", "icons", "index.html", "favicon.ico", "robots.txt", "tenants"}
+TENANT_RESERVED_PATHS = {"api", "static", "icons", "index.html", "favicon.ico", "robots.txt", "tenants", "meshcore-web"}
 
 
 def hash_web_password(pw):
@@ -7929,7 +7929,7 @@ td.rcell .dir{flex:none}.mono4{font-family:ui-monospace,monospace}
 .rprow input,.rprow select{width:auto;flex:none;padding:4px 6px;background:#0d1014;border:1px solid var(--line);border-radius:4px;color:var(--fg)}.sw{cursor:pointer}
 .mqrow input[type=checkbox]{transform:scale(1.2);margin-right:6px}.mqrow input[type=text],.mqrow input[type=password],.mqrow input[type=number],.mqrow select{width:auto;min-width:110px;padding:4px 6px;background:#0d1014;border:1px solid var(--line);border-radius:4px;color:var(--fg)}.mqnote{margin-top:10px;padding:8px 10px;border-left:3px solid var(--acc);background:#151a20;color:var(--dim);font-size:12px}
 .advrow{display:flex;gap:26px;align-items:center;flex-wrap:wrap}.adv{display:flex;gap:10px;align-items:center}
-.hdesc{color:var(--dim);font-weight:400;text-transform:none;letter-spacing:0;font-size:12px;margin-left:8px}
+.hdesc{color:var(--dim);font-weight:400;text-transform:none;letter-spacing:0;font-size:12px;margin-left:8px}.hdesc a{color:var(--acc)}
 #members tr.mrow{cursor:pointer}#members tr.mrow:hover td{background:#1e252d}#members tr.mrow.exp td{background:#1b2229}
 .hexr{font-family:ui-monospace,monospace;white-space:nowrap}.caret{color:var(--dim);font-size:11px;margin-right:4px}
 .mbox.wide{width:520px}.ac{position:relative}.aclist{background:#0d1014;border:1px solid var(--line);border-top:none;
@@ -8032,7 +8032,7 @@ Receive streams every packet this radio hears and sends. Send may send raw packe
 together within <span id="kk_air">5</span>% of airtime, after everything of the room's. Clients do their own MeshCore crypto: see docs/api.md and the Python client in client/.
 A key is shown once, when it is made: only a hash of it is kept, so a lost key can't be recovered, only revoked and replaced.</div>
 <table id="kklist" style="margin-top:8px"></table></div>
-<div class="card" id="webcard" style="display:none"><h2>Web users <span class="hdesc">MeshCore Web: people log in by signing with their node's private key, which never leaves their browser</span></h2>
+<div class="card" id="webcard" style="display:none"><h2>Web users <span class="hdesc">MeshCore Web: people log in by signing with their node's private key, which never leaves their browser &middot; <a href="meshcore-web/" target="_blank" rel="noopener">open MeshCore Web</a></span></h2>
 <div class="rprow"><label><input id="wb_on" type="checkbox" onchange="wbSettings({web_login:this.checked})"> Allow web logins</label>
 <label title="A key heard only by an MQTT observer, not by this radio, may send too"><input id="wb_obs" type="checkbox" onchange="wbSettings({web_trust_observers:this.checked})"> Trust keys heard by MQTT observers</label>
 <span class="dim small"><span id="wb_conn">0</span> of <span id="wb_max">32</span> sessions in use</span><span id="wbmsg" class="small"></span></div>
@@ -8471,6 +8471,7 @@ session().then(()=>{load();loadMap()});setInterval(load,1000);setInterval(loadMa
 
 ICON_NAMES = ("resync", "suggest", "kick", "ban", "advert", "flood_advert")
 PACKAGED_ICONS_DIR = os.path.join(os.path.dirname(os.path.realpath(__file__)), "data", "icons")
+MESHCORE_WEB_FILE = os.path.join(os.path.dirname(os.path.realpath(__file__)), "data", "meshcore-web.html")   # web/
 
 
 def dashboard_icon_file(data_dir, name):
@@ -8907,6 +8908,21 @@ class WebUI:
                 if path in ("/", "/index.html"):
                     gz = "gzip" in (self.headers.get("Accept-Encoding") or "")
                     return self._send(200, page[1] if gz else page[0], "text/html; charset=utf-8", gz=gz)
+                if path == "/meshcore-web":
+                    self.send_response(301)                     # (the page works out the server from its own address)
+                    self.send_header("Location", "meshcore-web/")
+                    self.send_header("Content-Length", "0")
+                    self.end_headers()
+                    return
+                if path in ("/meshcore-web/", "/meshcore-web/index.html"):
+                    if not os.path.isfile(MESHCORE_WEB_FILE):
+                        return self._send(404, '{"error":"MeshCore Web isn\'t built: run node build.mjs in web/"}')
+                    _, raw, gzd = cached_file(MESHCORE_WEB_FILE, True)
+                    gz = "gzip" in (self.headers.get("Accept-Encoding") or "")
+                    return self._send(200, gzd if gz else raw, "text/html; charset=utf-8", gz=gz,
+                                      headers={"Content-Security-Policy": "frame-ancestors 'none'",   # it holds a key:
+                                               "X-Frame-Options": "DENY", "X-Content-Type-Options": "nosniff",
+                                               "Referrer-Policy": "no-referrer"})                 # never framed
                 if path == "/api/state":
                     note_viewer(self.path.partition("?")[2], self._is_admin())
                     fresh = time.monotonic() - room.web_last_request > 20

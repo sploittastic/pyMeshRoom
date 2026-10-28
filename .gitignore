@@ -30,3 +30,6 @@ __pycache__/
 
 # Antenna test results.
 /tools/antenna_test/results/
+
+# MeshCore Web (web/)
+web/node_modules/
