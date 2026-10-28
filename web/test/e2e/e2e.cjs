@@ -14,7 +14,7 @@ const ID = JSON.parse(fs.readFileSync(H + '/../vectors.json')).identities[0];
 const PRIV = ID.private, PUB = ID.public;
 const py = (...args) => execFileSync('python3', [H + '/mkpkt.py', ...args]).toString().trim();
 const hear = (hex) => fs.appendFileSync(W + '/rx.txt', 'RX ' + hex + '\n');
-const inject = (ch, sender, text) => hear(py(ch, sender, text));
+const inject = (ch, sender, text, ts) => hear(py(ch, sender, text, ...(ts ? [String(ts)] : [])));
 const ok = (cond, what) => { if (!cond) { console.log('FAIL', what); process.exitCode = 1; } else console.log('ok  ', what); };
 const GIF_ID = 'JIX9t2j0ZTN9S';
 const command = (line) => fs.appendFileSync(W + '/rx.txt', line + '\n');
@@ -69,6 +69,12 @@ function startProxy(mode) {
 
 async function newPage(b, opts = {}) {
   const ctx = await b.newContext({ viewport: { width: 1200, height: 760 }, ...opts });
+  await ctx.route(/^https:\/\/api\.giphy\.com\/v1\/gifs\/(search|trending)\?/, (r) => {
+    const u = new URL(r.request().url());
+    const ids = u.searchParams.get('api_key') !== 'e2etestkey' ? null : u.pathname.endsWith('/search') ? [GIF_ID, 'AbCdEf123456'] : [GIF_ID];
+    r.fulfill(ids ? { status: 200, contentType: 'application/json', body: JSON.stringify({ data: ids.map((id) => ({ id })) }) }
+      : { status: 403, body: '{}' });
+  });
   await ctx.route(/^https:\/\/(media\d?|i)\.giphy\.com\//, (r) => r.fulfill({ status: 200, contentType: 'image/gif', body: TINY_GIF }));
   await ctx.route(/^https:\/\/unpkg\.com\/leaflet@1\.9\.4\/dist\/(leaflet\.(js|css))$/, (r) => {
     const f = r.request().url().split('/').pop();
@@ -259,9 +265,55 @@ let b;
   inject('Public', 'Carol', '@[Nobody]🔥\nabcdefgh');
   await p.waitForSelector('.reaction-note:has-text("Carol")', { timeout: 10000 });
   ok(true, 'a reaction to a message we never saw: a note, not raw text');
+  // the emoji picker: into the message box at the caret, and remembered as recent
+  await p.fill('#text', 'nice ');
+  await p.click('#emoji-btn');
+  await p.click('#pick-tabs button[title="Nature"]');
+  await p.click('#pick-grid button[aria-label="🐢"]');
+  ok(await p.inputValue('#text') === 'nice 🐢', 'emoji picker: into the message box');
+  await p.click('#emoji-btn');
+  await p.click('#emoji-btn');
+  ok(await p.isVisible('#pick-tabs button[title="Recent"]') && await p.isVisible('#pick-grid button[aria-label="🐢"]'), 'emoji picker: recent ones first');
+  await p.keyboard.press('Escape');
+  // the GIF picker: trending, then a search; the pick goes in as a Giphy link
+  await p.fill('#text', '');
+  ok(await p.isVisible('#gif-btn'), 'a GIF button, with the server\'s Giphy key');
+  await p.click('#gif-btn');
+  await p.waitForSelector('#pick-grid.gifs button img', { timeout: 5000 });
+  ok(await p.textContent('#pick-foot') === 'Powered by GIPHY', 'GIF picker: trending, with Giphy\'s attribution');
+  await p.fill('#gif-q', 'cats');
+  await p.waitForFunction(() => document.querySelectorAll('#pick-grid.gifs button').length === 2, null, { timeout: 5000 });
+  await p.click('#pick-grid.gifs button >> nth=0');
+  ok(await p.inputValue('#text') === 'https://giphy.com/gifs/' + GIF_ID + ' ' && await p.isHidden('#pick-pop'), 'GIF picker: a search, and the pick as a Giphy link');
+  await p.waitForSelector('#gif-preview img', { timeout: 5000 });
+  await p.fill('#text', '');
+
+  // a reaction that comes before its message (a catch-up still under way) waits, then goes onto it
+  const T = Math.floor(Date.now() / 1000) - 50;
+  inject('Public', 'Dave', '@[Eve]😮\n' + messageHash('arrives late', T));
+  await p.waitForSelector('.reaction-note:has-text("Dave")', { timeout: 10000 });
+  inject('Public', 'Eve', 'arrives late', T);
+  await p.waitForSelector('.msg:has(.text:text("arrives late")) .chip:has-text("😮")', { timeout: 10000 });
+  ok(await p.locator('.reaction-note:has-text("Dave")').count() === 0, 'a reaction before its message: the note goes onto it when it comes');
+  // a retry stamped anew is the same message, and a reaction to the retry's stamp finds it
+  inject('Public', 'Eve', 'said twice', T);
+  await p.waitForSelector('.msg .text:text("said twice")', { timeout: 10000 });
+  inject('Public', 'Eve', 'said twice', T + 31);
+  inject('Public', 'Dave', '@[Eve]👀\n' + messageHash('said twice', T + 31));
+  await p.waitForSelector('.msg:has(.text:text("said twice")) .chip:has-text("👀")', { timeout: 10000 });
+  ok(await p.locator('.msg .text:text("said twice")').count() === 1, 'a retry is one message, and a reaction to its stamp finds it');
   await p.hover('.msg:has(.text:text("only once"))');
   await p.click('.msg:has(.text:text("only once")) .react-btn');
   await p.click('#react-pop button:text("❤️")');
+  // any emoji, from the full picker
+  await p.waitForSelector('.msg:has(.text:text("only once")) .chip.me', { timeout: 5000 });
+  await p.hover('.msg:has(.text:text("only once"))');
+  await p.click('.msg:has(.text:text("only once")) .react-btn');
+  await p.click('#react-pop button.more');
+  await p.click('#pick-tabs button[title="Food"]');
+  await p.click('#pick-grid button[aria-label="🍕"]');
+  await p.waitForSelector('.msg:has(.text:text("only once")) .chip.me:has-text("🍕")', { timeout: 5000 });
+  ok(await p.isHidden('#pick-pop'), 'reacting with any emoji, from the full picker');
   await p.waitForSelector('.msg:has(.text:text("only once")) .chip.me', { timeout: 5000 });
   ok(true, 'reacting to a message: shown at once');
   const theirs = pub.find((m) => m.text === 'only once');

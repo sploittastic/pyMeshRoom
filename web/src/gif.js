@@ -28,3 +28,5 @@ export function findGifs(text) {
 export const gifUrl = (id) => "https://media.giphy.com/media/" + id + "/giphy.gif";
 export const gifFallbackUrl = (id) => "https://i.giphy.com/" + id + ".gif";
 export const gifPageUrl = (id) => "https://giphy.com/gifs/" + id;
+// A small rendition, for the GIF picker.
+export const gifThumbUrl = (id) => "https://media.giphy.com/media/" + id + "/200w.gif";

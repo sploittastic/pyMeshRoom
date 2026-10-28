@@ -56,6 +56,10 @@ const TICKET_OUTCOMES = {
 };
 TICKET_OUTCOMES.unused = TICKET_OUTCOMES.waiting;
 
+// Reconnecting: after 1 s, then twice as long each time, up to 15 s (a server restart is back within a few tries).
+const RETRY_FIRST_MS = 1000;
+const RETRY_MAX_MS = 15000;
+
 const CLOSE_REASONS = {
   4003: "this key is banned from this server",
   4004: "web logins were turned off on this server",
@@ -78,7 +82,7 @@ export class KaasClient extends EventTarget {
     this.hello = null;
     this.state = "closed";
     this.stopped = true;
-    this.retryMs = 2000;
+    this.retryMs = RETRY_FIRST_MS;
     this.timer = null;
     this.nextId = 1;
     this.waiting = new Map();             // send id -> {resolve, packet}
@@ -100,7 +104,19 @@ export class KaasClient extends EventTarget {
   // Resolves with hello on the first connection; rejects (AuthError for a bad key) if that one fails.
   start() {
     this.stopped = false;
+    if (!this.wake && typeof window !== "undefined") {
+      this.wake = () => this.retryNow();
+      window.addEventListener("online", this.wake);
+      document.addEventListener("visibilitychange", () => document.visibilityState === "visible" && this.wake());
+    }
     return this.connect();
+  }
+
+  // Waiting to reconnect: try now (the network came back, or the tab was shown again).
+  retryNow() {
+    if (this.stopped || !this.timer || this.state !== "closed") return;
+    this.retryMs = RETRY_FIRST_MS;
+    this.connect().catch(() => {});
   }
 
   stop() {
@@ -161,7 +177,7 @@ export class KaasClient extends EventTarget {
             if (msg.type !== "hello") return;
             opened = true;
             this.hello = msg;
-            this.retryMs = 2000;
+            this.retryMs = RETRY_FIRST_MS;
             this.setState("open");
             this.emit("hello", msg);
             resolve(msg);
@@ -213,7 +229,7 @@ export class KaasClient extends EventTarget {
   retry(reason) {
     if (this.stopped) return;
     const wait = this.retryMs;
-    this.retryMs = Math.min(this.retryMs * 2, 60000);
+    this.retryMs = Math.min(this.retryMs * 2, RETRY_MAX_MS);
     this.setState("closed", reason + "; retrying in " + Math.round(wait / 1000) + " s");
     this.timer = setTimeout(() => this.connect().catch(() => {}), wait);
   }

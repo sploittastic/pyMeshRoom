@@ -111,6 +111,8 @@
     <div class="gif-preview" id="gif-preview" hidden></div>
     <div class="mentions" id="mentions" role="listbox" aria-label="Mention someone" hidden></div>
     <form class="composer" id="composer" autocomplete="off">
+      <button type="button" id="emoji-btn" class="ghost tool" aria-label="Emoji" title="Emoji">😊</button>
+      <button type="button" id="gif-btn" class="ghost tool gif-tool" aria-label="GIF" title="GIFs from Giphy" hidden>GIF</button>
       <textarea id="text" rows="1" placeholder="Message" aria-label="Message" autocomplete="off" autocapitalize="sentences"
         enterkeyhint="send" inputmode="text" data-1p-ignore data-lpignore="true" data-bwignore data-form-type="other"></textarea>
       <span class="count" id="count"></span>
@@ -228,6 +230,12 @@
 </dialog>
 
 <div class="react-pop" id="react-pop" role="menu" aria-label="React" hidden></div>
+<div class="pick-pop" id="pick-pop" hidden>
+  <div class="pick-tabs" id="pick-tabs" role="tablist"></div>
+  <input id="gif-q" type="search" placeholder="Search Giphy" aria-label="Search Giphy" autocomplete="off" hidden>
+  <div class="pick-grid" id="pick-grid"></div>
+  <div class="pick-foot" id="pick-foot"></div>
+</div>
 <div class="toast" id="toast" role="status" hidden></div>
 </body>
 </html>

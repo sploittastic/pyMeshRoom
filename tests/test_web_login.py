@@ -332,6 +332,21 @@ class WebLoginTests(WebHelpers):
         first.ws.close()
 
 
+class PageSessionTests(unittest.TestCase):
+    def test_page_sessions_are_signed_not_stored(self):
+        """So they outlive a restart (nothing to lose), and a new page password ends them all."""
+        stored = mr.hash_web_password("letmein")
+        tok = mr.web_page_session(stored)
+        self.assertTrue(mr.web_page_session_ok(tok, stored))
+        exp, mac = tok.split(".")
+        self.assertFalse(mr.web_page_session_ok("%d.%s" % (int(exp) + 86400, mac), stored))     # stretched
+        self.assertFalse(mr.web_page_session_ok(exp + "." + "0" * 64, stored))
+        self.assertFalse(mr.web_page_session_ok(tok, mr.hash_web_password("letmein")))       # a new password (salt)
+        self.assertFalse(mr.web_page_session_ok(mr.web_page_session(stored, now=time.time() - 31 * 86400), stored))
+        self.assertFalse(mr.web_page_session_ok("junk", stored))
+        self.assertFalse(mr.web_page_session_ok(tok, ""))
+
+
 class WebsocketDiagnosisTests(WebHelpers):
     """A browser isn't told why its websocket didn't open: the server keeps what became of each ticket, and logs it."""
 

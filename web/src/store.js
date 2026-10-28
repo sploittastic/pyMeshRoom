@@ -24,6 +24,10 @@ function write(key, value) {
 export const loadSettings = () => read("settings", {});
 export const saveSettings = (s) => write("settings", s);
 
+// The emoji picker's recently used, most recent first.
+export const loadRecentEmoji = () => read("emoji.recent", []);
+export const saveRecentEmoji = (list) => write("emoji.recent", list);
+
 // Per identity (its public key), so two identities in one browser don't share channels or history.
 export const loadChannels = (pubHex) => read("channels." + pubHex.slice(0, 16), null);
 export const saveChannels = (pubHex, list) => write("channels." + pubHex.slice(0, 16), list);

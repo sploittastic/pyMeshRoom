@@ -17,6 +17,7 @@ from test_virtual_companion import Harness
 port, work = int(sys.argv[2]), sys.argv[3]
 h = Harness(web_password="adminpw", room_password="hello", kaas_send_window_s=2, push_quiet_ms=0)
 h.cfg.set("web_port", port); h.cfg.set("web_bind", "127.0.0.1"); h.cfg.set("web_login", True)
+h.cfg.set("web_giphy_key", "e2etestkey")                  # (the test answers api.giphy.com itself)
 web = mr.WebUI(h.room, h.events)
 token, entry = h.room.kaas.new_key(dict(receive=True, send=True, description="dev", expires=None))
 h.events.put(("kaas_key_add", entry))

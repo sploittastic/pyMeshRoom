@@ -178,6 +178,7 @@ DEFAULT_CONFIG = {
     "web_trust_observers": False,   #   a key heard only by an MQTT observer may send too (else: heard on this radio)
     "web_hosts": [],                #   other host names logins may sign for (behind a proxy that rewrites Host)
     "web_page_password": "",        #   a password for the MeshCore Web page and its logins (hashed; "" = none)
+    "web_giphy_key": "",            #   a Giphy API key for MeshCore Web's GIF picker ("" = no picker; links still show)
     "web_backlog_days": 30,         #   keep channel messages and DMs this many days, so web users catch up (0 = off)
     "web_backlog_mqtt": False,      #   ...including those MQTT observers reported (each packet is kept once)
 }
@@ -6321,6 +6322,23 @@ def hash_web_password(pw):
     return "pbkdf2_sha256$%d$%s$%s" % (n, salt.hex(), hashlib.pbkdf2_hmac("sha256", pw.encode(), salt, n).hex())
 
 
+WEB_PAGE_SESSION_S = 30 * 86400        # a MeshCore Web page session (page password) lasts this long
+
+
+def web_page_session(stored, now=None):
+    """A MeshCore Web page session (the mr_web cookie): its expiry, signed with the stored page password hash (a secret:
+    salted, and only in the config). Nothing is kept, so it outlives a restart; a new password ends every one."""
+    exp = int((now or time.time()) + WEB_PAGE_SESSION_S)
+    return "%d.%s" % (exp, hmac.new(str(stored).encode(), b"mr_web %d" % exp, hashlib.sha256).hexdigest())
+
+
+def web_page_session_ok(token, stored):
+    exp, _, mac = str(token).partition(".")
+    if not stored or not exp.isdigit() or int(exp) < time.time():
+        return False
+    return hmac.compare_digest(mac, hmac.new(str(stored).encode(), b"mr_web %d" % int(exp), hashlib.sha256).hexdigest())
+
+
 def check_web_password(pw, stored):
     try:
         algo, n, salt, h = str(stored).split("$")
@@ -7689,6 +7707,7 @@ class KaasHub:
                 "send_burst": int(room.cfg.kaas_send_burst), "send_window_s": float(room.cfg.kaas_send_window_s),
                 "airtime_pct": float(room.cfg.kaas_airtime_pct),
                 "radio": radio,
+                "giphy_key": (room.cfg.web_giphy_key or None) if key.get("web") else None,   # (Giphy keys are for browsers)
                 "nodes": {"room": hexs(room.id.pub_key),
                           "tenants": [hexs(t.id.pub_key) for t in list(room.tenants.values())],
                           "repeater": hexs(room.vr.pub) if room.vr is not None else None,
@@ -8330,6 +8349,10 @@ A key is shown once, when it is made: only a hash of it is kept, so a lost key c
 <div class="rprow"><label>Page password <input id="wb_pw" type="password" size="18" maxlength="64" autocomplete="new-password" placeholder="none"></label>
 <button onclick="wbPagePw(this,false)">Set</button><button id="wb_pw_rm" onclick="wbPagePw(this,true)">Remove</button>
 <span class="dim small" id="wb_pw_state"></span></div>
+<div class="rprow"><label title="For MeshCore Web's GIF picker: a free key from developers.giphy.com (an API key, not an SDK key). Web users' browsers use it to search Giphy">Giphy API key
+<input id="wb_giphy" type="password" size="18" maxlength="64" autocomplete="off" placeholder="none"></label>
+<button onclick="wbGiphy(this,false)">Set</button><button id="wb_giphy_rm" onclick="wbGiphy(this,true)">Remove</button>
+<span class="dim small" id="wb_giphy_state"></span></div>
 <div class="rprow"><label title="Channel messages and DMs, so web users catch up on what they missed while away (0 = keep none)">Backlog: keep
 <input id="wb_days" type="number" min="0" step="1" style="width:5em"> days</label><button onclick="wbBacklog(this)">Save</button>
 <label title="Also keep what MQTT observers report (each packet is kept once, whether heard here or reported), and show it to web users as it comes"><input id="wb_bk_mqtt" type="checkbox" onchange="wbSettings({web_backlog_mqtt:this.checked})"> Include MQTT packets</label>
@@ -8447,6 +8470,7 @@ async function kkRevoke(b){if(!confirm("Revoke the API key "+b.dataset.name+"? C
 let WB={users:[],banned:[]};
 async function loadWeb(){if(!MAINADM)return;let d;try{const r=await fetch("api/v1/web/users");if(!r.ok)return;d=await r.json()}catch(e){return}
  WB=d;$("wb_on").checked=d.enabled;$("wb_pw_state").textContent=d.page_password?"set: the page and its logins ask for it":"none: anyone who can reach this server can open the page";$("wb_pw_rm").disabled=!d.page_password;
+ $("wb_giphy_state").textContent=d.giphy_key?"set: web users get a GIF picker":"none: no GIF picker (Giphy links still show)";$("wb_giphy_rm").disabled=!d.giphy_key;
  {const b=d.backlog||{};if(document.activeElement!==$("wb_days"))$("wb_days").value=b.days;$("wb_bk_mqtt").checked=!!b.mqtt;
   $("wb_bk_state").textContent=b.days?(b.count||0).toLocaleString()+" packets kept"+(b.oldest?", the oldest from "+ago(b.oldest)+" ago":""):"off: web users don't catch up";}$("wb_obs").checked=d.trust_observers;$("wb_conn").textContent=d.connected;$("wb_max").textContent=d.max;
  $("wb_burst").textContent=$("kk_burst").textContent;$("wb_win").textContent=$("kk_win").textContent;
@@ -8479,6 +8503,9 @@ async function wbPagePw(btn,remove){const pw=remove?"":$("wb_pw").value;
  if(!remove&&(pw.length<4||pw.length>64)){$("wbmsg").className="poor small";$("wbmsg").textContent=" A page password is 4 to 64 characters.";return}
  if(remove&&!confirm("Remove the MeshCore Web page password? Anyone who can reach this server can then open the page."))return;
  btn.disabled=true;await wbSettings({page_password:pw});btn.disabled=false;$("wb_pw").value=""}
+async function wbGiphy(btn,remove){const k=remove?"":$("wb_giphy").value.trim();
+ if(!remove&&!/^[A-Za-z0-9]{8,64}$/.test(k)){$("wbmsg").className="poor small";$("wbmsg").textContent=" A Giphy API key is letters and digits.";return}
+ btn.disabled=true;await wbSettings({giphy_key:k});btn.disabled=false;$("wb_giphy").value=""}
 async function wbSettings(o){const m=await tnPost("api/v1/web/settings",o);$("wbmsg").className="poor small";$("wbmsg").textContent=m?" "+m:"";setTimeout(loadWeb,500)}
 async function wbAct(btn){const a=btn.dataset.act,p=btn.dataset.pub;if(!a)return;
  if(a==="ban"&&!confirm("Ban "+(btn.dataset.name||p.slice(0,8))+"? They are disconnected now and can't log in with this key again."))return;
@@ -8850,8 +8877,6 @@ class WebUI:
         thtml = DASHBOARD_HTML.replace("<script>\nconst TENANT=", "<script>window.TENANT=true</script><script>\nconst TENANT=")
         tpage = (thtml.encode(), gzip.compress(thtml.encode(), 6))
         tsessions = {}                                      # token -> (expiry, tenant key hex)
-        wpsessions = {}                                     # MeshCore Web page: token -> (expiry, the password hash)
-        WEB_PAGE_SESSION_S = 30 * 86400
         tsnaps = {}                                         # tenant key -> (state dict, raw, gzipped)
         t_last_advert = {}
         viewers = {}                                        # client id -> (last seen, admin)
@@ -9151,11 +9176,8 @@ class WebUI:
                     return True
                 for part in (self.headers.get("Cookie") or "").split(";"):
                     k, _, v = part.strip().partition("=")
-                    if k == "mr_web":
-                        with slock:
-                            e = wpsessions.get(v)
-                            if e is not None and e[0] >= time.monotonic() and hmac.compare_digest(e[1], h):
-                                return True
+                    if k == "mr_web" and web_page_session_ok(v, h):
+                        return True
                 return False
 
             def _page_password_ok(self, pw):
@@ -9183,12 +9205,7 @@ class WebUI:
                 if not cfg.web_page_password or not check_web_password(pw, cfg.web_page_password):
                     time.sleep(1.0)
                     return self._web_unlock_page("That isn't the password." if cfg.web_page_password else "")
-                tok = secrets.token_hex(24)
-                with slock:
-                    now_m = time.monotonic()
-                    for k in [k for k, e in wpsessions.items() if e[0] < now_m]:
-                        del wpsessions[k]
-                    wpsessions[tok] = (now_m + WEB_PAGE_SESSION_S, cfg.web_page_password)
+                tok = web_page_session(cfg.web_page_password)
                 self.send_response(303)
                 self.send_header("Location", "./")
                 self.send_header("Set-Cookie", "mr_web=%s; HttpOnly; SameSite=Strict; Path=/; Max-Age=%d" % (tok, WEB_PAGE_SESSION_S))
@@ -9258,7 +9275,7 @@ class WebUI:
                     hub = room.kaas
                     return self._send(200, json.dumps({
                         "enabled": bool(cfg.web_login), "trust_observers": bool(cfg.web_trust_observers),
-                        "page_password": bool(cfg.web_page_password),
+                        "page_password": bool(cfg.web_page_password), "giphy_key": bool(cfg.web_giphy_key),
                         "backlog": hub.backlog_info(),
                         "max": int(cfg.web_max_clients), "connected": sum(1 for c in hub.conns if c.web),
                         "users": hub.web_rows(), "banned": [b for b in (cfg.web_banned or []) if isinstance(b, dict)]}))
@@ -9426,6 +9443,11 @@ class WebUI:
                         if not isinstance(pw, str) or (pw and not 4 <= len(pw) <= 64):
                             return self._send(400, '{"error":"page password: 4 to 64 characters, or empty for none"}')
                         change["web_page_password"] = hash_web_password(pw) if pw else ""   # (hashed here: never stored)
+                    if "giphy_key" in body:
+                        k = body["giphy_key"]
+                        if not isinstance(k, str) or not re.fullmatch(r"[A-Za-z0-9]{0,64}", k.strip()):
+                            return self._send(400, '{"error":"a Giphy API key is letters and digits"}')
+                        change["web_giphy_key"] = k.strip()
                     if "web_backlog_mqtt" in body and isinstance(body["web_backlog_mqtt"], bool):
                         change["web_backlog_mqtt"] = body["web_backlog_mqtt"]
                     if "web_backlog_days" in body:

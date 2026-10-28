@@ -90,12 +90,14 @@ export function reactionText(emoji, hash, author = null) {
   return (author ? "@[" + author + "]" : "") + emoji + "\n" + hash;
 }
 
-// The forms a message's text may have been hashed in: as received, trimmed of spaces and tabs, and without leading
-// @[mentions] (apps hash a message as they show it).
+// The forms a message's text may have been hashed in, the one to send with first: trimmed of tabs and Unicode spaces at
+// the ends (never newlines), mentions kept, as MeshCore One holds it; as received; without leading "@[Name] " mentions
+// (as some apps show it); and without leading mentions in either form, "@[Name] " or reply markup "@[Name]\n".
 export function hashTexts(text) {
-  const trimmed = text.replace(/^[ \t]+|[ \t]+$/g, "");
-  const bare = trimmed.replace(/^(?:@\[[^\]]*\][ \t]*\n?[ \t]*)+/, "");
-  return [...new Set([text, trimmed, bare])];
+  const trimmed = text.replace(/^[\t\p{Zs}]+|[\t\p{Zs}]+$/gu, "");
+  const display = trimmed.replace(/^(?:@\[[^\]]+\] )+/, "");
+  const bare = trimmed.replace(/^(?:@\[[^\]]+\][ \n]?)+/, "");
+  return [...new Set([trimmed, text, display, bare])];
 }
 
 // A message of nothing but emoji, at most 5: shown large.

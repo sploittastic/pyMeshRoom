@@ -32,8 +32,10 @@ test("reactions: prose and malformed text are not reactions", () => {
 });
 
 test("text forms tried when matching, and emoji-only messages", () => {
-  assert.deepEqual(hashTexts(" @[Bob] hello\t"), [" @[Bob] hello\t", "@[Bob] hello", "hello"]);
+  assert.deepEqual(hashTexts(" @[Bob] hello\t"), ["@[Bob] hello", " @[Bob] hello\t", "hello"]);
   assert.deepEqual(hashTexts("plain"), ["plain"]);
+  assert.deepEqual(hashTexts("hi\u00a0"), ["hi", "hi\u00a0"]);                       // (a no-break space is trimmed too)
+  assert.deepEqual(hashTexts("@[Bob]\n>quote\nreply"), ["@[Bob]\n>quote\nreply", ">quote\nreply"]);
   assert.equal(emojiOnly("👍"), true);
   assert.equal(emojiOnly("🎉 🎉 🔥"), true);
   assert.equal(emojiOnly("👍👍👍👍👍👍"), false);

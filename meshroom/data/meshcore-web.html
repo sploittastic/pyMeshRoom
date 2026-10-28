@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover, interactive-widget=resizes-content">
-<meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'sha256-8fxUTBG+pS4w6Hii0DRr24KsPIV0IifyEJd+MT4lyV0=' 'self' https://unpkg.com/leaflet@1.9.4/dist/leaflet.js; style-src 'sha256-9FjzK/Bv2jDEWj9ZYFSfryEYCFU9c11okrOqtTaG/K4=' 'self' https://unpkg.com/leaflet@1.9.4/dist/leaflet.css; img-src 'self' data: https://media.giphy.com https://i.giphy.com https://*.tile.openstreetmap.org https://unpkg.com/leaflet@1.9.4/dist/images/; connect-src https: wss: http: ws:; base-uri 'none'; form-action 'none'">
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'sha256-+JsyELjbHxGkdE1O8eg8v2xsWB5wpwFIdseR657nBdM=' 'self' https://unpkg.com/leaflet@1.9.4/dist/leaflet.js; style-src 'sha256-H4R3hSzOToYncAmlANpU7VdX8Mx1SfSYzYInLvbD8Xs=' 'self' https://unpkg.com/leaflet@1.9.4/dist/leaflet.css; img-src 'self' data: https://media.giphy.com https://i.giphy.com https://*.tile.openstreetmap.org https://unpkg.com/leaflet@1.9.4/dist/images/; connect-src https: wss: http: ws:; base-uri 'none'; form-action 'none'">
 <meta name="referrer" content="no-referrer">
 <title>MeshCore Web</title>
 <style>:root {
@@ -277,6 +277,30 @@ dialog.wide { width: min(760px, calc(100% - 32px)); }
 }
 .react-pop button { padding: 4px 0; font-size: 18px; border: none; background: transparent; }
 .react-pop button:hover { background: var(--button); }
+.react-pop .more { font-size: 15px; color: var(--muted); }
+
+/* the composer's emoji and GIF pickers (and the full emoji set for a reaction) */
+.composer .tool { flex: none; padding: 0; width: 38px; height: 38px; font-size: 18px; line-height: 1; }
+.composer .gif-tool { font-size: 12px; font-weight: 700; letter-spacing: .5px; }
+.pick-pop {
+  position: fixed; z-index: 20; display: flex; flex-direction: column; gap: 6px; padding: 8px;
+  width: min(352px, calc(100vw - 16px)); height: min(340px, 60dvh);
+  background: var(--panel); border: 1px solid var(--line); border-radius: 8px; box-shadow: 0 6px 24px rgb(0 0 0 / .35);
+}
+.pick-tabs { display: flex; gap: 2px; overflow-x: auto; flex: none; }
+.pick-tabs button { flex: none; padding: 3px 6px; font-size: 17px; border: none; background: transparent; border-radius: 4px; }
+.pick-tabs button.on { background: var(--button); }
+.pick-grid { flex: 1; min-height: 0; overflow-y: auto; display: grid; grid-template-columns: repeat(auto-fill, minmax(38px, 1fr)); align-content: start; gap: 2px; }
+.pick-grid > button { padding: 4px 0; font-size: 22px; border: none; background: transparent; border-radius: 4px; }
+.pick-grid > button:hover, .pick-grid > button:focus-visible { background: var(--button); }
+.pick-grid.gifs { grid-template-columns: repeat(3, 1fr); gap: 4px; }
+.pick-grid.gifs > button { padding: 0; height: 92px; overflow: hidden; background: var(--line); }
+.pick-grid.gifs img { width: 100%; height: 100%; object-fit: cover; display: block; }
+.pick-grid .pick-msg { grid-column: 1 / -1; color: var(--muted); font-size: 13px; padding: 12px 4px; text-align: center; }
+.pick-foot { flex: none; color: var(--muted); font-size: 11px; text-align: right; }
+.pick-foot:empty { display: none; }
+#gif-q { flex: none; padding: 6px 9px; }
+
 .reaction-note { align-self: center; color: var(--muted); font-size: 12px; }
 .reaction-note .emoji { font-size: 15px; }
 .msg .text.big { font-size: 34px; line-height: 1.2; }
@@ -559,12 +583,14 @@ function reactionText(emoji, hash, author = null) {
   return (author ? "@[" + author + "]" : "") + emoji + "\n" + hash;
 }
 
-// The forms a message's text may have been hashed in: as received, trimmed of spaces and tabs, and without leading
-// @[mentions] (apps hash a message as they show it).
+// The forms a message's text may have been hashed in, the one to send with first: trimmed of tabs and Unicode spaces at
+// the ends (never newlines), mentions kept, as MeshCore One holds it; as received; without leading "@[Name] " mentions
+// (as some apps show it); and without leading mentions in either form, "@[Name] " or reply markup "@[Name]\n".
 function hashTexts(text) {
-  const trimmed = text.replace(/^[ \t]+|[ \t]+$/g, "");
-  const bare = trimmed.replace(/^(?:@\[[^\]]*\][ \t]*\n?[ \t]*)+/, "");
-  return [...new Set([text, trimmed, bare])];
+  const trimmed = text.replace(/^[\t\p{Zs}]+|[\t\p{Zs}]+$/gu, "");
+  const display = trimmed.replace(/^(?:@\[[^\]]+\] )+/, "");
+  const bare = trimmed.replace(/^(?:@\[[^\]]+\][ \n]?)+/, "");
+  return [...new Set([trimmed, text, display, bare])];
 }
 
 // A message of nothing but emoji, at most 5: shown large.
@@ -576,6 +602,42 @@ function emojiOnly(text) {
 }
 
 return { QUICK_REACTIONS, messageHash, parseReaction, reactionText, hashTexts, emojiOnly };
+})();
+
+// src/emoji.js
+const __src_emoji_js = (() => {
+// The emoji picker's emoji, by category. Kept short: the common ones, which every phone and desktop draws.
+
+const split = (s) => [...new Intl.Segmenter(undefined, { granularity: "grapheme" }).segment(s)].map((x) => x.segment).filter((x) => x.trim());
+
+const EMOJI_CATEGORIES = [
+  ["😀", "Smileys", split(
+    "😀😃😄😁😆😅🤣😂🙂🙃😉😊😇🥰😍🤩😘😗😚😙😋😛😜🤪😝🤑🤗🤭🤫🤔🤐🤨😐😑😶😏😒🙄😬🤥😌😔😪🤤😴😷🤒🤕🤢🤮🤧🥵🥶🥴😵🤯🤠🥳😎🤓🧐" +
+    "😕😟🙁☹️😮😯😲😳🥺😦😧😨😰😥😢😭😱😖😣😞😓😩😫🥱😤😡😠🤬😈👿💀☠️💩🤡👻👽🤖😺😸😹😻😼😽🙀😿😾")],
+  ["👍", "People", split(
+    "👋🤚🖐️✋🖖👌🤌🤏✌️🤞🤟🤘🤙👈👉👆👇☝️👍👎✊👊🤛🤜👏🙌👐🤲🤝🙏✍️💪🦾🦵🦶👂👃🧠👀👁️👅👄" +
+    "👶🧒👦👧🧑👱👨🧔👩🧓👴👵🙍🙎🙅🙆💁🙋🧏🙇🤦🤷👮🕵️💂👷🤴👸🧙🧚🧛🧜🧝🧞🧟🚶🏃💃🕺👯🧘")],
+  ["❤️", "Hearts", split(
+    "❤️🧡💛💚💙💜🖤🤍🤎💔❣️💕💞💓💗💖💘💝💟💌💋💯💢💥💫💦💨🕳️💬🗨️🗯️💭💤✨⭐🌟⚡🔥🌈☀️🌙☁️⛅🌧️⛈️❄️☃️🌊")],
+  ["🐶", "Nature", split(
+    "🐶🐱🐭🐹🐰🦊🐻🐼🐨🐯🦁🐮🐷🐸🐵🙈🙉🙊🐔🐧🐦🐤🦆🦅🦉🦇🐺🐗🐴🦄🐝🐛🦋🐌🐞🐜🦟🐢🐍🦎🐙🦑🦐🦀🐡🐠🐟🐬🐳🐋🦈🐊" +
+    "🌵🎄🌲🌳🌴🌱🌿☘️🍀🍁🍂🍃🌷🌹🥀🌺🌸🌼🌻🌞🌝🌎🌍🌏🪐")],
+  ["🍕", "Food", split(
+    "🍏🍎🍐🍊🍋🍌🍉🍇🍓🫐🍈🍒🍑🥭🍍🥥🥝🍅🥑🍆🥔🥕🌽🌶️🥒🥬🥦🧄🧅🍄🥜🍞🥐🥖🥨🧀🥚🍳🥓🥩🍗🍖🌭🍔🍟🍕🥪🌮🌯🥗🍝🍜🍲🍛🍣🍱🥟🍤🍙🍚🍘" +
+    "🍦🍧🍨🍩🍪🎂🍰🧁🥧🍫🍬🍭🍮🍯🍼☕🍵🧃🥤🍶🍺🍻🥂🍷🥃🍸🍹🧉🍾🧊")],
+  ["⚽", "Activities", split(
+    "⚽🏀🏈⚾🥎🎾🏐🏉🥏🎱🏓🏸🏒🏑🥍🏏⛳🪁🏹🎣🤿🥊🥋🎽🛹🛼🛷⛸️🎿⛷️🏂🏋️🤸⛹️🤺🤾🏌️🏇🧗🚴🚵🏆🥇🥈🥉🏅🎖️🎗️🎫🎟️🎪🎭🎨🎬🎤🎧🎼🎹🥁🎷🎺🎸🎻🎲♟️🎯🎳🎮🎰🧩")],
+  ["🚗", "Travel", split(
+    "🚗🚕🚙🚌🚎🏎️🚓🚑🚒🚐🛻🚚🚛🚜🏍️🛵🚲🛴🚨🚔🚍🚘🚖✈️🛫🛬🛩️🚁🚀🛸⛵🚤🛥️🛳️⛴️🚢⚓🚧⛽🚦🚥🗺️🗿🗽🗼🏰🏯🏟️🎡🎢🎠⛲⛱️🏖️🏝️🏜️🌋⛰️🏔️🗻🏕️⛺🏠🏡🏘️🏚️🏗️🏭🏢🏬🏣🏤🏥🏦🏨🏪🏫🏩💒🏛️⛪🕌🕍🛕🕋⛩️🌁🌃🏙️🌄🌅🌆🌇🌉🎆🎇")],
+  ["💡", "Objects", split(
+    "⌚📱📲💻⌨️🖥️🖨️🖱️💾💿📷📸📹🎥📞☎️📟📠📺📻🎙️🎚️🎛️🧭⏱️⏲️⏰🕰️⌛⏳📡🔋🔌💡🔦🕯️🧯💸💵💰💳💎⚖️🧰🔧🔨⚒️🛠️⛏️🔩⚙️🧱⛓️🧲🔫💣🧨🪓🔪🗡️⚔️🛡️🚬⚰️🔮📿🧿💈⚗️🔭🔬🩹💊💉🧬🦠🧪🌡️🧹🧺🧻🚽🚰🚿🛁🔑🗝️🚪🛋️🛏️🧸🎁🎈🎏🎀🎊🎉📦📫📬📮✉️📩📨📧📝📁📂📅📆📇📈📉📊📋📌📍📎🖇️📏📐✂️🔒🔓🔏🔐")],
+  ["✅", "Symbols", split(
+    "✅☑️✔️❌❎➕➖➗✖️♾️‼️⁉️❓❔❕❗〰️⚠️🚸⛔🚫🚳🚭🚯🚱🚷📵🔞☢️☣️⬆️↗️➡️↘️⬇️↙️⬅️↖️↕️↔️↩️↪️⤴️⤵️🔃🔄🔙🔚🔛🔜🔝🛐⚛️☮️✝️☪️☯️🔯🕎☸️♈♉♊♋♌♍♎♏♐♑♒♓⛎🔀🔁🔂▶️⏩⏭️⏯️◀️⏪⏮️🔼⏫🔽⏬⏸️⏹️⏺️⏏️🎦🔅🔆📶📳📴♻️🔱📛🔰⭕🆗🆒🆕🆓🆙🆘🆚🔴🟠🟡🟢🔵🟣🟤⚫⚪🟥🟧🟨🟩🟦🟪🟫⬛⬜🔶🔷🔸🔹🔺🔻💠🔘🔳🔲🏁🚩🎌🏴🏳️🏳️‍🌈🏴‍☠️")],
+];
+
+const RECENT_MAX = 32;
+
+return { EMOJI_CATEGORIES, RECENT_MAX };
 })();
 
 // src/gif.js
@@ -610,8 +672,10 @@ function findGifs(text) {
 const gifUrl = (id) => "https://media.giphy.com/media/" + id + "/giphy.gif";
 const gifFallbackUrl = (id) => "https://i.giphy.com/" + id + ".gif";
 const gifPageUrl = (id) => "https://giphy.com/gifs/" + id;
+// A small rendition, for the GIF picker.
+const gifThumbUrl = (id) => "https://media.giphy.com/media/" + id + "/200w.gif";
 
-return { findGifs, gifUrl, gifFallbackUrl, gifPageUrl };
+return { findGifs, gifUrl, gifFallbackUrl, gifPageUrl, gifThumbUrl };
 })();
 
 // src/kaas.js
@@ -673,6 +737,10 @@ const TICKET_OUTCOMES = {
 };
 TICKET_OUTCOMES.unused = TICKET_OUTCOMES.waiting;
 
+// Reconnecting: after 1 s, then twice as long each time, up to 15 s (a server restart is back within a few tries).
+const RETRY_FIRST_MS = 1000;
+const RETRY_MAX_MS = 15000;
+
 const CLOSE_REASONS = {
   4003: "this key is banned from this server",
   4004: "web logins were turned off on this server",
@@ -695,7 +763,7 @@ class KaasClient extends EventTarget {
     this.hello = null;
     this.state = "closed";
     this.stopped = true;
-    this.retryMs = 2000;
+    this.retryMs = RETRY_FIRST_MS;
     this.timer = null;
     this.nextId = 1;
     this.waiting = new Map();             // send id -> {resolve, packet}
@@ -717,7 +785,19 @@ class KaasClient extends EventTarget {
   // Resolves with hello on the first connection; rejects (AuthError for a bad key) if that one fails.
   start() {
     this.stopped = false;
+    if (!this.wake && typeof window !== "undefined") {
+      this.wake = () => this.retryNow();
+      window.addEventListener("online", this.wake);
+      document.addEventListener("visibilitychange", () => document.visibilityState === "visible" && this.wake());
+    }
     return this.connect();
+  }
+
+  // Waiting to reconnect: try now (the network came back, or the tab was shown again).
+  retryNow() {
+    if (this.stopped || !this.timer || this.state !== "closed") return;
+    this.retryMs = RETRY_FIRST_MS;
+    this.connect().catch(() => {});
   }
 
   stop() {
@@ -778,7 +858,7 @@ class KaasClient extends EventTarget {
             if (msg.type !== "hello") return;
             opened = true;
             this.hello = msg;
-            this.retryMs = 2000;
+            this.retryMs = RETRY_FIRST_MS;
             this.setState("open");
             this.emit("hello", msg);
             resolve(msg);
@@ -830,7 +910,7 @@ class KaasClient extends EventTarget {
   retry(reason) {
     if (this.stopped) return;
     const wait = this.retryMs;
-    this.retryMs = Math.min(this.retryMs * 2, 60000);
+    this.retryMs = Math.min(this.retryMs * 2, RETRY_MAX_MS);
     this.setState("closed", reason + "; retrying in " + Math.round(wait / 1000) + " s");
     this.timer = setTimeout(() => this.connect().catch(() => {}), wait);
   }
@@ -1930,6 +2010,10 @@ function write(key, value) {
 const loadSettings = () => read("settings", {});
 const saveSettings = (s) => write("settings", s);
 
+// The emoji picker's recently used, most recent first.
+const loadRecentEmoji = () => read("emoji.recent", []);
+const saveRecentEmoji = (list) => write("emoji.recent", list);
+
 // Per identity (its public key), so two identities in one browser don't share channels or history.
 const loadChannels = (pubHex) => read("channels." + pubHex.slice(0, 16), null);
 const saveChannels = (pubHex, list) => write("channels." + pubHex.slice(0, 16), list);
@@ -1957,7 +2041,7 @@ function forgetEverything() {
   }
 }
 
-return { loadSettings, saveSettings, loadChannels, saveChannels, loadHistory, saveHistory, loadContacts, saveContacts, loadConversations, saveConversations, loadCursor, saveCursor, forgetEverything };
+return { loadSettings, saveSettings, loadRecentEmoji, saveRecentEmoji, loadChannels, saveChannels, loadHistory, saveHistory, loadContacts, saveContacts, loadConversations, saveConversations, loadCursor, saveCursor, forgetEverything };
 })();
 
 // src/app.js
@@ -1966,18 +2050,19 @@ const __src_app_js = (() => {
 // The private key, channel secrets and room passwords never leave the browser; the server only sees encrypted packets.
 const { bytesToHex, hexToBytes, randomBytes, utf8Decode, utf8Encode } = __src_bytes_js;
 const { QUICK_REACTIONS, emojiOnly, hashTexts, messageHash, parseReaction, reactionText } = __src_format_js;
-const { findGifs, gifFallbackUrl, gifPageUrl, gifUrl } = __src_gif_js;
+const { EMOJI_CATEGORIES, RECENT_MAX } = __src_emoji_js;
+const { findGifs, gifFallbackUrl, gifPageUrl, gifThumbUrl, gifUrl } = __src_gif_js;
 const { AuthError, KaasClient, PagePasswordNeeded, kaasEndpoints } = __src_kaas_js;
 const { showMap } = __src_map_js;
 const { Identity, MAX_NAME_LEN, MAX_TEXT_LEN, PT_ADVERT, PT_GRP_TXT, advertPayload, channelMessagePacket, floodPacket, makeChannel, packetHash, parsePacket, readChannelMessage, textBudget, zeroHopPacket } = __src_meshcore_js;
 const { LoginFailed, MAX_ROOM_POST_LEN, MeshNode } = __src_node_js;
-const { loadChannels, loadContacts, loadCursor, saveCursor, loadConversations, loadHistory, loadSettings, saveChannels, saveContacts, saveConversations, saveHistory, saveSettings } = __src_store_js;
+const { loadChannels, loadContacts, loadCursor, saveCursor, loadConversations, loadHistory, loadRecentEmoji, loadSettings, saveChannels, saveContacts, saveConversations, saveHistory, saveRecentEmoji, saveSettings } = __src_store_js;
 const { seal, unseal } = __src_vault_js;
 const HISTORY_PER_CONVERSATION = 300;
 const SEEN_MAX = 4096;
 const DIRECTORY_EVERY_MS = 15 * 60 * 1000;     // the server's node directory, refreshed this often
 const DIRECTORY_DAYS = 30;
-const REACTION_WINDOW_MS = 48 * 3600 * 1000;   // a reaction is matched against messages this recent
+const REACTION_WINDOW_MS = 7 * 86400 * 1000;   // a reaction is matched against messages this recent
 const $ = (id) => document.getElementById(id);
 
 const app = {
@@ -2394,6 +2479,15 @@ function onChannelPacket(pkt, dir, snr) {
   if (!m) return;
   const msgs = app.history[m.channel.keyHex] || [];
   if (msgs.some((x) => x.ts === m.ts && x.sender === m.sender && x.text === m.text)) return;   // (resent)
+  // a retry: the same text from the same sender, stamped anew. One message, but a reaction may hash either stamp
+  const retried = msgs.slice(-30).find((x) => !x.mine && !x.reaction && x.sender === m.sender && x.text === m.text &&
+    Math.abs(x.ts - m.ts) <= 120);
+  if (retried) {
+    retried.tsAlt = [...new Set([...(retried.tsAlt || []), m.ts])];
+    reactionHashes.delete(retried);
+    attachParked(m.channel.keyHex, retried);
+    return scheduleSave();
+  }
   addIncoming(m.channel.keyHex, { id: newId(), ts: m.ts, at: app.lastPkt?.at || Date.now(), sender: m.sender, text: m.text,
     hops: pkt.isFlood ? pkt.hops : null, snr: dir === "rx" ? snr : null, dir, old: app.lastPkt?.old || undefined });
 }
@@ -2420,10 +2514,11 @@ function onPost({ room, author, text, ts }) {
 function addIncoming(key, msg) {
   if (takeReaction(key, msg)) return;
   (app.history[key] ||= []).push(msg);
+  const redraw = attachParked(key, msg, false);
   scheduleSave();
   if (key !== app.active || document.hidden) app.unread[key] = (app.unread[key] || 0) + 1;
   if (app.catchingUp) return void app.touched.add(key);   // (drawn once, in order, when the catch-up ends)
-  if (key === app.active) appendMessage(msg);
+  if (key === app.active) redraw ? renderConversation() : appendMessage(msg);
   renderSidebar();
   updateTitle();
 }
@@ -2504,7 +2599,8 @@ function takeReaction(key, msg) {
   if (!r) return false;
   const target = r.legacy ? null : findReactionTarget(key, r);
   if (!target) {
-    msg.reaction = { emoji: r.emoji, to: r.targetSender || null };
+    // shown as a note until its message turns up (one still coming in a catch-up, or a retry stamped anew)
+    msg.reaction = { emoji: r.emoji, to: r.targetSender || null, hash: r.legacy ? undefined : r.hash };
     return false;
   }
   addReaction(target, r.emoji, msg.sender);
@@ -2515,11 +2611,46 @@ function takeReaction(key, msg) {
 
 function findReactionTarget(key, r) {
   const since = Date.now() - REACTION_WINDOW_MS;
-  const msgs = (app.history[key] || []).filter((m) => !m.reaction && m.at >= since);
-  const hit = (m) => hashTexts(m.text).some((t) => messageHash(t, m.ts) === r.hash);
+  const msgs = (app.history[key] || []).filter((m) => !m.reaction && (m.at || m.ts * 1000) >= since);
+  const hit = (m) => hashesOf(m, key).has(r.hash);
   for (const pass of [(m) => m.sender === r.targetSender, () => true])
     for (let i = msgs.length - 1; i >= 0; i--) if (pass(msgs[i]) && hit(msgs[i])) return msgs[i];
   return null;
+}
+
+// Every hash a reaction to this message may carry (worked out once): each text form (hashTexts), with each stamp it
+// may have been hashed with. Received: as received, and any retry's. Ours: as sent, and the next 3 s (as MeshTrax
+// tries: apps that stamp their own copy a little later); in a room, the server stamps the post with its own clock, so
+// two minutes either side. (40-bit hashes: trying more stamps doesn't make a wrong match likely.)
+const reactionHashes = new WeakMap();
+function hashesOf(m, key) {
+  let set = reactionHashes.get(m);
+  if (set) return set;
+  const stamps = new Set([m.ts, ...(m.tsAlt || [])]);
+  if (m.mine) {
+    const [from, to] = key.startsWith("room:") ? [-120, 120] : [0, 3];
+    for (let d = from; d <= to; d++) stamps.add(m.ts + d);
+  }
+  set = new Set();
+  for (const t of hashTexts(m.text)) for (const s of stamps) set.add(messageHash(t, s));
+  reactionHashes.set(m, set);
+  return set;
+}
+
+// A message just added: reactions to it that came first (shown as notes) go onto it. True if any did (then the
+// conversation is drawn again, unless `draw` is false).
+function attachParked(key, m, draw = true) {
+  const list = app.history[key] || [];
+  const parked = list.filter((x) => x.reaction?.hash && !x.mine);
+  if (!parked.length || m.reaction) return false;
+  const hashes = hashesOf(m, key);
+  const hits = parked.filter((x) => hashes.has(x.reaction.hash));
+  if (!hits.length) return false;
+  for (const x of hits) addReaction(m, x.reaction.emoji, x.sender);
+  app.history[key] = list.filter((x) => !hits.includes(x));
+  scheduleSave();
+  if (draw && key === app.active && !app.catchingUp) renderConversation();
+  return true;
 }
 
 function addReaction(m, emoji, who) {
@@ -2539,7 +2670,7 @@ async function react(m, emoji) {
   updateMessage(m);
   scheduleSave();
   // the hash covers the text as the author's app holds it: in a channel the body trimmed, else exactly as sent
-  const hash = messageHash(cv.kind === "channel" ? hashTexts(m.text)[1] || m.text : m.text, m.ts);
+  const hash = messageHash(cv.kind === "channel" ? hashTexts(m.text)[0] : m.text, m.ts);
   const text = reactionText(emoji, hash, cv.kind === "dm" ? null : m.sender);
   let ok;
   if (cv.kind === "channel") {
@@ -2564,7 +2695,9 @@ function openReactPicker(m, button) {
   const pop = $("react-pop");
   if (pickerFor === m && !pop.hidden) return closeReactPicker();
   pickerFor = m;
-  pop.replaceChildren(...QUICK_REACTIONS.map((e) => el("button", { type: "button", "aria-label": "React " + e, onclick: () => react(m, e) }, e)));
+  pop.replaceChildren(...QUICK_REACTIONS.map((e) => el("button", { type: "button", "aria-label": "React " + e, onclick: () => react(m, e) }, e)),
+    el("button", { type: "button", class: "more", "aria-label": "More emoji", title: "More emoji",
+      onclick: (ev) => { ev.stopPropagation(); openPicker("emoji", button, m); } }, "＋"));
   pop.hidden = false;
   const r = button.getBoundingClientRect(), w = pop.offsetWidth;
   pop.style.left = Math.max(8, Math.min(window.innerWidth - w - 8, r.right - w)) + "px";
@@ -2848,12 +2981,108 @@ function updateComposer() {
   const ok = canSend();
   $("send").disabled = !ok || left < 0 || !$("text").value.trim();
   $("text").placeholder = ok ? "Message " + (conv()?.title || "") : "Can't send right now";
+  $("gif-btn").hidden = !gifsOn() || !giphyKey();
   $("advert").disabled = !ok;
 }
 
 function updateTitle() {
   const n = Object.values(app.unread).reduce((a, b) => a + b, 0);
   document.title = (n ? "(" + n + ") " : "") + "MeshCore Web";
+}
+
+// ---------------------------------------------------------------- emoji and GIF pickers
+
+let picker = null;              // {kind: "emoji" | "gif", react?: message to react to, tab?, seq?}
+
+const giphyKey = () => app.client?.hello?.giphy_key || "";
+
+// Text into the message box at the caret, with a space between it and words either side.
+function insertText(t, spaced = false) {
+  const ta = $("text");
+  const a = ta.selectionStart ?? ta.value.length, b = ta.selectionEnd ?? a;
+  const before = ta.value.slice(0, a), after = ta.value.slice(b);
+  const pre = spaced && before && !/\s$/.test(before) ? " " : "", post = spaced && !/^\s/.test(after) ? " " : "";
+  ta.value = before + pre + t + post + after;
+  const caret = (before + pre + t + post).length;
+  ta.setSelectionRange(caret, caret);
+  autosize();
+  updateComposer();
+  updateGifPreview();
+}
+
+function openPicker(kind, anchor, react = null) {
+  if (picker && picker.kind === kind && !picker.react === !react && !$("pick-pop").hidden) return closePicker();
+  closeReactPicker();
+  picker = { kind, react, tab: loadRecentEmoji().length ? -1 : 0, seq: 0 };
+  const pop = $("pick-pop");
+  pop.hidden = false;
+  $("gif-q").hidden = kind !== "gif";
+  $("pick-tabs").hidden = kind !== "emoji";
+  if (kind === "emoji") renderEmojiTab();
+  else {
+    $("gif-q").value = "";
+    searchGifs();
+    if (matchMedia("(hover: hover)").matches) $("gif-q").focus();   // (on a phone, not the keyboard at once)
+  }
+  placePicker(anchor);
+}
+
+function placePicker(anchor) {
+  const pop = $("pick-pop"), r = anchor.getBoundingClientRect(), w = pop.offsetWidth, h = pop.offsetHeight;
+  pop.style.left = Math.max(8, Math.min(window.innerWidth - w - 8, r.left)) + "px";
+  pop.style.top = (r.top - h - 6 >= 8 ? r.top - h - 6 : Math.min(window.innerHeight - h - 8, r.bottom + 6)) + "px";
+}
+
+function closePicker() {
+  picker = null;
+  $("pick-pop").hidden = true;
+}
+
+function renderEmojiTab() {
+  const recent = loadRecentEmoji();
+  const tabs = [...(recent.length ? [["🕘", "Recent", recent]] : []), ...EMOJI_CATEGORIES];
+  const at = Math.max(0, Math.min(tabs.length - 1, picker.tab + (recent.length ? 1 : 0)));
+  $("pick-tabs").replaceChildren(...tabs.map(([icon, name], i) => el("button", {
+    type: "button", role: "tab", title: name, "aria-label": name, class: i === at ? "on" : "", "aria-selected": String(i === at),
+    onclick: () => { picker.tab = i - (recent.length ? 1 : 0); renderEmojiTab(); $("pick-grid").scrollTop = 0; },
+  }, icon)));
+  const grid = $("pick-grid");
+  grid.className = "pick-grid";
+  grid.replaceChildren(...tabs[at][2].map((e) => el("button", { type: "button", "aria-label": e, onclick: () => pickEmoji(e) }, e)));
+  $("pick-foot").textContent = "";
+}
+
+function pickEmoji(e) {
+  saveRecentEmoji([e, ...loadRecentEmoji().filter((x) => x !== e)].slice(0, RECENT_MAX));
+  if (picker?.react) {
+    const m = picker.react;
+    closePicker();
+    return react(m, e);
+  }
+  insertText(e);
+}
+
+let gifTimer = null;
+async function searchGifs() {
+  const q = $("gif-q").value.trim(), seq = ++picker.seq, grid = $("pick-grid");
+  grid.className = "pick-grid gifs";
+  $("pick-foot").textContent = "Powered by GIPHY";
+  if (!grid.children.length) grid.replaceChildren(el("div", { class: "pick-msg" }, "Loading…"));
+  const url = "https://api.giphy.com/v1/gifs/" + (q ? "search" : "trending") + "?api_key=" + encodeURIComponent(giphyKey()) +
+    "&limit=24&rating=pg-13" + (q ? "&q=" + encodeURIComponent(q) : "");
+  let ids;
+  try {
+    const r = await fetch(url, { cache: "no-store", referrerPolicy: "no-referrer" });
+    if (!r.ok) throw new Error(r.status === 401 || r.status === 403 ? "Giphy refused this server's API key." : "Giphy answered " + r.status + ".");
+    ids = ((await r.json()).data || []).map((g) => String(g.id || "")).filter((id) => /^[A-Za-z0-9]{6,40}$/.test(id));
+  } catch (e) {
+    if (picker?.seq === seq) grid.replaceChildren(el("div", { class: "pick-msg" }, e.message.startsWith("Giphy") ? e.message : "Can't reach Giphy."));
+    return;
+  }
+  if (picker?.kind !== "gif" || picker.seq !== seq) return;
+  grid.replaceChildren(...(ids.length ? ids.map((id) => el("button", {
+    type: "button", "aria-label": "GIF", onclick: () => { closePicker(); insertText(gifPageUrl(id), true); $("text").focus(); },
+  }, el("img", { src: gifThumbUrl(id), alt: "", loading: "lazy" }))) : [el("div", { class: "pick-msg" }, "No GIFs found.")]));
 }
 
 function autosize() {
@@ -3231,7 +3460,17 @@ function wire() {
   $("toggle-side").addEventListener("click", () => $("sidebar").classList.toggle("open"));
   document.addEventListener("click", (e) => {
     if (!$("react-pop").hidden && !e.target.closest("#react-pop, .react-btn")) closeReactPicker();
+    // (by the path the click took: a tab redraws itself, so its button may have left the page by now)
+    const inside = e.composedPath().some((n) => ["pick-pop", "emoji-btn", "gif-btn", "react-pop"].includes(n.id));
+    if (picker && !inside) closePicker();
   });
+  document.addEventListener("keydown", (e) => { if (e.key === "Escape" && picker) { closePicker(); $("text").focus(); } });
+  for (const [id, kind] of [["emoji-btn", "emoji"], ["gif-btn", "gif"]]) {
+    $(id).addEventListener("mousedown", (e) => e.preventDefault());    // (the message box keeps focus, and the keyboard)
+    $(id).addEventListener("click", () => openPicker(kind, $("composer")));
+  }
+  $("gif-q").addEventListener("input", () => { clearTimeout(gifTimer); gifTimer = setTimeout(searchGifs, 350); });
+  $("pick-pop").addEventListener("mousedown", (e) => { if (e.target.closest("button")) e.preventDefault(); });
   $("messages").addEventListener("scroll", closeReactPicker);
   document.addEventListener("visibilitychange", () => {
     if (!document.hidden && app.active && app.unread[app.active]) {
@@ -3354,6 +3593,8 @@ return {  };
     <div class="gif-preview" id="gif-preview" hidden></div>
     <div class="mentions" id="mentions" role="listbox" aria-label="Mention someone" hidden></div>
     <form class="composer" id="composer" autocomplete="off">
+      <button type="button" id="emoji-btn" class="ghost tool" aria-label="Emoji" title="Emoji">😊</button>
+      <button type="button" id="gif-btn" class="ghost tool gif-tool" aria-label="GIF" title="GIFs from Giphy" hidden>GIF</button>
       <textarea id="text" rows="1" placeholder="Message" aria-label="Message" autocomplete="off" autocapitalize="sentences"
         enterkeyhint="send" inputmode="text" data-1p-ignore data-lpignore="true" data-bwignore data-form-type="other"></textarea>
       <span class="count" id="count"></span>
@@ -3471,6 +3712,12 @@ return {  };
 </dialog>
 
 <div class="react-pop" id="react-pop" role="menu" aria-label="React" hidden></div>
+<div class="pick-pop" id="pick-pop" hidden>
+  <div class="pick-tabs" id="pick-tabs" role="tablist"></div>
+  <input id="gif-q" type="search" placeholder="Search Giphy" aria-label="Search Giphy" autocomplete="off" hidden>
+  <div class="pick-grid" id="pick-grid"></div>
+  <div class="pick-foot" id="pick-foot"></div>
+</div>
 <div class="toast" id="toast" role="status" hidden></div>
 </body>
 </html>

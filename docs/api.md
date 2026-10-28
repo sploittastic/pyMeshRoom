@@ -162,7 +162,7 @@ they were last connected. Its **Actions** menu adds:
 The admin can also set a **page password** on the card (`web_page_password`, stored hashed). Then:
 
 * `/meshcore-web/` shows a password form first. The right password gives that browser a page session (an `HttpOnly`
-  cookie, 30 days).
+  cookie, 30 days). It's signed, not stored, so it outlives a restart.
 * `/api/v1/web/challenge` and `/api/v1/web/login` need either that cookie or `"page_password"` in their JSON body.
   Without them they answer 401 with `{"error": ..., "page_password": true}`, after a one-second delay.
 * A new password, or removing it, ends every page session.
@@ -200,6 +200,9 @@ Close codes from the server:
  "nodes": {"room": "<64 hex>", "tenants": [], "repeater": null, "companion": null},
  "names": {"<64 hex>": "My Room"}}
 ```
+
+A web session's hello also has `"giphy_key"`: the admin's Giphy API key for the GIF picker (`web_giphy_key`, set on
+the Web users card), or null. Giphy API keys are meant for browsers; an API key's hello always has null.
 
 `nodes` lists the public keys of the nodes running on this radio, and `names` gives the room's and each tenant room's
 name by public key.
@@ -364,6 +367,7 @@ Bad input gets `{"type": "error", "id": ..., "error": ...}`. Questions share the
 | `web_trust_observers` | false | A key heard only by an MQTT observer may send too. |
 | `web_hosts` | `[]` | More host names a login may be signed for, behind a proxy elsewhere that rewrites `Host`. |
 | `web_page_password` | `""` | A password for the MeshCore Web page and its logins, hashed. Set from the dashboard. |
+| `web_giphy_key` | `""` | A Giphy API key for MeshCore Web's GIF picker (developers.giphy.com). Set from the dashboard. |
 | `web_backlog_days` | 30 | Keep channel messages and DMs this many days, for web users to catch up (0 = none). |
 | `web_backlog_mqtt` | false | Keep what MQTT observers report too (each packet once), and show it to web users live. |
 

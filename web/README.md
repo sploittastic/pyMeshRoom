@@ -80,14 +80,22 @@ What you get:
   describes it.
   * **On the wire:** `@[Author]👍` and a second line holding the message's hash: 8 Crockford Base32 characters of
     SHA-256(text + its timestamp). In a DM, just `👍` and the hash.
-  * **Receiving:** a reaction is matched against the last 48 hours of that conversation and shown as a chip on its
-    message. One whose message isn't here shows as a short note, not as raw text.
+  * **Receiving:** a reaction is matched against the last 7 days of that conversation and shown as a chip on its
+    message. It's tried against each form the text may have been hashed in (trimmed, as received, without leading
+    mentions), and each timestamp the message may have carried: a retry's too (a retried message shows once), the
+    next few seconds for our own, and the room server's own stamp for our room posts. One whose message isn't here
+    shows as a short note, not as raw text, and moves onto its message if that turns up later (during a catch-up,
+    say).
+  * **Picking:** the quick row, or **＋** for any emoji.
   * **Sending:** react from the button on any message, or press a chip to add yours.
   * **meshcore-open's older `r:HASH:INDEX`:** shown as a note. Its hash can't be reproduced outside Dart, so it can't
     be attached to a message.
 * A message of nothing but emoji, up to 5, is shown large.
 * **GIFs:** a Giphy link in a message (`https://giphy.com/gifs/…`, as Giphy's Share button copies it, with or without
-  the `https://`), or meshcore-open's `g:ID`, shows as the GIF itself. To send one, paste the link; the GIF is previewed while you type. Other MeshCore apps see the link.
+  the `https://`), or meshcore-open's `g:ID`, shows as the GIF itself. To send one, paste the link, or pick one with
+  **GIF** next to the message box (trending, or search Giphy; shown when the server's admin has set a Giphy API key).
+  The GIF is previewed while you type. Other MeshCore apps see the link.
+* **😊** next to the message box picks emoji, by category, with the ones you used lately first.
   **Show GIFs from Giphy** in the sidebar turns this off: loading a GIF lets Giphy see your IP address.
 * Your own messages show **Sent**, **Waiting for the rate limit** or **Not sent: reason**, with **Retry**. DMs and
   room posts show **Delivered** once ACKed, or **Not delivered** after three tries. Sends are queued to fit the
@@ -99,8 +107,10 @@ What you get:
   messages per conversation are kept in this browser, per identity, as is the conversation you had open. Room
   passwords are saved encrypted with a key derived from your private key, so they can't be read without it.
 * Rooms you've joined log you in again by themselves each time you connect.
-* It reconnects by itself, logging in again each time. It stops if the admin disconnects or bans the key, or turns
-  web logins off.
+* It reconnects by itself, logging in again each time: after 1 s, then twice as long each try up to 15 s, and at once
+  when the network comes back or the tab is shown again. A server restart doesn't need the page password again (the
+  page session is a signed cookie, not something the server has to remember). It stops if the admin disconnects or
+  bans the key, or turns web logins off.
 * If the login works but the websocket doesn't open, it asks the server what became of it and says why: most often a
   reverse proxy that doesn't pass websockets on (see [docs/api.md](../docs/api.md#connecting)).
 * Dark (the dashboard's look), light, or following the system; it works on phones.
@@ -167,6 +177,7 @@ Source layout:
 | `src/map.js` | The map (Leaflet, loaded when first opened) |
 | `src/vault.js` | The passphrase-sealed saved key |
 | `src/gif.js` | Giphy links |
+| `src/emoji.js` | The emoji picker's emoji |
 | `src/format.js` | Reactions and the message hash, from the MeshTrax message format |
 | `src/meshcore.js` | Packets, identities, adverts, channel messages: a port of `client/meshroom_kaas` |
 | `src/hash.js`, `src/aes.js`, `src/ed25519.js`, `src/bytes.js` | Crypto and byte helpers |
