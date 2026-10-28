@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'self'; style-src 'self'; img-src 'self' data: https://media.giphy.com https://i.giphy.com; connect-src https: wss: http: ws:; base-uri 'none'; form-action 'none'">
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'self' https://unpkg.com/leaflet@1.9.4/dist/leaflet.js; style-src 'self' https://unpkg.com/leaflet@1.9.4/dist/leaflet.css; img-src 'self' data: https://media.giphy.com https://i.giphy.com https://*.tile.openstreetmap.org https://unpkg.com/leaflet@1.9.4/dist/images/; connect-src https: wss: http: ws:; base-uri 'none'; form-action 'none'">
 <meta name="referrer" content="no-referrer">
 <title>MeshCore Web</title>
 <link rel="stylesheet" href="src/style.css">
@@ -24,13 +24,21 @@
       <input id="f-url" type="url" placeholder="https://meshroom.example.com" spellcheck="false" required>
     </div>
 
-    <label for="f-priv">Private key</label>
-    <div class="row">
-      <input id="f-priv" type="password" placeholder="128 hex characters (or a 32-byte seed)" spellcheck="false" required>
-      <button type="button" id="f-priv-show" class="ghost" aria-label="Show private key">Show</button>
-      <button type="button" id="f-priv-gen" class="ghost">New</button>
+    <div id="unlock-box" hidden>
+      <label for="f-unlock">Passphrase</label>
+      <input id="f-unlock" type="password" placeholder="Unlocks the key saved on this device" autocomplete="current-password">
+      <p class="hint">Your private key is saved here, protected by this passphrase.
+        <button type="button" id="unlock-other" class="linkish">Use a different key</button></p>
     </div>
-    <p class="hint" id="f-pub">Exported from a MeshCore app, or press New to make one. Keep a copy: a new key is a new node.</p>
+    <div id="priv-box">
+      <label for="f-priv">Private key</label>
+      <div class="row">
+        <input id="f-priv" type="password" placeholder="128 hex characters (or a 32-byte seed)" spellcheck="false" required>
+        <button type="button" id="f-priv-show" class="ghost" aria-label="Show private key">Show</button>
+        <button type="button" id="f-priv-gen" class="ghost">New</button>
+      </div>
+      <p class="hint" id="f-pub">Exported from a MeshCore app, or press New to make one. Keep a copy: a new key is a new node.</p>
+    </div>
 
     <label for="f-name">Your name</label>
     <input id="f-name" type="text" maxlength="31" placeholder="Shown before your messages" required>
@@ -43,7 +51,13 @@
         log in with your private key.</p>
     </details>
 
-    <label class="check"><input id="f-remember" type="checkbox"> Remember my private key on this device</label>
+    <label class="check"><input id="f-remember" type="checkbox"> Remember me on this device, and connect by myself next time</label>
+    <div id="pass-box" hidden>
+      <label for="f-pass">Passphrase <span class="opt">(optional)</span></label>
+      <input id="f-pass" type="password" placeholder="Protects the saved key" autocomplete="new-password">
+      <p class="hint">With a passphrase the saved key is encrypted, and you type the passphrase instead of the key next
+        time. Without one, anyone using this browser can use your key.</p>
+    </div>
 
     <p class="error" id="login-error" role="alert" hidden></p>
     <button type="submit" id="login-go" class="primary">Connect</button>
@@ -61,12 +75,24 @@
         </div>
       </div>
     </header>
-    <h2 class="sect">Channels</h2>
-    <nav class="channels" id="channel-list" aria-label="Channels"></nav>
+    <div class="side-scroll">
+      <h2 class="sect">Channels <button type="button" id="add-channel" class="sect-add" title="Join a channel" aria-label="Join a channel">+</button></h2>
+      <nav class="channels" id="channel-list" aria-label="Channels"></nav>
+      <h2 class="sect">Direct messages <button type="button" id="new-dm" class="sect-add" title="Message someone" aria-label="Message someone">+</button></h2>
+      <nav class="channels" id="dm-list" aria-label="Direct messages"></nav>
+      <h2 class="sect">Rooms <button type="button" id="join-room" class="sect-add" title="Join a room" aria-label="Join a room">+</button></h2>
+      <nav class="channels" id="room-list" aria-label="Rooms"></nav>
+    </div>
     <div class="side-actions">
-      <button type="button" id="add-channel" class="ghost wide">+ Join a channel</button>
+      <div class="two">
+        <button type="button" id="open-contacts" class="ghost">Contacts</button>
+        <button type="button" id="open-map" class="ghost">Map</button>
+      </div>
       <button type="button" id="advert" class="ghost wide">Advertise me</button>
       <label class="check side-check"><input id="show-gifs" type="checkbox"> Show GIFs from Giphy</label>
+      <label class="side-check side-select">Theme
+        <select id="theme"><option value="dark">Dark</option><option value="light">Light</option><option value="system">Follow the system</option></select>
+      </label>
       <button type="button" id="logout" class="ghost wide">Log out</button>
     </div>
     <footer class="server" id="server-info"></footer>
@@ -84,6 +110,7 @@
     <div class="banner" id="banner" hidden></div>
     <div class="messages" id="messages" aria-live="polite"></div>
     <div class="gif-preview" id="gif-preview" hidden></div>
+    <div class="mentions" id="mentions" role="listbox" aria-label="Mention someone" hidden></div>
     <form class="composer" id="composer">
       <textarea id="text" rows="1" placeholder="Message" aria-label="Message"></textarea>
       <span class="count" id="count"></span>
@@ -127,19 +154,64 @@
     <h3 id="i-name"></h3>
     <p id="i-kind"></p>
     <div id="i-secret-box" hidden>
-      <label for="i-secret">Secret</label>
+      <label for="i-secret" id="i-secret-label">Secret</label>
       <div class="row">
         <input id="i-secret" type="text" readonly spellcheck="false">
         <button type="button" id="i-copy" class="ghost">Copy</button>
       </div>
-      <p class="hint">Anyone with this secret can read and send on the channel.</p>
+      <p class="hint" id="i-secret-hint">Anyone with this secret can read and send on the channel.</p>
     </div>
     <div class="buttons">
       <button type="button" class="danger" id="i-leave">Leave channel</button>
+      <button type="button" class="ghost" id="i-relogin" hidden>Log in again</button>
       <button type="button" class="ghost" id="i-clear">Clear history</button>
       <button type="button" class="primary" data-close>Done</button>
     </div>
   </div>
+</dialog>
+
+<dialog id="dlg-contacts" class="wide">
+  <div class="card">
+    <h3>Contacts</h3>
+    <div class="tabs" role="tablist">
+      <button type="button" role="tab" data-ctab="chat" class="tab on">People</button>
+      <button type="button" role="tab" data-ctab="room" class="tab">Rooms</button>
+      <button type="button" role="tab" data-ctab="repeater" class="tab">Repeaters</button>
+    </div>
+    <input id="c-search" type="search" placeholder="Search by name or key" spellcheck="false" aria-label="Search contacts">
+    <div class="contact-list" id="c-list"></div>
+    <p class="hint" id="c-note"></p>
+    <div class="buttons"><button type="button" class="primary" data-close>Done</button></div>
+  </div>
+</dialog>
+
+<dialog id="dlg-map" class="wide">
+  <div class="card">
+    <h3>Map</h3>
+    <div class="map" id="map-box"></div>
+    <p class="hint" id="map-note"></p>
+    <div class="buttons"><button type="button" class="primary" data-close>Done</button></div>
+  </div>
+</dialog>
+
+<dialog id="dlg-room">
+  <form method="dialog" id="room-form" class="card" novalidate>
+    <h3 id="r-title">Join a room</h3>
+    <div id="r-pick">
+      <label for="r-key">Room</label>
+      <input id="r-key" type="text" list="r-known" placeholder="Its name, or public key in hex" spellcheck="false">
+      <datalist id="r-known"></datalist>
+    </div>
+    <label for="r-pass">Password</label>
+    <input id="r-pass" type="password" maxlength="15" placeholder="The room's password (empty for none)">
+    <p class="hint">Rooms keep their posts and send you the ones you missed. The password is saved on this device to
+      log in again next time.</p>
+    <p class="error" id="r-error" role="alert" hidden></p>
+    <div class="buttons">
+      <button type="button" class="ghost" data-close>Cancel</button>
+      <button type="submit" class="primary" id="r-go">Join</button>
+    </div>
+  </form>
 </dialog>
 
 <dialog id="dlg-advert">

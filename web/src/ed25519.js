@@ -85,3 +85,58 @@ export function ed25519Sign(priv64, pub, msg) {
   const h = mod(bytesToBig(sha512(concatBytes(R, pub, msg))), L);
   return concatBytes(R, bigToBytes(mod(r + h * a, L)));
 }
+
+// A point from its 32-byte encoding, or null if it isn't on the curve.
+function decodePoint(b) {
+  const n = bytesToBig(b);
+  const y = n & ((1n << 255n) - 1n);
+  if (y >= P) return null;
+  const x2 = mod((y * y - 1n) * inv(D * y * y + 1n));
+  let x = powMod(x2, (P + 3n) / 8n);
+  if (mod(x * x - x2) !== 0n) x = mod(x * powMod(2n, (P - 1n) / 4n));
+  if (mod(x * x - x2) !== 0n) return null;
+  if ((x & 1n) !== n >> 255n) {
+    if (x === 0n) return null;
+    x = P - x;
+  }
+  return [x, y, 1n, mod(x * y)];
+}
+
+// Checks [S]B == R + [h]A, h = SHA-512(R || A || msg). (Adverts: a forged one can't rename a contact.)
+export function ed25519Verify(pub, sig, msg) {
+  if (pub.length !== 32 || sig.length !== 64) return false;
+  const A = decodePoint(pub);
+  const R = decodePoint(sig.subarray(0, 32));
+  const S = bytesToBig(sig.subarray(32, 64));
+  if (!A || !R || S >= L) return false;
+  const h = mod(bytesToBig(sha512(concatBytes(sig.subarray(0, 32), pub, msg))), L);
+  const left = encodePoint(mulPoint(S, BASE));
+  const right = encodePoint(add(R, mulPoint(h, A)));
+  return left.every((v, i) => v === right[i]);
+}
+
+// X25519 (RFC 7748): the secret two nodes share, from one's private scalar and the other's key.
+export function x25519(scalar32, u32) {
+  const k = bytesToBig(scalar32.subarray(0, 32)) & ~7n & ((1n << 254n) - 1n) | (1n << 254n);
+  const x1 = bytesToBig(u32) & ((1n << 255n) - 1n);
+  let x2 = 1n, z2 = 0n, x3 = x1, z3 = 1n, swap = 0n;
+  for (let t = 254n; t >= 0n; t--) {
+    const kt = (k >> t) & 1n;
+    if (swap ^ kt) [x2, x3, z2, z3] = [x3, x2, z3, z2];
+    swap = kt;
+    const A = x2 + z2, AA = mod(A * A), B = x2 - z2, BB = mod(B * B), E = AA - BB;
+    const C = x3 + z3, Dd = x3 - z3, DA = mod(Dd * A), CB = mod(C * B);
+    x3 = mod((DA + CB) ** 2n);
+    z3 = mod(x1 * mod((DA - CB) ** 2n));
+    x2 = mod(AA * BB);
+    z2 = mod(E * (AA + 121665n * E));
+  }
+  if (swap) [x2, z2] = [x3, z3];
+  return bigToBytes(mod(x2 * inv(z2)));
+}
+
+// An Ed25519 public key as an X25519 one: u = (1 + y) / (1 - y).
+export function edPubToX25519(pub) {
+  const y = bytesToBig(pub) & ((1n << 255n) - 1n);
+  return bigToBytes(mod((1n + y) * inv(mod(1n - y))));
+}

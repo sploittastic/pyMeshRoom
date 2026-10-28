@@ -17,6 +17,9 @@ const hear = (hex) => fs.appendFileSync(W + '/rx.txt', 'RX ' + hex + '\n');
 const inject = (ch, sender, text) => hear(py(ch, sender, text));
 const ok = (cond, what) => { if (!cond) { console.log('FAIL', what); process.exitCode = 1; } else console.log('ok  ', what); };
 const GIF_ID = 'JIX9t2j0ZTN9S';
+const command = (line) => fs.appendFileSync(W + '/rx.txt', line + '\n');
+const seed = () => require('crypto').randomBytes(32).toString('hex');
+const LEAFLET_DIR = path.join(process.env.PYMESHROOM, 'meshroom', 'data', 'static');
 const TINY_GIF = Buffer.from('R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7', 'base64');
 
 let cookie = null;
@@ -32,6 +35,12 @@ async function admin(p, body) {
 async function newPage(b, opts = {}) {
   const ctx = await b.newContext({ viewport: { width: 1200, height: 760 }, ...opts });
   await ctx.route(/^https:\/\/(media\d?|i)\.giphy\.com\//, (r) => r.fulfill({ status: 200, contentType: 'image/gif', body: TINY_GIF }));
+  await ctx.route(/^https:\/\/unpkg\.com\/leaflet@1\.9\.4\/dist\/(leaflet\.(js|css))$/, (r) => {
+    const f = r.request().url().split('/').pop();
+    r.fulfill({ status: 200, contentType: f.endsWith('.js') ? 'application/javascript' : 'text/css', body: fs.readFileSync(path.join(LEAFLET_DIR, f)),
+      headers: { 'Access-Control-Allow-Origin': '*' } });
+  });
+  await ctx.route(/tile\.openstreetmap\.org/, (r) => r.fulfill({ status: 200, contentType: 'image/gif', body: TINY_GIF }));
   const p = await ctx.newPage();
   p.errors = [];
   p.on('pageerror', e => p.errors.push('pageerror: ' + e.message));
@@ -60,6 +69,8 @@ let b;
 (async () => {
   b = await chromium.launch();
   const errors = [];
+  hear(py('--advert', seed(), 'Seaside', '2', '36.60', '-121.89'));       // a repeater with a position
+  hear(py('--advert', seed(), 'Carol', '1'));                             // a person
   const p = await newPage(b);
   await p.goto(pageUrl);
   ok(await p.isHidden('#f-key'), 'no API key field: logging in takes only the private key and a name');
@@ -117,8 +128,8 @@ let b;
   await p.waitForSelector('.msg .text:text("on the hashtag")', { timeout: 10000 });
   ok(true, '#test message decrypted');
   inject('Public', 'Bob', 'while you were away');
-  await p.waitForSelector('.channels .badge', { timeout: 10000 });
-  ok(await p.textContent('.channels button:first-child .badge') === '1', 'unread badge on Public');
+  await p.waitForSelector('#channel-list .badge', { timeout: 10000 });
+  ok(await p.textContent('#channel-list button:first-child .badge') === '1', 'unread badge on Public');
 
   await p.click('#add-channel');
   await p.click('.tab[data-kind=private]');
@@ -144,6 +155,72 @@ let b;
   await p.click('#dlg-info [data-close]');
   await p.screenshot({ path: shotPrefix + '-chat.png' });
 
+  // contacts: the server's directory, plus adverts heard while here
+  await p.click('#open-contacts');
+  await p.waitForSelector('#c-list .contact b:text("Carol")', { timeout: 10000 });
+  ok(true, 'contacts: people from the server\'s directory');
+  await p.click('.tab[data-ctab=repeater]');
+  await p.waitForSelector('#c-list .contact b:text("Seaside")', { timeout: 5000 });
+  ok(true, 'contacts: repeaters');
+  await p.click('.tab[data-ctab=room]');
+  ok(await p.locator('#c-list .contact').count() >= 1, 'contacts: the room on this radio');
+  await p.click('#dlg-contacts [data-close]');
+
+  // a DM with EchoBot (a Python meshroom_kaas node on its own KaaS key): delivered (ACKed), and its answer
+  command('BOT_ADVERT');
+  await p.click('#open-contacts');
+  await p.click('.tab[data-ctab=chat]');
+  await p.waitForSelector('#c-list .contact b:text("EchoBot")', { timeout: 15000 });
+  await p.click('#c-list .contact:has(b:text("EchoBot")) button:text("Message")');
+  ok(await p.textContent('#room-name') === 'EchoBot', 'DM conversation opened from contacts');
+  await p.fill('#text', 'ping over the mesh');
+  await p.press('#text', 'Enter');
+  await p.waitForSelector('.msg.mine .status:text("Delivered")', { timeout: 30000 });
+  ok(true, 'DM delivered: the bot ACKed it');
+  await p.waitForSelector('.msg:not(.mine) .text:text("echo: ping over the mesh")', { timeout: 30000 });
+  ok(true, 'DM received: the bot\'s answer, decrypted here');
+  ok(await p.locator('#dm-list button:has-text("EchoBot")').count() === 1, 'the DM is listed in the sidebar');
+
+  // the room on this radio: log in, post, and get its posts
+  await p.click('#join-room');
+  const roomName = await p.evaluate(() => document.querySelector('#r-known option')?.value || '');
+  ok(!!roomName, 'the room on this radio is offered by name: ' + roomName);
+  await p.fill('#r-key', roomName);
+  await p.fill('#r-pass', 'hello');
+  await p.click('#r-go');
+  await p.waitForSelector('#dlg-room', { state: 'hidden', timeout: 30000 });
+  ok(/logged in/.test(await p.textContent('#room-sub')), 'logged in to the room');
+  await p.fill('#text', 'hi room');
+  await p.press('#text', 'Enter');
+  await p.waitForSelector('.msg.mine .status:text("Delivered")', { timeout: 30000 });
+  ok(true, 'room post delivered');
+  command('SAY welcome, web user');
+  await p.waitForSelector('.msg .text:text("welcome, web user")', { timeout: 30000 });
+  ok(true, 'the room\'s post arrives');
+
+  // @mentions: people who wrote here first
+  await p.click('#channel-list button:has-text("Public")');
+  await p.fill('#text', '');
+  await p.type('#text', 'hey @Bo');
+  await p.waitForSelector('#mentions button:text("@Bob")', { timeout: 5000 });
+  await p.press('#text', 'Enter');
+  ok(await p.inputValue('#text') === 'hey @[Bob] ', 'autocomplete: @Bo becomes @[Bob]');
+  await p.fill('#text', '');
+
+  // the map
+  await p.click('#open-map');
+  await p.waitForSelector('#map-box .leaflet-interactive', { timeout: 15000 });
+  ok(/1 of \d+ known nodes/.test(await p.textContent('#map-note')), 'map: ' + await p.textContent('#map-note'));
+  await p.screenshot({ path: shotPrefix + '-map.png' });
+  await p.click('#dlg-map [data-close]');
+
+  // theme
+  await p.selectOption('#theme', 'light');
+  ok(await p.evaluate(() => document.documentElement.dataset.theme) === 'light', 'theme: light');
+  await p.screenshot({ path: shotPrefix + '-light.png' });
+  await p.selectOption('#theme', 'dark');
+  ok(await p.evaluate(() => !document.documentElement.dataset.theme), 'theme: dark (the dashboard\'s)');
+
   await p.reload();
   ok(await p.inputValue('#f-priv') === '', 'private key not remembered without the checkbox');
   ok(await p.inputValue('#f-url') === SERVER && await p.inputValue('#f-name') === 'WebTester', 'URL and name remembered');
@@ -152,10 +229,40 @@ let b;
   await p.fill('#f-priv', PRIV);
   await p.click('#login-go');
   await p.waitForSelector('#conn-dot.open', { timeout: 10000 });
-  ok(await p.locator('.channels button').count() === 3, 'channels kept across reload');
-  await p.click('.channels button:first-child');
+  ok(await p.locator('#channel-list button').count() === 3, 'channels kept across reload');
+  await p.click('#channel-list button:first-child');
   ok(await p.locator('.msg .text:text("hello from the browser")').count() === 1, 'history kept across reload');
   ok(await p.isHidden('#banner'), 'logging in again: already allowed to send');
+  ok(await p.locator('#dm-list button:has-text("EchoBot")').count() === 1 && await p.locator('#room-list button').count() === 1,
+    'DMs and rooms kept across reload');
+
+  // saved login: with a passphrase the key is sealed; without one, it connects by itself
+  await p.click('#logout');
+  await p.check('#f-remember');
+  await p.fill('#f-priv', PRIV);
+  await p.fill('#f-pass', 'correct horse');
+  await p.click('#login-go');
+  await p.waitForSelector('#conn-dot.open', { timeout: 20000 });
+  ok(!(await p.evaluate(() => JSON.stringify(localStorage))).includes(PRIV), 'with a passphrase, the saved key is sealed');
+  await p.reload();
+  ok(await p.isVisible('#unlock-box') && await p.isHidden('#priv-box'), 'reload: asks for the passphrase, not the key');
+  await p.fill('#f-unlock', 'wrong');
+  await p.click('#login-go');
+  await p.waitForSelector('#login-error:not([hidden])', { timeout: 20000 });
+  ok(/doesn't unlock/.test(await p.textContent('#login-error')), 'a wrong passphrase doesn\'t unlock');
+  await p.fill('#f-unlock', 'correct horse');
+  await p.click('#login-go');
+  await p.waitForSelector('#conn-dot.open', { timeout: 20000 });
+  ok(true, 'the right passphrase unlocks and connects');
+  await p.click('#logout');
+  await p.click('#unlock-other');
+  await p.check('#f-remember');
+  await p.fill('#f-priv', PRIV);
+  await p.click('#login-go');
+  await p.waitForSelector('#conn-dot.open', { timeout: 20000 });
+  await p.reload();
+  await p.waitForSelector('#conn-dot.open', { timeout: 20000 });
+  ok(await p.isHidden('#login'), 'remembered without a passphrase: connects by itself');
 
   ok(await admin('/api/v1/web/users/' + PUB + '/kick') === 200, 'admin kicks the key');
   await p.waitForSelector('#conn-dot.failed', { timeout: 10000 });

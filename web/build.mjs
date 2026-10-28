@@ -45,7 +45,10 @@ const sha = (s) => "'sha256-" + createHash("sha256").update(s).digest("base64") 
 const script = bundle("src/app.js");
 const style = readFileSync(join(root, "src/style.css"), "utf8");
 let html = readFileSync(join(root, "index.html"), "utf8");
-const csp = `default-src 'none'; script-src ${sha(script)}; style-src ${sha(style)}; img-src data: https://media.giphy.com https://i.giphy.com; ` +
+// The map's Leaflet comes from the serving pyMeshRoom's /static/ ('self') or unpkg, pinned by hash in map.js.
+const LEAFLET = "https://unpkg.com/leaflet@1.9.4/dist/";
+const csp = `default-src 'none'; script-src ${sha(script)} 'self' ${LEAFLET}leaflet.js; style-src ${sha(style)} 'self' ${LEAFLET}leaflet.css; ` +
+  `img-src 'self' data: https://media.giphy.com https://i.giphy.com https://*.tile.openstreetmap.org ${LEAFLET}images/; ` +
   "connect-src https: wss: http: ws:; base-uri 'none'; form-action 'none'";
 const swap = (pattern, text) => {
   if (!pattern.test(html)) throw new Error("index.html: no match for " + pattern);

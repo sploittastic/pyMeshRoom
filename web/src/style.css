@@ -212,3 +212,37 @@ details summary { cursor: pointer; color: var(--muted); font-size: 14px; }
 .msg .gif-link { color: var(--accent); }
 .gif-preview { padding: 8px 16px 0; background: var(--panel); border-top: 1px solid var(--line); display: flex; gap: 8px; }
 .gif-preview img { max-height: 90px; border-radius: 6px; }
+
+/* sidebar sections */
+.side-scroll { flex: 1; overflow-y: auto; min-height: 0; }
+.side-scroll .channels { flex: none; overflow: visible; padding: 2px 8px 6px; }
+.sect { display: flex; align-items: center; justify-content: space-between; }
+.sect-add { padding: 0 7px; font-size: 15px; line-height: 20px; background: transparent; border-color: transparent; color: var(--accent); }
+.sect-add:hover { background: var(--button); }
+.side-actions .two { display: grid; grid-template-columns: 1fr 1fr; gap: 6px; }
+.side-select { display: flex; align-items: center; gap: 8px; }
+.side-select select { flex: 1; }
+select { font: inherit; color: inherit; background: var(--bg); border: 1px solid var(--line); border-radius: 4px; padding: 4px 6px; }
+.channels .sub { color: var(--muted); font-size: 12px; }
+.opt { font-weight: 400; color: var(--muted); }
+
+/* contacts, map */
+dialog.wide { width: min(760px, calc(100% - 32px)); }
+.contact-list { margin-top: 10px; max-height: min(52vh, 460px); overflow-y: auto; border: 1px solid var(--line); border-radius: 4px; }
+.contact { display: flex; gap: 10px; align-items: center; padding: 8px 10px; border-bottom: 1px solid var(--line); }
+.contact:last-child { border-bottom: none; }
+.contact .who { flex: 1; min-width: 0; }
+.contact .who b { display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.contact .who span { color: var(--muted); font-size: 12px; }
+.contact .acts { display: flex; gap: 6px; flex-wrap: wrap; justify-content: flex-end; }
+.contact .acts button { padding: 3px 9px; font-size: 13px; }
+.map { height: min(60vh, 520px); border-radius: 6px; background: var(--side); }
+.map .leaflet-popup-content { color: #1c1f24; }
+.map-pop b { display: block; }
+.map-pop button { margin-top: 6px; }
+
+/* @mentions */
+.mentions { margin: 0 16px; background: var(--panel); border: 1px solid var(--line); border-radius: 6px; max-height: 200px; overflow-y: auto; }
+.mentions button { display: block; width: 100%; text-align: left; border: none; border-radius: 0; background: transparent; padding: 6px 10px; }
+.mentions button.on, .mentions button:hover { background: var(--mine); }
+.msg .room-author { color: var(--muted); font-weight: 400; }

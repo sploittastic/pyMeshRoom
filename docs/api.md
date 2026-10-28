@@ -264,6 +264,18 @@ strongest scores 1, one with a quarter of that traffic 0.5. A link seen only onc
 at half, and every hop costs 5%, so shorter routes win ties. Routes use 2-byte ids, at most 10 hops. This radio is a hop only while its
 virtual repeater relays. A node with no recent location (it hasn't flood-adverted lately) is an error, and so is an
 unknown name. An empty list means no chain of seen links joins the two ends.
+**nodes**: the server's directory of nodes: every one heard advertising in the last `days` (default 7, at most 365),
+by this radio or by an MQTT observer, most recently heard first, at most 2000. For contact lists and maps.
+
+```json
+{"type": "nodes", "id": "q4", "days": 7}
+{"type": "nodes_result", "id": "q4", "nodes": [{"pub": "<64 hex>", "type": "chat", "name": "Alice", "lat": 36.6,
+ "lon": -121.9, "last_heard": 1760313600, "rf": 1760313600, "obs": null}]}
+```
+
+`type` is `chat`, `repeater`, `room` or `sensor`. `rf` and `obs` say when this radio, or an observer, last heard it.
+Name and position come from its newest signed advert.
+
 Bad input gets `{"type": "error", "id": ..., "error": ...}`. Questions share the 4-at-a-time limit with sends.
 
 ## Sending rules

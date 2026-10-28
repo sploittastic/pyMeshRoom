@@ -11,7 +11,11 @@ dashboard's port, and it reaches the mesh through that radio over the KaaS API. 
   from disk or from any static web host.
 * **Channels.** You join **Public** by default. You can also join **#hashtag** channels (the key comes from the name)
   and **private** channels (a 16-byte secret you share yourself).
-* Not yet supported: rooms and direct messages.
+* **Direct messages**, delivered and confirmed the way the MeshCore apps do it: retried until the other node ACKs,
+  the last try by flood, and sent direct once a route is learned.
+* **Rooms**: log in with the room's password, read the posts you missed, and post.
+* **Contacts and a map**: the people, rooms and repeaters the server has heard advertise in the last 7 days
+  (refreshed every 15 minutes), plus any advert heard while you're here. The map shows those that share a position.
 
 ## Logging in
 
@@ -21,8 +25,10 @@ dashboard's port, and it reaches the mesh through that radio over the KaaS API. 
 | Private key | A 64-byte MeshCore private key in hex, as the apps export it, or a 32-byte seed. **New** makes one. Keep a copy: a new key is a new node. |
 | Your name | Goes before your messages (`Name: text`) and into your adverts. |
 
-**Remember** keeps the private key in this browser's `localStorage`. Leave it unticked on a shared computer. Without
-it, only the URL and your name are saved.
+**Remember me** keeps the private key in this browser's `localStorage`, and the page then connects by itself when it
+opens. With a **passphrase**, the key is sealed instead: PBKDF2-HMAC-SHA256 with 50,000 rounds, AES-128-CTR and an
+HMAC. You type the passphrase rather than the key each time. Leave Remember unticked on a shared computer: then only
+the URL and your name are saved.
 
 The server's admin turns web logins on (**Allow web logins** on the dashboard's **Web users** card). Anyone can then
 log in and read. You can **send** once the radio has heard your key advertise, for example from your MeshCore app
@@ -60,19 +66,23 @@ What you get:
 
 * Messages show the sender, the time, and the hops and SNR as the radio heard them. A flood heard through several
   repeaters shows once.
-* `@[name]` mentions are highlighted, and mentions of you stand out.
+* `@[name]` mentions are highlighted, and mentions of you stand out. Typing `@` suggests names: people who wrote in this
+  conversation lately first, then your contacts. Arrow keys or Tab pick one, which is inserted as `@[name]`.
 * **GIFs:** a Giphy link in a message (`https://giphy.com/gifs/…`, as Giphy's Share button copies it) shows as the
   GIF itself. To send one, paste the link; the GIF is previewed while you type. Other MeshCore apps see the link.
   **Show GIFs from Giphy** in the sidebar turns this off: loading a GIF lets Giphy see your IP address.
-* Your own messages show **Sent**, **Waiting for the rate limit** or **Not sent: reason**, with **Retry**. Sends are
-  queued to fit the key's rate limit (3 packets per 20 s by default).
-* Each message holds 160 bytes, `Name: ` included. The counter shows what's left.
+* Your own messages show **Sent**, **Waiting for the rate limit** or **Not sent: reason**, with **Retry**. DMs and
+  room posts show **Delivered** once ACKed, or **Not delivered** after three tries. Sends are queued to fit the
+  key's rate limit (3 packets per 20 s by default); ACKs and path returns don't count.
+* A channel message holds 160 bytes, `Name: ` included; a DM 160; a room post 151. The counter shows what's left.
 * **Advertise me** sends a signed advert, flood or zero-hop, so other people's apps learn your name and key.
-* **Details** on a private channel shows its secret to share. Channels and the last 300 messages per channel are kept
-  in this browser, per identity.
+* **Details** shows a private channel's secret, or a contact's or room's public key, to share or check. Channels,
+  DMs, rooms (with their passwords and where their posts left off), contacts with their routes, and the last 300
+  messages per conversation are kept in this browser, per identity, as is the conversation you had open.
+* Rooms you've joined log you in again by themselves each time you connect.
 * It reconnects by itself, logging in again each time. It stops if the admin disconnects or bans the key, turns
   web logins off, or revokes an API key.
-* Light and dark themes, and it works on phones.
+* Dark (the dashboard's look), light, or following the system; it works on phones.
 
 The radio keeps no backlog: you see messages heard while you're connected.
 
@@ -83,7 +93,9 @@ The radio keeps no backlog: you see messages heard while you're connected.
   sign with MeshCore's 64-byte expanded keys. The output is checked against pyMeshRoom's Python client
   (`test/vectors.json`).
 * The built file has a Content-Security-Policy that allows only its own inline script and style, pinned by hash, so
-  no other script can run next to your key. Images may come only from Giphy's two image hosts, and only by GIF id.
+  no other script can run next to your key. The map's Leaflet 1.9.4 may come only from the serving pyMeshRoom or that
+  exact file on unpkg, and is pinned by hash too. Images may come only from Giphy's two image hosts (by GIF id), the
+  OpenStreetMap tile servers and Leaflet's own.
   Message text is always added as text, never as HTML.
 * An API key is a credential: anyone who has it can use the radio within the key's permissions. Use HTTPS.
 
@@ -105,6 +117,9 @@ The end-to-end run starts pyMeshRoom's own test harness with a dashboard, web lo
   sending on Public, a hashtag channel and a private channel, including a burst past the rate limit;
 * decrypting what the radio transmitted with the Python client, and checking the advert's signature;
 * injecting packets for the page to receive, including Giphy links (Giphy itself is faked);
+* contacts from the server's directory, a DM to and from a Python `meshroom_kaas` bot (delivered once ACKed), joining
+  the radio's room with its password, posting, and receiving its posts;
+* `@` autocomplete, the map (OpenStreetMap faked), the theme switch, and the saved login with and without a passphrase;
 * persistence, kick and ban by the admin, logging in with an API key, a bad key, the page served by pyMeshRoom at
   `/meshcore-web/`, and the phone layout.
 
@@ -116,6 +131,9 @@ Source layout:
 |---|---|
 | `src/app.js` | The UI |
 | `src/kaas.js` | Signed login, ticket, websocket, reconnects, rate-limited send queue |
+| `src/node.js` | Contacts, DMs with ACKs and retries, path returns, rooms: a port of `client/meshroom_kaas/node.py` |
+| `src/map.js` | The map (Leaflet, loaded when first opened) |
+| `src/vault.js` | The passphrase-sealed saved key |
 | `src/gif.js` | Giphy links |
 | `src/meshcore.js` | Packets, identities, adverts, channel messages: a port of `client/meshroom_kaas` |
 | `src/hash.js`, `src/aes.js`, `src/ed25519.js`, `src/bytes.js` | Crypto and byte helpers |

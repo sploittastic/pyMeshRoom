@@ -475,8 +475,8 @@ pyMeshRoom serves a MeshCore chat client at `/meshcore-web/` on the dashboard's 
 their browser: the page signs a login challenge, and encrypts and signs messages itself, so the server only sees
 signatures and encrypted packets.
 
-It covers the Public channel, hashtag and private channels, adverts, `@` mentions and GIFs from Giphy links. Rooms and
-DMs aren't supported yet.
+It covers the Public channel, hashtag and private channels, DMs, rooms, contacts with a map, adverts, `@` mentions with
+autocomplete, and GIFs from Giphy links.
 
 Turn it on with **Allow web logins** on the **Web users** card. Its source is in [web/](web/README.md).
 * Python client: [client/](client/README.md). It works with raw packets, or as a full chat node: adverts, contacts,

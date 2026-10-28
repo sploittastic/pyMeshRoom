@@ -47,6 +47,7 @@ client.near("@[platinum]")   # or by name (plain or mention); same answer as by 
 client.near(pub)          # [{"id": "44c3", "name": "Seaside", "share": 0.62}, ..., {"direct": True, "id": "9a1f", "name": "...", "share": 0.13}]
 client.route(pub, "@[platinum]")   # {"from", "to", "routes": [{"hops": [...], "path": ..., "score": 0.62}, ...]}
 client.routes("44c3")     # [{"path_len": 66, "path": "55b244c3", "hops": [...], "names": [...], "confidence": 0.81}]
+client.nodes(days=7)      # the directory: [{"pub", "type": "chat" | "repeater" | "room" | "sensor", "name", "lat", "lon", "last_heard", ...}]
 
 best = client.routes(client.near(pub)[0]["id"])[0]
 pkt = Packet.direct(ptype, payload, bytes.fromhex(best["path"]), best["path_len"])

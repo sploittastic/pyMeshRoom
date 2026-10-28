@@ -132,6 +132,11 @@ class KaasClient:
         msg = self._request("route", timeout, limit=limit, **{"from": _hex(src), "to": _hex(dst)})
         return {"from": msg["from"], "to": msg["to"], "routes": msg["routes"]}
 
+    def nodes(self, days=7, timeout=10.0):
+        """The server's node directory: every node heard advertising in the last `days`, most recent first, as
+        {"pub", "type": "chat" | "repeater" | "room" | "sensor", "name", "lat", "lon", "last_heard", "rf", "obs"}."""
+        return self._request("nodes", timeout, days=days)["nodes"]
+
     def _request(self, t, timeout, **fields):
         rid = "q%d" % next(self.ids)
         ev, box = threading.Event(), {}
@@ -189,7 +194,7 @@ class KaasClient:
                         if msg.get("status") in FINAL:
                             w[1]["final"] = msg
                             w[0].set()
-                elif t in ("near_result", "routes_result", "route_result", "error") and msg.get("id") in self.queries:
+                elif t in ("near_result", "routes_result", "route_result", "nodes_result", "error") and msg.get("id") in self.queries:
                     with self.lock:
                         q = self.queries.pop(msg.get("id"), None)
                     if q:

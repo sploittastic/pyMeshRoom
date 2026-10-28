@@ -30,6 +30,12 @@ export const saveChannels = (pubHex, list) => write("channels." + pubHex.slice(0
 export const loadHistory = (pubHex) => read("history." + pubHex.slice(0, 16), {});
 export const saveHistory = (pubHex, h) => write("history." + pubHex.slice(0, 16), h);
 
+// Contacts (with routes and joined rooms), and the open conversations, per identity too.
+export const loadContacts = (pubHex) => read("contacts." + pubHex.slice(0, 16), []);
+export const saveContacts = (pubHex, list) => write("contacts." + pubHex.slice(0, 16), list);
+export const loadConversations = (pubHex) => read("conversations." + pubHex.slice(0, 16), { dms: [], last: null });
+export const saveConversations = (pubHex, c) => write("conversations." + pubHex.slice(0, 16), c);
+
 export function forgetEverything() {
   try {
     for (const k of Object.keys(localStorage)) if (k.startsWith(PREFIX)) localStorage.removeItem(k);

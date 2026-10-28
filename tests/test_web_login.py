@@ -273,6 +273,29 @@ class WebLoginTests(WebTestCase):
         first.ws.close()
 
 
+class NodesRequestTests(WebTestCase):
+    def test_nodes_request(self):
+        """KaaS "nodes": the directory, most recently heard first, for contact lists and maps."""
+        self.http("POST", "/api/login", {"password": "adminpw"})
+        token = self.make_key(receive=True, send=False)
+        a, b = kc.Identity.generate(), kc.Identity.generate()
+        self.h.events.put(("rxraw", advert(a, "Alice", lat=36.5, lon=-121.9)))
+        self.h.pump(lambda: a.pub in self.h.room.nodes, 5)
+        self.h.events.put(("rxraw", advert(b, "Bob")))
+        self.h.pump(lambda: b.pub in self.h.room.nodes, 5)
+        self.h.room.nodes[a.pub]["rf"] -= 10
+        c = kc.KaasClient(self.url, token)
+        self.h.run_client(c.connect)
+        rows = self.h.run_client(c.nodes)
+        self.assertEqual([(r["pub"], r["name"], r["type"]) for r in rows], [(b.pub.hex(), "Bob", "chat"), (a.pub.hex(), "Alice", "chat")])
+        self.assertEqual((rows[1]["lat"], rows[1]["lon"]), (36.5, -121.9))
+        self.h.room.nodes[a.pub]["rf"] -= 2 * 86400
+        self.assertEqual([r["name"] for r in self.h.run_client(lambda: c.nodes(days=1))], ["Bob"])
+        with self.assertRaises(kc.RequestError):
+            self.h.run_client(lambda: c.nodes(days=0))
+        c.close()
+
+
 class NodeDirectoryTests(unittest.TestCase):
     def test_heard_nodes_are_kept_with_full_keys(self):
         h = Harness()

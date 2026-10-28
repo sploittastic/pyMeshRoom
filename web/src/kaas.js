@@ -65,6 +65,7 @@ export class KaasClient extends EventTarget {
     this.timer = null;
     this.nextId = 1;
     this.waiting = new Map();             // send id -> {resolve, packet}
+    this.queries = new Map();             // request id -> {resolve, reject}: nodes, near, routes, route
     this.queue = [];                      // {raw, resolve}: sends waiting for the rate limit
     this.recent = [];                     // when our sends went (performance.now()), for the rolling window
     this.pumping = false;
@@ -205,6 +206,11 @@ export class KaasClient extends EventTarget {
         this.waiting.delete(msg.id);
         w.resolve(msg);
       }
+    } else if ((/_result$/.test(msg.type) || msg.type === "error") && this.queries.has(msg.id)) {
+      const q = this.queries.get(msg.id);
+      this.queries.delete(msg.id);
+      if (msg.type === "error") q.reject(new Error(msg.error || "the server couldn't answer"));
+      else q.resolve(msg);
     } else if (msg.type === "dropped") {
       this.emit("dropped", msg.count);
     } else if (msg.type === "access" && this.hello?.key) {
@@ -218,6 +224,22 @@ export class KaasClient extends EventTarget {
   failAll(reason) {
     for (const w of this.waiting.values()) w.resolve({ status: "dropped", reason });
     this.waiting.clear();
+    for (const q of this.queries.values()) q.reject(new Error(reason));
+    this.queries.clear();
+  }
+
+  // A question for the server ({type: "nodes", days: 7}, ...) -> its answer, or throws with the server's error.
+  request(type, fields = {}, timeoutMs = 15000) {
+    return new Promise((resolve, reject) => {
+      if (!this.ws || this.ws.readyState !== WebSocket.OPEN) return reject(new Error("not connected"));
+      const id = "q" + this.nextId++;
+      const timer = setTimeout(() => { this.queries.delete(id); reject(new Error("no answer from the server")); }, timeoutMs);
+      this.queries.set(id, {
+        resolve: (m) => { clearTimeout(timer); resolve(m); },
+        reject: (e) => { clearTimeout(timer); reject(e); },
+      });
+      this.ws.send(JSON.stringify({ ...fields, type, id }));
+    });
   }
 
   // One packet straight to the server -> the final send_result.

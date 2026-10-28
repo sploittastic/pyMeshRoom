@@ -291,6 +291,7 @@ SUSPENDED_PROBE_S = 6 * 3600     # while suspended: a single flood this often, i
 MAX_NEIGHBOURS = 50
 NAME_CACHE_MAX = 1000
 NODES_MAX = 5000                 # every node heard advertising (any type), kept with its full key: the oldest go first
+NODES_ANSWER_MAX = 2000          # a KaaS "nodes" answer: at most this many, the most recently heard
 
 SLOT_FLOOD = "flood"
 
@@ -7627,10 +7628,11 @@ class KaasHub:
             rid = None
         if t == "ping":
             return conn.send_json({"type": "pong", "id": rid})
-        if t in ("near", "routes", "route"):
+        if t in ("near", "routes", "route", "nodes"):
             return self.ask(conn, t, msg, rid)
         if t != "send":
-            return conn.send_json({"type": "error", "id": rid, "error": "unknown message type: use send, near, routes, route or ping"})
+            return conn.send_json({"type": "error", "id": rid,
+                                   "error": "unknown message type: use send, near, routes, route, nodes or ping"})
 
         def drop(reason):
             self.stats["dropped"] += 1
@@ -7656,6 +7658,15 @@ class KaasHub:
         """A route question: checked here, answered by the main loop (it owns the map). Shares the in-flight cap."""
         def err(e):
             conn.send_json({"type": "error", "id": rid, "error": e})
+        if t == "nodes":
+            days = msg.get("days", 7)
+            if isinstance(days, bool) or not isinstance(days, (int, float)) or not 0 < days <= 365:
+                return err("days: more than 0, at most 365")
+            with conn.cv:
+                if conn.inflight >= KAAS_MAX_INFLIGHT:
+                    return err("too many requests waiting: wait for their answers")
+                conn.inflight += 1
+            return self.room.events_put(("kaas_query", conn, t, float(days), NODES_ANSWER_MAX, rid))
         try:
             key = bytes.fromhex(str(msg.get("node" if t == "near" else "repeater", "")))
         except ValueError:
@@ -7698,6 +7709,8 @@ class KaasHub:
         def name(h):
             hit = r.rpt_lookup(h)
             return hit[1]["name"] if hit and hit[1].get("name") else None
+        if t == "nodes":
+            return self.nodes_answer(conn, key, limit, rid)
         if t == "near" and isinstance(key, str):
             k8 = r.node_by_name(key)
             if k8 is None:
@@ -7725,6 +7738,21 @@ class KaasHub:
             rows.append({"path_len": rr.plen, "path": rr.path.hex(), "hops": [h.hex() for h in hops],
                          "names": [name(h) for h in hops], "confidence": round(conf, 3)})
         conn.send_json({"type": "routes_result", "id": rid, "repeater": target.hex(), "name": name(target), "routes": rows})
+
+    def nodes_answer(self, conn, days, limit, rid):
+        """nodes: the node directory, newest first: every node heard advertising in the last `days`, on this radio or
+        by an MQTT observer. For contact lists and maps."""
+        since = now_s() - days * 86400
+        rows = []
+        for pub, n in self.room.nodes.items():
+            last = max(n["rf"] or 0, n["obs"] or 0)
+            if last >= since:
+                rows.append((last, pub, n))
+        rows.sort(key=lambda x: -x[0])
+        types = {ADV_TYPE_CHAT: "chat", ADV_TYPE_REPEATER: "repeater", ADV_TYPE_ROOM: "room", ADV_TYPE_SENSOR: "sensor"}
+        conn.send_json({"type": "nodes_result", "id": rid, "nodes": [
+            {"pub": pub.hex(), "type": types.get(n["type"], n["type"]), "name": n["name"], "lat": n["lat"], "lon": n["lon"],
+             "last_heard": last, "rf": n["rf"], "obs": n["obs"]} for last, pub, n in rows[:limit]]})
 
     def route(self, conn, ends, limit, rid, name):
         """route: suggested repeater chains from one node (or repeater) to another, through the links the room
