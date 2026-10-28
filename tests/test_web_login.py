@@ -142,13 +142,13 @@ class WebLoginTests(WebHelpers):
         self.assertEqual(self.login(RoomIdent)[0], 403)
 
     def test_proxy_host(self):
-        """Behind a proxy on this machine the browser signs the public host name, sent as X-Forwarded-Host."""
-        self.enable()
+        """Behind a proxy the browser signs the public host name: it has to be one the admin listed in web_hosts."""
+        self.enable(web_hosts=["mesh.example.com"])
         me = kc.Identity.generate()
         code, d = self.post("/api/v1/web/challenge")
         msg = mr.web_login_message("mesh.example.com", d["challenge"], me.pub.hex())
         body = dict(pub=me.pub.hex(), signature=me.sign(msg).hex(), challenge=d["challenge"], host="mesh.example.com")
-        self.assertEqual(self.post("/api/v1/web/login", body, {"X-Forwarded-Host": "mesh.example.com"})[0], 200)
+        self.assertEqual(self.post("/api/v1/web/login", body, {"Host": "mesh.example.com"})[0], 200)
 
     def test_pending_until_heard_then_sends_as_itself(self):
         self.enable()

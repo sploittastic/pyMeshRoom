@@ -31,6 +31,7 @@ const LEAFLET_DIR = path.join(process.env.PYMESHROOM, 'meshroom', 'data', 'stati
 const TINY_GIF = Buffer.from('R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7', 'base64');
 
 let cookie = null;
+const tileReferers = [];
 async function admin(p, body) {
   if (!cookie) {
     const r = await fetch(SERVER + '/api/login', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{"password":"adminpw"}' });
@@ -81,7 +82,10 @@ async function newPage(b, opts = {}) {
     r.fulfill({ status: 200, contentType: f.endsWith('.js') ? 'application/javascript' : 'text/css', body: fs.readFileSync(path.join(LEAFLET_DIR, f)),
       headers: { 'Access-Control-Allow-Origin': '*' } });
   });
-  await ctx.route(/tile\.openstreetmap\.org/, (r) => r.fulfill({ status: 200, contentType: 'image/gif', body: TINY_GIF }));
+  await ctx.route(/tile\.openstreetmap\.org/, (r) => {
+    tileReferers.push(r.request().headers()['referer'] || '');               // (OSM refuses tiles without one)
+    r.fulfill({ status: 200, contentType: 'image/gif', body: TINY_GIF });
+  });
   const p = await ctx.newPage();
   p.errors = [];
   p.on('pageerror', e => p.errors.push('pageerror: ' + e.message));
@@ -347,6 +351,9 @@ let b;
   await p.click('#open-map');
   await p.waitForSelector('#map-box .leaflet-interactive', { timeout: 15000 });
   ok(/1 of \d+ known nodes/.test(await p.textContent('#map-note')), 'map: ' + await p.textContent('#map-note'));
+  await p.waitForFunction(() => document.querySelectorAll('.leaflet-tile-loaded').length > 0, null, { timeout: 10000 });
+  if (!pageUrl.startsWith('file:')) ok(tileReferers.length && tileReferers.every((r) => /^https?:\/\/[^/]+\/$/.test(r)),
+    'map tiles carry the page\'s origin as Referer, as OSM requires: ' + tileReferers[0]);
   await p.screenshot({ path: shotPrefix + '-map.png' });
   await p.click('#dlg-map [data-close]');
 
@@ -437,6 +444,8 @@ let b;
   for (const [mode, want, what] of [['strip', /without its Upgrade header/, 'a proxy dropping the Upgrade header'],
                                     ['drop', /never reached pyMeshRoom/, 'a proxy that doesn\'t pass websockets on']]) {
     const proxy = await startProxy(mode);
+    // (a proxy's name has to be one the admin lists: else the server refuses logins signed for it)
+    ok(await admin('/api/v1/web/settings', { web_hosts: ['127.0.0.1:' + proxy.address().port] }) === 200, 'admin allows the proxy\'s name');
     const pp = await newPage(b);
     await pp.goto(pageUrl);
     await loginWith(pp, { url: 'http://127.0.0.1:' + proxy.address().port });

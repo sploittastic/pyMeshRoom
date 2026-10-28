@@ -96,9 +96,12 @@ answers `{"outcome": ...}`, kept for 5 minutes:
 | `connected` | It opened. |
 | `unknown` | No such ticket (or the server restarted). |
 
-A challenge works once. The host must be the one this request arrived at: its `Host` header, `X-Forwarded-Host` from
-a reverse proxy on the same machine, or one listed in `web_hosts`. This stops another site from getting a visitor to
-sign a login for this server. The label means a login signature can never also be a valid MeshCore packet
+A challenge works once. The host must be one of this server's own names: its address as the connection reached it
+(`ip:port`), or a name listed in `web_hosts`: a domain, or the name a reverse proxy serves it under. The request's
+`Host` or `X-Forwarded-Host` header alone never counts, so another server can't pass its visitors' logins on to this
+one. A login signed for any other name answers 401, and the name is listed on the **Web users** card (the last ten),
+with **Allow** to add it to `web_hosts`. Behind a proxy, add the public name there (or press Allow after the first
+login). The label means a login signature can never also be a valid MeshCore packet
 signature.
 
 Anyone may log in and receive. A key may **send** once this radio has heard it advertise, or once the admin presses
@@ -394,7 +397,7 @@ Bad input gets `{"type": "error", "id": ..., "error": ...}`. Questions share the
 | `web_approved` | `[]` | Public keys (hex) allowed to send without being heard. Managed from the dashboard. |
 | `web_banned` | `[]` | `{"pub", "name", "ts"}` of banned keys. Managed from the dashboard. |
 | `web_unknown_key_message` | "Your key must be heard on RF before you can send messages. Please send a flood advert." | What a web user whose key may not send yet is told. Set from the dashboard. |
-| `web_hosts` | `[]` | More host names a login may be signed for, behind a proxy elsewhere that rewrites `Host`. |
+| `web_hosts` | `[]` | The names MeshCore Web is reached by (a domain, a proxy's name), besides this server's own `ip:port`. Set from the dashboard. |
 | `web_page_password` | `""` | A password for the MeshCore Web page and its logins, hashed. Set from the dashboard. |
 | `web_giphy_key` | `""` | A Giphy API key for MeshCore Web's GIF picker (developers.giphy.com). Set from the dashboard. |
 | `web_backlog_days` | 30 | Keep channel messages and DMs this many days, for web users to catch up (0 = none). |

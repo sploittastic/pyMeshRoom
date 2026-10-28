@@ -26,7 +26,7 @@ dashboard's port, and it reaches the mesh through that radio over the KaaS API. 
 
 | Field | |
 |---|---|
-| pyMeshRoom URL | The server, e.g. `https://meshroom.example.com`. A path prefix from a reverse proxy works too. Filled in by itself when pyMeshRoom serves the page (at `…/meshcore-web/`). |
+| pyMeshRoom URL | The server, e.g. `https://meshroom.example.com`. A path prefix from a reverse proxy works too. Filled in by itself when pyMeshRoom serves the page (at `…/meshcore-web/`). A name other than the server's own `ip:port` (a domain, a proxy's) has to be listed under **Host names** on the server's Web users card, else logins are refused. |
 | Private key | A 64-byte MeshCore private key in hex, as the apps export it, or a 32-byte seed. **New** makes one. Keep a copy: a new key is a new node. |
 | Your name | Goes before your messages (`Name: text`) and into your adverts. |
 

@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover, interactive-widget=resizes-content">
-<meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'sha256-YooSKchCWdXE9ezAqsPfznwB53apRST+daGQc/HnPhg=' 'self' https://unpkg.com/leaflet@1.9.4/dist/leaflet.js; style-src 'sha256-H4R3hSzOToYncAmlANpU7VdX8Mx1SfSYzYInLvbD8Xs=' 'self' https://unpkg.com/leaflet@1.9.4/dist/leaflet.css; img-src 'self' data: https://media.giphy.com https://i.giphy.com https://*.tile.openstreetmap.org https://unpkg.com/leaflet@1.9.4/dist/images/; connect-src https: wss: http: ws:; base-uri 'none'; form-action 'none'">
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'sha256-8UWOyQ+JSR/gN3Xatdz+8/y2dliCqOkIy+zdDXAs42s=' 'self' https://unpkg.com/leaflet@1.9.4/dist/leaflet.js; style-src 'sha256-H4R3hSzOToYncAmlANpU7VdX8Mx1SfSYzYInLvbD8Xs=' 'self' https://unpkg.com/leaflet@1.9.4/dist/leaflet.css; img-src 'self' data: https://media.giphy.com https://i.giphy.com https://tile.openstreetmap.org https://*.tile.openstreetmap.org https://unpkg.com/leaflet@1.9.4/dist/images/; connect-src https: wss: http: ws:; base-uri 'none'; form-action 'none'">
 <meta name="referrer" content="no-referrer">
 <title>MeshCore Web</title>
 <style>:root {
@@ -1069,8 +1069,10 @@ async function showMap(box, nodes, { serverBase, center, popup }) {
   const L = await leaflet(serverBase);
   if (!map) {
     map = L.map(box, { worldCopyJump: true });
-    L.tileLayer("https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png", {
-      maxZoom: 18, attribution: "&copy; OpenStreetMap contributors",
+    // OSM's tile servers refuse requests without a Referer (their tile usage policy), and this page sends none: the
+    // tiles carry the page's origin (only that), as the dashboard's map does
+    L.tileLayer("https://tile.openstreetmap.org/{z}/{x}/{y}.png", {
+      maxZoom: 18, attribution: "&copy; OpenStreetMap contributors", referrerPolicy: "strict-origin-when-cross-origin",
     }).addTo(map);
     layer = L.layerGroup().addTo(map);
   }

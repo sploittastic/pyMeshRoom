@@ -36,8 +36,10 @@ export async function showMap(box, nodes, { serverBase, center, popup }) {
   const L = await leaflet(serverBase);
   if (!map) {
     map = L.map(box, { worldCopyJump: true });
-    L.tileLayer("https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png", {
-      maxZoom: 18, attribution: "&copy; OpenStreetMap contributors",
+    // OSM's tile servers refuse requests without a Referer (their tile usage policy), and this page sends none: the
+    // tiles carry the page's origin (only that), as the dashboard's map does
+    L.tileLayer("https://tile.openstreetmap.org/{z}/{x}/{y}.png", {
+      maxZoom: 18, attribution: "&copy; OpenStreetMap contributors", referrerPolicy: "strict-origin-when-cross-origin",
     }).addTo(map);
     layer = L.layerGroup().addTo(map);
   }

@@ -403,6 +403,11 @@ The RoomServer does not search for vanity keys and never exports a private key t
 
 Configure it from the **Virtual companion** admin card: enable it, set its name, the TCP port, allowed addresses (IP addresses or networks such as `192.168.1.0/24`; empty means anyone who can reach the port), and an optional auto advert (zero-hop or flood) with its interval in minutes. There is no separate Save button: the settings are saved when you turn the companion on, and they are locked (greyed out) while it runs. To change them, turn it off, edit, and turn it on again. The node name and position can also be changed from the app while it runs. Like the Virtual Repeater, a random key is created on first enable and saved in the private configuration, or you can import a private key (64 or 128 hex characters) while it is disabled. The private key is never exported: an app asking for it is told key export is disabled, as with default firmware. `companion_bind` (config file only) chooses the listening address; `127.0.0.1` keeps it to the Pi itself.
 
+The virtual companion is for a trusted local network only: its port has no login, as with MeshCore's Wi-Fi
+companions, so anyone who can reach it can read and delete its messages, read its channel secrets, send as it and have
+it sign data. Turning it on asks you to confirm that. Never forward the port to the internet; use **Allowed addresses**
+or `companion_bind`.
+
 What the app can do: contacts (auto-add from adverts, add, remove, share, import/export), direct messages with delivery confirmation, Public and hashtag/private channels, logins, status, telemetry and binary requests to repeaters and rooms (including this room), path discovery, traces, adverts, flood scope, message signing and statistics. Messages that arrive while no app is connected are kept until the app collects them.
 
 Settings that belong to the whole radio or to hardware the companion doesn't have are **acknowledged and ignored**: radio frequency/bandwidth/SF/CR, TX power, tuning, path hash mode, the Bluetooth PIN, reboot, factory reset, private key import, setting the clock (the Pi's clock is used) and app CLI commands. The app may show the value it sent until it reconnects and reads the real one. The node name, position, contact, channel, telemetry-permission and auto-add settings from the app are applied.

@@ -177,13 +177,28 @@ DEFAULT_CONFIG = {
     "web_banned": [],               #   [{"pub", "name", "ts"}]: may not log in
     "web_unknown_key_message":      #   what a web user whose key may not send yet is told
         "Your key must be heard on RF before you can send messages. Please send a flood advert.",
-    "web_hosts": [],                #   other host names logins may sign for (behind a proxy that rewrites Host)
+    "web_hosts": [],                #   the names MeshCore Web is reached by (a domain, a proxy): logins signed for others are refused
     "web_page_password": "",        #   a password for the MeshCore Web page and its logins (hashed; "" = none)
     "web_giphy_key": "",            #   a Giphy API key for MeshCore Web's GIF picker ("" = no picker; links still show)
     "web_backlog_days": 30,         #   keep channel messages and DMs this many days, so web users catch up (0 = off)
     "web_backlog_mqtt": False,      #   ...including those MQTT observers reported (each packet is kept once)
 }
 
+
+# The dashboard's headers. Its scripts are inline (and so are its handlers), so the policy can't pin them by hash; it
+# keeps everything else to this server: no script, stylesheet, connection or form target elsewhere, except Leaflet
+# (from unpkg when it isn't installed locally) and the map tiles. Never framed.
+DASHBOARD_HEADERS = {
+    "Content-Security-Policy": "default-src 'self'; script-src 'self' 'unsafe-inline' https://unpkg.com; "
+                               "style-src 'self' 'unsafe-inline' https://unpkg.com; "
+                               "img-src 'self' data: https://unpkg.com https://tile.openstreetmap.org "
+                               "https://*.tile.openstreetmap.org; connect-src 'self'; object-src 'none'; base-uri 'none'; "
+                               "form-action 'self'; frame-ancestors 'none'",
+    "X-Content-Type-Options": "nosniff", "X-Frame-Options": "DENY", "Referrer-Policy": "strict-origin-when-cross-origin"}
+
+HTTP_TIMEOUT_S = 30                   # a dashboard / API connection idle (or trickling) this long is closed
+HTTP_MAX_BODY = 64 * 1024             # a request body larger than this is refused (413)
+HTTP_MAX_THREADS = 400                # connections beyond this many threads in the process are closed at once
 
 RETIRED_SETTINGS = {"web_trust_observers"}   # settings older versions had: ignored quietly
 
@@ -7255,8 +7270,8 @@ class KaasConn:
 
     def run(self):
         """In the HTTP thread that upgraded: start the writer, then read until the connection ends."""
-        threading.Thread(target=self._writer, name="kaas-w", daemon=True).start()
         try:
+            threading.Thread(target=self._writer, name="kaas-w", daemon=True).start()
             while not self.closed:
                 op, data = ws_read(self.rfile, KAAS_MAX_MESSAGE, on_control=self._control)
                 self.last_rx = time.monotonic()
@@ -7280,6 +7295,7 @@ class KaasConn:
             pass
         finally:
             self.close()
+            self.hub.drop(self)                             # (the writer drops it too: whichever ends first frees the slot)
 
     def _writer(self):
         last_ping = time.monotonic()
@@ -7332,6 +7348,7 @@ class KaasHub:
         self.next_check = 0.0
         self.tickets = {}                   # ticket -> (web login's pub hex, monotonic expiry): one websocket, once
         self.ticket_log = {}                # ticket -> (what became of it, monotonic expiry): see ticket_outcome
+        self.refused_hosts = {}             # host -> (logins refused, last): names web logins were signed for, not ours
         self.challenges = {}                # web login challenge -> monotonic expiry
         self.wusers = {}                    # web user (pub hex) -> {"name", "first", "last"}: shown on the dashboard
         self.wusers_path = os.path.join(room.cfg.data_dir, "web_users.json")
@@ -7531,7 +7548,9 @@ class KaasHub:
         if exp is None or exp <= time.monotonic():
             return 401, {"error": "unknown or expired challenge: ask for a new one"}
         if host.lower() not in hosts:
-            return 401, {"error": "the login was signed for %s, not this server" % host[:100]}
+            self.web_refused_host(host.lower())
+            return 401, {"error": "the login was signed for %s, which isn't one of this server's names (its admin can "
+                                  "allow it on the Web users card)" % host[:100]}
         if not ed25519_verify(pb, sb, web_login_message(host, ch, pub)):
             return 401, {"error": "the signature doesn't match the key"}
         if pb in self.room.own_node_keys():
@@ -7550,6 +7569,16 @@ class KaasHub:
             return 503, {"error": "too many logins at once: try again shortly"}
         return 200, {"ticket": ticket, "expires_in": KAAS_TICKET_S, "send": key["send"],
                      "state": "allowed" if key["send"] else "pending"}
+
+    def web_refused_host(self, host):
+        """A web login signed for a name not in web_hosts: kept (the last few) for the Web users card to offer."""
+        if not re.fullmatch(r"[a-z0-9.\-:\[\]]{1,100}", host):
+            return
+        with self.slock:
+            n = self.refused_hosts.pop(host, (0, 0))[0]
+            self.refused_hosts[host] = (n + 1, now_s())
+            while len(self.refused_hosts) > 10:
+                del self.refused_hosts[next(iter(self.refused_hosts))]
 
     def web_seen(self, pub_hex, name=None):
         """A web user logged in, or is still connected: the dashboard's list (the least recently active go first)."""
@@ -8464,6 +8493,9 @@ A key is shown once, when it is made: only a hash of it is kept, so a lost key c
 <div class="rprow"><label>Page password <input id="wb_pw" type="password" size="18" maxlength="64" autocomplete="new-password" placeholder="none"></label>
 <button onclick="wbPagePw(this,false)">Set</button><button id="wb_pw_rm" onclick="wbPagePw(this,true)">Remove</button>
 <span class="dim small" id="wb_pw_state"></span></div>
+<div class="rprow"><label title="The names people reach MeshCore Web by, through a proxy or a domain (this server's own ip:port always works). A login signed for any other name is refused: another server can't relay its visitors' logins here">Host names
+<input id="wb_hosts" type="text" size="40" maxlength="600" autocomplete="off" placeholder="mesh.example.com, ..."></label><button onclick="wbHosts(this)">Save</button>
+<span class="small" id="wb_refused"></span></div>
 <div class="rprow"><label title="Shown to a web user whose key may not send yet: not heard advertising on this radio (an MQTT report doesn't count), and not allowed by you">Unknown key message
 <input id="wb_unk" type="text" size="60" maxlength="200" autocomplete="off"></label><button onclick="wbUnknown(this)">Save</button></div>
 <div class="rprow"><label title="For MeshCore Web's GIF picker: a free key from developers.giphy.com (an API key, not an SDK key). Web users' browsers use it to search Giphy">Giphy API key
@@ -8514,7 +8546,7 @@ A key is shown once, when it is made: only a hash of it is kept, so a lost key c
 <script>
 const TENANT=!!window.TENANT;if(TENANT){document.body.classList.add("tenant");
  document.querySelector("#advcard .hdesc").textContent="this room's adverts"}
-const $=id=>document.getElementById(id), esc=s=>String(s??"").replace(/[&<>"]/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c]));
+const $=id=>document.getElementById(id), esc=s=>String(s??"").replace(/[&<>"'`]/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;","`":"&#96;"}[c]));
 function ago(t){if(!t)return"never";let d=Math.max(0,Date.now()/1000-t);return d<60?Math.round(d)+"s":d<3600?Math.round(d/60)+"m":d<86400?(d/3600).toFixed(1)+"h":(d/86400).toFixed(1)+"d"}
 async function act(url,label){if(!confirm(label))return;const r=await fetch(url,{method:"POST"});if(r.status===401){await session();alert("Your admin session has expired: log in again.")}setTimeout(load,300)}
 async function resync(m,btn){btn.disabled=true;await fetch("api/members/"+m.pub+"/resync",{method:"POST"});
@@ -8548,7 +8580,12 @@ async function vcSet(o){const r=await fetch("api/companion",{method:"POST",heade
  if(r.status===401){m="Your admin session has expired: log in again.";session()}
  $("vcmsg").className=r.ok?"good small":"poor small";$("vcmsg").textContent=r.ok?"":" "+m;delete SIG.vcform;setTimeout(load,400);return r.ok}
 async function vcImportKey(){const k=$("vc_key").value.trim();if(!k)return;const ok=await vcSet({private_key:k});$("vc_key").value="";$("vckeymsg").textContent=ok?"key imported; companion remains disabled":"key was not imported"}
+const VC_WARNING="The virtual companion is meant for use on a trusted local network only. Its port has no login: anyone "+
+ "who can reach it can read and delete its messages, read its channel secrets, see its contacts, send as it and "+
+ "have it sign data with its key.\n\nNever expose the port to the internet. Limit it to the devices you use with "+
+ "\"Allowed addresses\" (or bind it to 127.0.0.1).\n\nTurn the virtual companion on?";
 async function vcToggle(cb){   // turning it on saves the options with it; they stay locked until it's turned off again
+ if(cb.checked&&!confirm(VC_WARNING)){cb.checked=false;return}
  const o=cb.checked?{enabled:true,name:$("vc_name").value,port:+$("vc_port").value,allow:$("vc_allow").value,auto_advert:$("vc_auto").checked,
   advert_min:+$("vc_int").value,advert_flood:$("vc_flood").value==="1"}:{enabled:false};
  cb.disabled=true;const ok=await vcSet(o);cb.disabled=false;if(!ok)cb.checked=!cb.checked}
@@ -8589,7 +8626,10 @@ async function loadWeb(){if(!MAINADM)return;let d;try{const r=await fetch("api/v
  WB=d;$("wb_on").checked=d.enabled;$("wb_pw_state").textContent=d.page_password?"set: the page and its logins ask for it":"none: anyone who can reach this server can open the page";$("wb_pw_rm").disabled=!d.page_password;
  $("wb_giphy_state").textContent=d.giphy_key?"set: web users get a GIF picker":"none: no GIF picker (Giphy links still show)";$("wb_giphy_rm").disabled=!d.giphy_key;
  {const b=d.backlog||{};if(document.activeElement!==$("wb_days"))$("wb_days").value=b.days;$("wb_bk_mqtt").checked=!!b.mqtt;
-  $("wb_bk_state").textContent=b.days?(b.count||0).toLocaleString()+" packets kept"+(b.oldest?", the oldest from "+ago(b.oldest)+" ago":""):"off: web users don't catch up";}if(document.activeElement!==$("wb_unk"))$("wb_unk").value=d.unknown_key_message||"";$("wb_conn").textContent=d.connected;$("wb_max").textContent=d.max;
+  $("wb_bk_state").textContent=b.days?(b.count||0).toLocaleString()+" packets kept"+(b.oldest?", the oldest from "+ago(b.oldest)+" ago":""):"off: web users don't catch up";}if(document.activeElement!==$("wb_unk"))$("wb_unk").value=d.unknown_key_message||"";
+ WBH=d.hosts||[];if(document.activeElement!==$("wb_hosts"))$("wb_hosts").value=WBH.join(", ");
+ $("wb_refused").innerHTML=(d.refused_hosts||[]).length?'<span class="mid">Refused:</span> '+d.refused_hosts.map(r=>
+  `<span class="mono">${esc(r.host)}</span> <span class="dim">(${r.count}, ${ago(r.last)} ago)</span> <button data-h="${esc(r.host)}" onclick="wbHosts(this,this.dataset.h)">Allow</button>`).join(" "):"";$("wb_conn").textContent=d.connected;$("wb_max").textContent=d.max;
  $("wb_burst").textContent=$("kk_burst").textContent;$("wb_win").textContent=$("kk_win").textContent;
  const t=$("wblist");if(!d.users.length){t.innerHTML='<tr><td class="dim">'+(d.enabled?"Nobody has logged in yet.":"Web logins are off.")+'</td></tr>'}else{
  const key=p=>`<span class="wbkey" title="${esc(p)}">${esc(p.slice(0,8))}&hellip;</span>`;
@@ -8620,6 +8660,10 @@ async function wbPagePw(btn,remove){const pw=remove?"":$("wb_pw").value;
  if(!remove&&(pw.length<4||pw.length>64)){$("wbmsg").className="poor small";$("wbmsg").textContent=" A page password is 4 to 64 characters.";return}
  if(remove&&!confirm("Remove the MeshCore Web page password? Anyone who can reach this server can then open the page."))return;
  btn.disabled=true;await wbSettings({page_password:pw});btn.disabled=false;$("wb_pw").value=""}
+let WBH=[];
+async function wbHosts(btn,add){const l=add?[...WBH,add]:$("wb_hosts").value.split(/[\s,]+/).filter(Boolean);
+ if(l.some(h=>!/^[A-Za-z0-9.\-:\[\]]{1,100}$/.test(h))){$("wbmsg").className="poor small";$("wbmsg").textContent=" Host names look like mesh.example.com or 10.0.0.5:8081.";return}
+ btn.disabled=true;await wbSettings({web_hosts:l});btn.disabled=false}
 async function wbUnknown(btn){const t=$("wb_unk").value.trim();
  if(!t){$("wbmsg").className="poor small";$("wbmsg").textContent=" The unknown key message can't be empty.";return}
  btn.disabled=true;await wbSettings({unknown_key_message:t});btn.disabled=false}
@@ -8853,7 +8897,7 @@ async function load(){
  const memSig=JSON.stringify(st.members)+"|"+ADMIN+"|"+[...EXP].join(",");
  if(changed("members",memSig)){
  const PUSH_TIP={synced:"Up to date: nothing to send",queued:"Posts waiting; nothing sent yet",sent:"First attempt sent",retry:"Retrying: count of retries sent for this post",backoff:"Every attempt failed: one more try (best route, then floods) when the timer ends",suspended:"No ACKs: paused until we hear from them (a flood probe every 6 h)"};
- const ACTS=(m,i)=>ADMIN?`<td class="acts"><button class="act" title="Force resync: clear backoff/suspension, retry now via best routes, then floods${m.outstanding?"":" (nothing outstanding)"}" onclick="event.stopPropagation();resync(MEMBERS[${i}],this)">${IC("resync")}</button><button class="act" title="Suggest a route to this member" onclick="event.stopPropagation();openSuggest(MEMBERS[${i}])">${IC("suggest")}</button><button class="act" title="Kick: remove from the room (they can rejoin)" onclick="event.stopPropagation();act('api/members/${m.pub}/kick','Kick ${esc(m.name||m.key)}? They are removed as if they never joined, and can log in again.')">${IC("kick")}</button><button class="act" title="Ban: the room ignores them completely" onclick="event.stopPropagation();act('api/members/${m.pub}/ban','Ban ${esc(m.name||m.key)}? The room will stop responding to them entirely.')">${IC("ban")}</button></td>`:"";
+ const ACTS=(m,i)=>ADMIN?`<td class="acts"><button class="act" title="Force resync: clear backoff/suspension, retry now via best routes, then floods${m.outstanding?"":" (nothing outstanding)"}" onclick="event.stopPropagation();resync(MEMBERS[${i}],this)">${IC("resync")}</button><button class="act" title="Suggest a route to this member" onclick="event.stopPropagation();openSuggest(MEMBERS[${i}])">${IC("suggest")}</button><button class="act" title="Kick: remove from the room (they can rejoin)" data-u="api/members/${m.pub}/kick" data-m="Kick ${esc(m.name||m.key)}? They are removed as if they never joined, and can log in again." onclick="event.stopPropagation();act(this.dataset.u,this.dataset.m)">${IC("kick")}</button><button class="act" title="Ban: the room ignores them completely" data-u="api/members/${m.pub}/ban" data-m="Ban ${esc(m.name||m.key)}? The room will stop responding to them entirely." onclick="event.stopPropagation();act(this.dataset.u,this.dataset.m)">${IC("ban")}</button></td>`:"";
  const IDC=(m,caret)=>`<td class="idcell">${caret}<b>${esc(m.name)||'<span class="dim">unknown</span>'}</b><br><span class="dim mono4">${m.key.slice(0,4)}</span><br><span class="small">${m.role}</span></td>`;
  const HX=h=>h==null?'<span class="dim">unknown</span>':h.length?h.join(" &rsaquo; "):"direct";
  const NM=p=>p==null?'<span class="dim">unknown</span>':p.length?p.map(esc).join(" &rsaquo; "):"direct";
@@ -8886,7 +8930,7 @@ async function load(){
  MEMBERS=st.members;
  const bans=st.bans||[];
  if(changed("bans",{b:bans,a:ADMIN}))
- $("bans").innerHTML=bans.length?"<tr><th>Name</th><th>Key</th><th>Banned</th><th></th></tr>"+bans.map(b=>`<tr><td>${esc(b.name)||'<span class="dim">unknown</span>'}</td><td class="dim">${b.key}</td><td>${ago(b.ts)} ago</td><td>${ADMIN?`<button onclick="act('api/bans/${b.pub}/unban','Unban ${esc(b.name||b.key)}? They will be able to log in again.')">Unban</button>`:""}</td></tr>`).join(""):'<tr><td class="dim">nobody</td></tr>';
+ $("bans").innerHTML=bans.length?"<tr><th>Name</th><th>Key</th><th>Banned</th><th></th></tr>"+bans.map(b=>`<tr><td>${esc(b.name)||'<span class="dim">unknown</span>'}</td><td class="dim">${b.key}</td><td>${ago(b.ts)} ago</td><td>${ADMIN?`<button data-u="api/bans/${b.pub}/unban" data-m="Unban ${esc(b.name||b.key)}? They will be able to log in again." onclick="act(this.dataset.u,this.dataset.m)">Unban</button>`:""}</td></tr>`).join(""):'<tr><td class="dim">nobody</td></tr>';
 }
 function drawMap(st){
  if(typeof L==="undefined"){$("mapnote").textContent="Map needs internet access (Leaflet / OpenStreetMap). Tables above still work.";return}
@@ -8899,7 +8943,7 @@ function drawMap(st){
   map=L.map("map").setView([c[0],c[1]],z);
   // OSM's tile servers refuse requests without a Referer: set it on the tiles themselves so a strict
   // Referrer-Policy from a proxy / load balancer can't strip it
-  L.tileLayer("https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png",{maxZoom:18,attribution:"&copy; OpenStreetMap",
+  L.tileLayer("https://tile.openstreetmap.org/{z}/{x}/{y}.png",{maxZoom:18,attribution:"&copy; OpenStreetMap",
    referrerPolicy:"strict-origin-when-cross-origin"}).addTo(map);
   map.on("click",()=>{if(SEL)select(null)});                 // empty map: show everything again
  }
@@ -9027,8 +9071,30 @@ class WebUI:
                 return hit[2] if gz else hit[1]
 
         class H(http.server.BaseHTTPRequestHandler):
+            timeout = HTTP_TIMEOUT_S                        # (a websocket lifts it once it's open: pings take over)
+
             def log_message(self, *a):
                 pass
+
+            def _raw_body(self):
+                """The request body, read once (do_POST reads it before taking a request slot). At most
+                HTTP_MAX_BODY: a bigger one is refused there with 413, unread."""
+                if not hasattr(self, "_body_bytes"):
+                    try:
+                        n = int(self.headers.get("Content-Length") or 0)
+                    except ValueError:
+                        n = 0
+                    self._body_bytes = self.rfile.read(n) if 0 < n <= HTTP_MAX_BODY else b""
+                return self._body_bytes
+
+            def _penalty(self):
+                """A wrong password, key or ticket: answer a second late, without holding a request slot meanwhile
+                (else 16 bad guesses a second would turn everyone else away)."""
+                slots.release()
+                try:
+                    time.sleep(1.0)
+                finally:
+                    slots.acquire()
 
             def _token(self):
                 for part in (self.headers.get("Cookie") or "").split(";"):
@@ -9050,7 +9116,7 @@ class WebUI:
 
             def _body(self):
                 try:
-                    return json.loads(self.rfile.read(int(self.headers.get("Content-Length") or 0) or 0) or b"{}")
+                    return json.loads(self._raw_body() or b"{}")
                 except ValueError:
                     return None
 
@@ -9077,7 +9143,8 @@ class WebUI:
                         return self._get()
                     if path in ("/", "/index.html"):
                         gz = "gzip" in (self.headers.get("Accept-Encoding") or "")
-                        return self._send(200, tpage[1] if gz else tpage[0], "text/html; charset=utf-8", gz=gz)
+                        return self._send(200, tpage[1] if gz else tpage[0], "text/html; charset=utf-8", gz=gz,
+                                          headers=DASHBOARD_HEADERS)
                     if path == "/api/session":
                         return self._send(200, json.dumps({"admin": self._tenant_admin(t), "login_enabled": True}))
                     if path == "/api/state":
@@ -9112,7 +9179,7 @@ class WebUI:
                 if parts == ["api", "login"]:
                     body = self._body() or {}
                     if not check_web_password(str(body.get("password", "")), t.cfg.web_password_hash):
-                        time.sleep(1.0)                         # slow down guessing
+                        self._penalty()
                         return self._send(401, '{"error":"wrong password"}')
                     tok = secrets.token_hex(24)
                     with slock:
@@ -9205,6 +9272,14 @@ class WebUI:
                     slots.release()
 
             def do_POST(self):
+                try:
+                    n = int(self.headers.get("Content-Length") or 0)
+                except ValueError:
+                    n = -1
+                if not 0 <= n <= HTTP_MAX_BODY:
+                    self.close_connection = True
+                    return self._send(413 if n > 0 else 400, '{"error":"a request body is at most %d bytes"}' % HTTP_MAX_BODY)
+                self._raw_body()                            # (before a slot: a slow body only holds its own thread)
                 if not slots.acquire(blocking=False):
                     return self._send(503, '{"error":"busy"}')
                 try:
@@ -9249,7 +9324,7 @@ class WebUI:
                                 "unknown": "an unknown or already used", "expired": "an expired",
                                 "refused": "web logins are off, or the key is banned: a"}[why])
                             hub.ticket_outcome(ticket, why)
-                        time.sleep(1.0)                     # slow down guessing
+                        self._penalty()
                         return self._send(401, '{"error":"missing, unknown, revoked or expired API key or ticket"}')
                     conn = KaasConn(hub, self.connection, self.rfile, key, self.client_address[0])
                     if not hub.add(conn):
@@ -9257,18 +9332,23 @@ class WebUI:
                             (int(cfg.web_max_clients), "web sessions") if conn.web else (KAAS_MAX_CLIENTS, "API clients")),
                             "full", "all %d %s are in use" % (
                                 (int(cfg.web_max_clients), "web sessions") if conn.web else (KAAS_MAX_CLIENTS, "API clients")))
+                    try:
+                        self.protocol_version = "HTTP/1.1"  # (this upgrade only) an HTTP/1.0 101 isn't valid, and
+                        self.send_response(101, "Switching Protocols")   # a proxy may refuse it or add Connection: close
+                        self.send_header("Upgrade", "websocket")
+                        self.send_header("Connection", "Upgrade")
+                        self.send_header("Sec-WebSocket-Accept", ws_accept(wkey))
+                        self.end_headers()
+                        self.close_connection = True
+                        conn.send_json(hub.hello(key))
+                    except BaseException:
+                        hub.drop(conn)                      # (the peer hung up mid-upgrade: its slot isn't kept)
+                        raise
+                    self.connection.settimeout(None)            # (an open websocket: its pings keep watch)
                     if ticket:
                         hub.ticket_outcome(ticket, "connected")
-                    self.protocol_version = "HTTP/1.1"      # (this upgrade only) an HTTP/1.0 101 isn't valid, and
-                    self.send_response(101, "Switching Protocols")   # a proxy may refuse it or add Connection: close
-                    self.send_header("Upgrade", "websocket")
-                    self.send_header("Connection", "Upgrade")
-                    self.send_header("Sec-WebSocket-Accept", ws_accept(wkey))
-                    self.end_headers()
-                    self.close_connection = True
                     if not conn.web:
                         events.put(("kaas_used", key["id"], now_s()))
-                    conn.send_json(hub.hello(key))
                 finally:
                     slots.release()
                 log.info("API client %s connected (key %s)", self.client_address[0], key["id"])
@@ -9280,12 +9360,17 @@ class WebUI:
                 return room.kaas.find(auth[7:].strip()) if auth[:7].lower() == "bearer " else None
 
             def _web_hosts(self):
-                """The host names a web login may be signed for: this request's Host; X-Forwarded-Host from a proxy on
-                this machine; and web_hosts from the config (a proxy elsewhere that rewrites Host)."""
-                hosts = {(self.headers.get("Host") or "").strip().lower()}
-                if self.client_address[0] in ("127.0.0.1", "::1", "::ffff:127.0.0.1"):
-                    hosts.add((self.headers.get("X-Forwarded-Host") or "").split(",")[0].strip().lower())
-                hosts.update(str(h).strip().lower() for h in (cfg.web_hosts or []))
+                """The host names a web login may be signed for: this server's own address as this connection reached
+                it (ip:port), and the names the admin lists in web_hosts (a domain, or a proxy's). Never the request's
+                Host header by itself: another server could relay its visitors' logins here under its own name."""
+                hosts = {str(h).strip().lower() for h in (cfg.web_hosts or [])}
+                ip, port = self.connection.getsockname()[:2]
+                ip = ip[7:] if ip.startswith("::ffff:") else ip
+                names = [("[%s]" % ip) if ":" in ip else ip] + (["localhost"] if ip in ("127.0.0.1", "::1") else [])
+                for n in names:
+                    hosts.add("%s:%d" % (n, port))
+                    if port in (80, 443):
+                        hosts.add(n)
                 hosts.discard("")
                 return hosts
 
@@ -9305,7 +9390,7 @@ class WebUI:
                     return True
                 if pw and check_web_password(str(pw), cfg.web_page_password):
                     return True
-                time.sleep(1.0)                             # slow down guessing
+                self._penalty()
                 return False
 
             def _web_unlock_page(self, error=""):
@@ -9320,10 +9405,10 @@ class WebUI:
                 """POST /meshcore-web/unlock: the page password, from the form. Right: a page session (cookie), then
                 the app; wrong: the form again, after a second."""
                 n = int(self.headers.get("Content-Length") or 0)
-                form = urllib.parse.parse_qs(self.rfile.read(min(n, 4096)).decode(errors="replace")) if n else {}
+                form = urllib.parse.parse_qs(self._raw_body()[:4096].decode(errors="replace")) if n else {}
                 pw = (form.get("password") or [""])[0]
                 if not cfg.web_page_password or not check_web_password(pw, cfg.web_page_password):
-                    time.sleep(1.0)
+                    self._penalty()
                     return self._web_unlock_page("That isn't the password." if cfg.web_page_password else "")
                 tok = web_page_session(cfg.web_page_password)
                 self.send_response(303)
@@ -9395,6 +9480,9 @@ class WebUI:
                     hub = room.kaas
                     return self._send(200, json.dumps({
                         "enabled": bool(cfg.web_login), "unknown_key_message": str(cfg.web_unknown_key_message or ""),
+                        "hosts": [str(h) for h in (cfg.web_hosts or [])],
+                        "refused_hosts": [dict(host=h, count=v[0], last=v[1]) for h, v in list(hub.refused_hosts.items())
+                                          if h not in [str(x).lower() for x in (cfg.web_hosts or [])]],
                         "page_password": bool(cfg.web_page_password), "giphy_key": bool(cfg.web_giphy_key),
                         "backlog": hub.backlog_info(),
                         "max": int(cfg.web_max_clients), "connected": sum(1 for c in hub.conns if c.web),
@@ -9435,7 +9523,8 @@ class WebUI:
                     return self._send(404, '{"error":"not found"}')
                 if path in ("/", "/index.html"):
                     gz = "gzip" in (self.headers.get("Accept-Encoding") or "")
-                    return self._send(200, page[1] if gz else page[0], "text/html; charset=utf-8", gz=gz)
+                    return self._send(200, page[1] if gz else page[0], "text/html; charset=utf-8", gz=gz,
+                                      headers=DASHBOARD_HEADERS)
                 if path == "/meshcore-web":
                     self.send_response(301)                     # (the page works out the server from its own address)
                     self.send_header("Location", "meshcore-web/")
@@ -9525,11 +9614,11 @@ class WebUI:
                     if not cfg.web_password:
                         return self._send(403, '{"error":"admin login is off: set web_password in the config"}')
                     try:
-                        body = json.loads(self.rfile.read(int(self.headers.get("Content-Length") or 0) or 0) or b"{}")
+                        body = json.loads(self._raw_body() or b"{}")
                     except ValueError:
                         body = {}
                     if not hmac.compare_digest(str(body.get("password", "")).encode(), str(cfg.web_password).encode()):
-                        time.sleep(1.0)                         # slow down guessing
+                        self._penalty()
                         return self._send(401, '{"error":"wrong password"}')
                     tok = secrets.token_hex(24)
                     with slock:
@@ -9558,6 +9647,12 @@ class WebUI:
                 if parts == ["api", "v1", "web", "settings"]:
                     body = self._body() or {}
                     change = {k: body[k] for k in ("web_login",) if isinstance(body.get(k), bool)}
+                    if "web_hosts" in body:
+                        hl = body["web_hosts"]
+                        if not isinstance(hl, list) or len(hl) > 16 or not all(
+                                isinstance(h, str) and re.fullmatch(r"[A-Za-z0-9.\-:\[\]]{1,100}", h.strip()) for h in hl):
+                            return self._send(400, '{"error":"host names: up to 16, like mesh.example.com or 10.0.0.5:8081"}')
+                        change["web_hosts"] = sorted({h.strip().lower() for h in hl})
                     if "unknown_key_message" in body:
                         t = body["unknown_key_message"]
                         if not isinstance(t, str) or not t.strip() or len(t) > 200:
@@ -9631,7 +9726,7 @@ class WebUI:
                     body = self._body() or {}
                     if parts[3] == "delete":
                         if not hmac.compare_digest(str(body.get("password", "")).encode(), str(cfg.web_password).encode()):
-                            time.sleep(1.0)
+                            self._penalty()
                             return self._send(403, '{"error":"wrong admin password: the room was not deleted"}')
                         events.put(("t_delete", key))
                     else:
@@ -9645,7 +9740,7 @@ class WebUI:
                     return self._send(200, '{"ok":true}')
                 if parts == ["api", "observer"]:
                     try:
-                        body = json.loads(self.rfile.read(int(self.headers.get("Content-Length") or 0) or 0) or b"{}")
+                        body = json.loads(self._raw_body() or b"{}")
                     except ValueError:
                         return self._send(400, '{"error":"invalid JSON"}')
                     bool_keys = ("observer_enabled", "observer_status", "observer_packets", "observer_rx",
@@ -9677,7 +9772,7 @@ class WebUI:
                     return self._send(200, json.dumps({"ok": True, "updates": updates}))
                 if parts == ["api", "welcome"]:
                     try:
-                        body = json.loads(self.rfile.read(int(self.headers.get("Content-Length") or 0) or 0) or b"{}")
+                        body = json.loads(self._raw_body() or b"{}")
                     except ValueError:
                         return self._send(400, '{"error":"invalid JSON"}')
                     updates = {}
@@ -9705,7 +9800,7 @@ class WebUI:
                     return self._send(200, json.dumps({"ok": True, "updates": updates}))
                 if parts == ["api", "mqtt"]:
                     try:
-                        body = json.loads(self.rfile.read(int(self.headers.get("Content-Length") or 0) or 0) or b"{}")
+                        body = json.loads(self._raw_body() or b"{}")
                         ch = mqtt_changes(body)
                     except (ValueError, TypeError) as e:
                         return self._send(400, json.dumps({"error": str(e) or "bad request"}))
@@ -9715,7 +9810,7 @@ class WebUI:
                     return self._send(200, json.dumps({"ok": True, "changed": list(ch)}))
                 if parts == ["api", "repeater"]:
                     try:
-                        body = json.loads(self.rfile.read(int(self.headers.get("Content-Length") or 0) or 0) or b"{}")
+                        body = json.loads(self._raw_body() or b"{}")
                         if "private_key" in body and room.cfg.repeater_enabled:
                             return self._send(409, '{"error":"disable the virtual repeater before importing a private key"}')
                         ch = repeater_changes(body)
@@ -9727,7 +9822,7 @@ class WebUI:
                     return self._send(200, json.dumps({"ok": True, "changed": list(ch)}))
                 if parts == ["api", "companion"]:
                     try:
-                        body = json.loads(self.rfile.read(int(self.headers.get("Content-Length") or 0) or 0) or b"{}")
+                        body = json.loads(self._raw_body() or b"{}")
                         if room.cfg.companion_enabled and set(body) - {"enabled"}:
                             return self._send(409, '{"error":"turn the virtual companion off to change its settings"}')
                         ch = companion_changes(body)
@@ -9739,7 +9834,7 @@ class WebUI:
                     return self._send(200, json.dumps({"ok": True, "changed": list(ch)}))
                 if parts == ["api", "advert"]:
                     try:
-                        body = json.loads(self.rfile.read(int(self.headers.get("Content-Length") or 0) or 0) or b"{}")
+                        body = json.loads(self._raw_body() or b"{}")
                     except ValueError:
                         body = {}
                     with slock:
@@ -9752,7 +9847,7 @@ class WebUI:
                     return self._send(200, json.dumps({"ok": True, "flood": flood, "repeater": rpt}))
                 if parts == ["api", "chat"]:
                     try:
-                        body = json.loads(self.rfile.read(int(self.headers.get("Content-Length") or 0) or 0) or b"{}")
+                        body = json.loads(self._raw_body() or b"{}")
                     except ValueError:
                         body = {}
                     text = str(body.get("text", "")).strip()
@@ -9765,7 +9860,7 @@ class WebUI:
                 if len(parts) == 4 and parts[:2] == ["api", "members"] and parts[3] == "route":
                     try:
                         pub = bytes.fromhex(parts[2])
-                        body = json.loads(self.rfile.read(int(self.headers.get("Content-Length") or 0) or 0) or b"{}")
+                        body = json.loads(self._raw_body() or b"{}")
                         reps = [(r.get("name") or "", r["hash"]) for r in (room.web_map or {}).get("repeaters", [])]
                         hops = resolve_route(str(body.get("path", "")), reps)
                     except ValueError as e:
@@ -9785,6 +9880,12 @@ class WebUI:
                 self._send(404, '{"error":"not found"}')
 
         class Server(http.server.ThreadingHTTPServer):
+            def process_request(self, request, client_address):
+                if threading.active_count() >= HTTP_MAX_THREADS:   # (a flood of connections: refuse, don't spawn)
+                    self.shutdown_request(request)
+                    return
+                super().process_request(request, client_address)
+
             def handle_error(self, request, client_address):
                 # clients disconnecting early is routine: no traceback. Anything else is logged briefly.
                 exc = sys.exc_info()[1]
