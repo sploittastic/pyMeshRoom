@@ -207,11 +207,11 @@ export function textBudget(senderName) {
 }
 
 // A channel message, as the apps send it: "Name: text" with a timestamp, flooded. Returns the raw packet.
-export function channelMessagePacket(channel, senderName, text, ts) {
+export function channelMessagePacket(channel, senderName, text, ts, hashSize = 1) {
   const prefix = utf8Encode(senderName + ": ");
   const body = utf8Cut(utf8Encode(text), textBudget(senderName));
   const plain = concatBytes(u32le(ts), new Uint8Array([0]), prefix, body);
-  return floodPacket(PT_GRP_TXT, concatBytes(new Uint8Array([channel.hash]), encryptThenMac(channel.secret, plain)));
+  return floodPacket(PT_GRP_TXT, concatBytes(new Uint8Array([channel.hash]), encryptThenMac(channel.secret, plain)), hashSize);
 }
 
 // A GRP_TXT payload -> {channel, sender, text, ts}, or null if it's for none of these channels.

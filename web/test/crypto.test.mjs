@@ -84,3 +84,12 @@ test("keys of small order: they never verify, and can't be talked to", async () 
   assert.equal(isWeakKey(me.pub), false);
   assert.throws(() => me.sharedSecret(identity), /weak key/);
 });
+
+test("floods we start can collect 1-, 2- or 3-byte repeater ids (MeshCore's path hash mode)", () => {
+  const ch = makeChannel("Public", "public");
+  for (const size of [1, 2, 3]) {
+    const pkt = parsePacket(channelMessagePacket(ch, "Alice", "hi", 1, size));
+    assert.equal(pkt.isFlood && pkt.hops === 0 && pkt.hashSize, size);
+  }
+  assert.equal(parsePacket(floodPacket(PT_GRP_TXT, new Uint8Array(4))).hashSize, 1);   // (1 unless asked)
+});

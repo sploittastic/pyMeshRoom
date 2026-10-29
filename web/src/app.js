@@ -88,6 +88,13 @@ const newId = () => crypto.randomUUID?.() || bytesToHex(randomBytes(8));
 
 // ---------------------------------------------------------------- theme
 
+// How many bytes of each repeater's id the floods we start collect in their path (MeshCore's path hash mode): 2 by
+// default. Longer ids mix up fewer repeaters, so the direct paths learned from those floods are surer.
+function pathHashSize() {
+  const n = Number(loadSettings().pathHash);
+  return [1, 2, 3].includes(n) ? n : 2;
+}
+
 function applyTheme(choice = loadSettings().theme || "dark") {
   const light = choice === "light" || (choice === "system" && matchMedia("(prefers-color-scheme: light)").matches);
   if (light) document.documentElement.dataset.theme = "light";
@@ -202,7 +209,7 @@ async function login(ev) {
   }
   const remember = $("f-remember").checked;
   const otherServer = !$("url-box").hidden && !!servedBy();
-  const prefs = { url, name, remember, otherServer, gifs: s.gifs, theme: s.theme };
+  const prefs = { url, name, remember, otherServer, gifs: s.gifs, theme: s.theme, pathHash: s.pathHash };
   if (!remember) saveSettings(prefs);
   else if (!$("unlock-box").hidden) saveSettings({ ...prefs, vault: s.vault });   // (unlocked: keep it sealed)
   else if ($("f-pass").value) {
@@ -259,6 +266,7 @@ function startChat(identity, name, client) {
   });
   node.loadContacts(loadContacts(identity.pubHex));
   node.isLocalRoom = isLocalRoom;
+  node.hashSize = pathHashSize();
   node.suggest = suggestPaths;
   app.server = client.endpoints.ws;
   app.cursor = loadCursor(identity.pubHex, app.server);
@@ -426,7 +434,7 @@ function logout() {
   clearInterval(app.dirTimer);
   flushSave();
   const s = loadSettings();
-  if (!s.remember) saveSettings({ url: s.url, name: s.name, remember: false, otherServer: s.otherServer, gifs: s.gifs, theme: s.theme });
+  if (!s.remember) saveSettings({ url: s.url, name: s.name, remember: false, otherServer: s.otherServer, gifs: s.gifs, theme: s.theme, pathHash: s.pathHash });
   Object.assign(app, { identity: null, client: null, node: null, channels: [], dms: [], history: {}, unread: {}, active: null });
   $("chat").hidden = true;
   $("messages").replaceChildren();
@@ -717,7 +725,7 @@ async function react(m, emoji) {
   const text = reactionText(emoji, hash, cv.kind === "dm" ? null : m.sender);
   let ok;
   if (cv.kind === "channel") {
-    const raw = channelMessagePacket(cv.channel, app.name, text, uniqueTime());
+    const raw = channelMessagePacket(cv.channel, app.name, text, uniqueTime(), pathHashSize());
     markSeen(packetHash(parsePacket(raw)));
     const res = await app.client.send(raw);
     ok = res.status === "sent" || res.status === "local";
@@ -776,7 +784,7 @@ async function sendMessage(ev) {
 
 async function deliver(cv, msg) {
   if (cv.kind === "channel") {
-    const raw = channelMessagePacket(cv.channel, app.name, msg.text, msg.ts);
+    const raw = channelMessagePacket(cv.channel, app.name, msg.text, msg.ts, pathHashSize());
     markSeen(packetHash(parsePacket(raw)));
     msg.status = app.client.backlog || app.client.state !== "open" ? "waiting" : "sending";
     updateMessage(msg);
@@ -836,7 +844,7 @@ async function advertise(kind) {
   $("dlg-advert").close();
   if (!canSend()) return toast("Not connected, or this key can't send.");
   const payload = advertPayload(app.identity, app.name, uniqueTime());
-  const raw = kind === "flood" ? floodPacket(PT_ADVERT, payload) : zeroHopPacket(PT_ADVERT, payload);
+  const raw = kind === "flood" ? floodPacket(PT_ADVERT, payload, pathHashSize()) : zeroHopPacket(PT_ADVERT, payload);
   markSeen(packetHash(parsePacket(raw)));
   toast("Sending advert…");
   const res = await app.client.send(raw);
@@ -1579,6 +1587,11 @@ function wire() {
     $("f-url").value = "";
     $("f-url").focus();
   });
+  $("path-hash").value = String(pathHashSize());
+  $("path-hash").addEventListener("change", () => {
+    saveSettings({ ...loadSettings(), pathHash: Number($("path-hash").value) });
+    if (app.node) app.node.hashSize = pathHashSize();
+  });
   $("theme").addEventListener("change", () => {
     saveSettings({ ...loadSettings(), theme: $("theme").value });
     applyTheme();
@@ -1662,8 +1675,8 @@ function wire() {
     const s = loadSettings();
     const forget = s.remember && confirm("Also forget your saved key on this device? (Your channels and messages are kept.)");
     if (forget) {
-      const { url, name, gifs, theme, otherServer } = s;
-      saveSettings({ url, name, gifs, theme, otherServer, remember: false });
+      const { url, name, gifs, theme, otherServer, pathHash } = s;
+      saveSettings({ url, name, gifs, theme, otherServer, pathHash, remember: false });
     }
     logout();
   });

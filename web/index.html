@@ -92,6 +92,9 @@
       </div>
       <button type="button" id="advert" class="ghost wide">Advertise me</button>
       <label class="check side-check"><input id="show-gifs" type="checkbox"> Show GIFs from Giphy</label>
+      <label class="side-check side-select" title="How many bytes of each repeater's id the floods you send collect in their path (MeshCore's path hash mode). Longer ids mix up fewer repeaters, so the routes learned from them are surer; very old repeater firmware only knows 1 byte">Path ids
+        <select id="path-hash"><option value="1">1 byte</option><option value="2">2 bytes</option><option value="3">3 bytes</option></select>
+      </label>
       <label class="side-check side-select">Theme
         <select id="theme"><option value="dark">Dark</option><option value="light">Light</option><option value="system">Follow the system</option></select>
       </label>

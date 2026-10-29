@@ -564,6 +564,10 @@ let b;
   ok(/ADVERT flood \w+ valid-sig WebTester/.test(tx), 'the radio sent our advert, with a valid signature');
   ok(tx.includes(wantReaction.replace('\n', '\\n')),                      // (readtx prints the line break as \n)
     'the radio sent our reaction, naming the message by its hash: ' + JSON.stringify(wantReaction));
+  const sizes = execFileSync('python3', ['-c', 'import sys,os;sys.path.insert(0,os.path.join(os.environ["PYMESHROOM"],"client"));' +
+    'from meshroom_kaas import Packet\nfor l in open(sys.argv[1]):\n  p = Packet.parse(bytes.fromhex(l[3:].strip())) if l.startswith("TX ") else None\n' +
+    '  if p and p.ptype == 5 and p.is_flood: print((p.path_len >> 6) + 1)', W + '/dev.log']).toString().trim().split('\n');
+  ok(sizes.length && sizes.every((n) => n === '2'), 'our channel floods collect 2-byte repeater ids by default: ' + [...new Set(sizes)].join(','));
   ok(tx.includes(wantReply), 'the radio sent our reply in MeshCore One\'s format: ' + wantReply);
   for (const pg of [p, banned, served, mp]) errors.push(...pg.errors);
   ok(errors.length === 0, 'no page errors' + (errors.length ? ': ' + errors.join(' | ') : ''));

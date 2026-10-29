@@ -28,6 +28,7 @@ export class MeshNode extends EventTarget {
   constructor(client, identity, name, { markSeen = () => false, uniqueTime } = {}) {
     super();
     this.client = client;
+    this.hashSize = 1;                    // bytes of each repeater's id in the paths of floods we start (1 to 3)
     this.id = identity;
     this.name = name;
     this.markSeen = markSeen;                 // the app's de-duplication: our own packets aren't handled again
@@ -134,7 +135,7 @@ export class MeshNode extends EventTarget {
   }
 
   route(c, ptype, payload, flood = false) {
-    return c.outLen == null || flood ? floodPacket(ptype, payload) : directPacket(ptype, payload, c.outPath, c.outLen);
+    return c.outLen == null || flood ? floodPacket(ptype, payload, this.hashSize) : directPacket(ptype, payload, c.outPath, c.outLen);
   }
 
   // How to send to c, try by try: [{plen, path, source} | {flood: true}], `tries` long. c.routeMode: "flood", only floods;
@@ -171,7 +172,7 @@ export class MeshNode extends EventTarget {
   }
 
   packetFor(step, ptype, payload) {
-    return step.flood ? floodPacket(ptype, payload) : directPacket(ptype, payload, step.path, step.plen);
+    return step.flood ? floodPacket(ptype, payload, this.hashSize) : directPacket(ptype, payload, step.path, step.plen);
   }
 
   datagram(c, data) {
@@ -335,7 +336,7 @@ export class MeshNode extends EventTarget {
   replyAck(pkt, c, ack) {
     let raw;
     if (pkt.isFlood) raw = floodPacket(PT_PATH, this.pathReturn(c, pkt.path, pkt.pathLen, PT_ACK, ack), pkt.hashSize);
-    else if (c.outLen == null) raw = floodPacket(PT_ACK, ack);
+    else if (c.outLen == null) raw = floodPacket(PT_ACK, ack, this.hashSize);
     else raw = directPacket(PT_ACK, ack, c.outPath, c.outLen);
     this.sendNow(raw);
   }

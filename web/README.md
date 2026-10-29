@@ -131,6 +131,7 @@ What you get:
   bans the key, or turns web logins off.
 * If the login works but the websocket doesn't open, it asks the server what became of it and says why: most often a
   reverse proxy that doesn't pass websockets on (see [docs/api.md](../docs/api.md#connecting)).
+* **Path ids** (sidebar): how many bytes of each repeater's id the floods you send collect in their path, MeshCore's path hash mode: 2 by default (1 or 3 too). Longer ids mix up fewer repeaters, so the routes learned from them are surer; very old repeater firmware only knows 1 byte.
 * Dark (the dashboard's look), light, or following the system; it works on phones.
 
 **Catching up.** pyMeshRoom keeps a backlog of channel messages and DMs, 30 days by default (the admin sets it).
