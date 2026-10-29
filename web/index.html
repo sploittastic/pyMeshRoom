@@ -113,6 +113,10 @@
     <div class="messages" id="messages" aria-live="polite"></div>
     <div class="gif-preview" id="gif-preview" hidden></div>
     <div class="mentions" id="mentions" role="listbox" aria-label="Mention someone" hidden></div>
+    <div class="reply-bar" id="reply-bar" hidden>
+      <span class="reply-label">Replying to <b id="reply-name"></b> <span id="reply-quote" class="dim"></span></span>
+      <button type="button" id="reply-cancel" class="ghost icon" aria-label="Don't reply" title="Don't reply">×</button>
+    </div>
     <form class="composer" id="composer" autocomplete="off">
       <button type="button" id="emoji-btn" class="ghost tool" aria-label="Emoji" title="Emoji">😊</button>
       <button type="button" id="gif-btn" class="ghost tool gif-tool" aria-label="GIF" title="GIFs from Giphy" hidden>GIF</button>

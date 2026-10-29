@@ -107,3 +107,50 @@ export function emojiOnly(text) {
   const parts = [...new Intl.Segmenter(undefined, { granularity: "grapheme" }).segment(t)].filter((s) => s.segment.trim());
   return parts.length <= 5 && parts.every((s) => /\p{Extended_Pictographic}|\p{Regional_Indicator}|⃣/u.test(s.segment));
 }
+
+// ---------------------------------------------------------------- replies (MeshCore One's format, as MeshTrax uses it)
+
+const collapse = (s) => s.replace(/\s+/g, " ").trim();
+const chars = (s) => Array.from(s);                       // (characters, not UTF-16 units: an emoji counts once)
+const stripMentions = (s) => s.replace(/^(?:@\[[^\]]+\][ \n]?)+/, "");
+
+// A reply's wire text: "@[Name]\n>{first 10 characters of theirs}..\n{reply}" (".." only when theirs was longer). Theirs
+// leaves out a leading mention of the one replying (me). When it doesn't fit maxBytes, the quote shrinks to 6
+// characters, then goes, leaving "@[Name]\n{reply}". -> the text, or null when the reply alone doesn't fit.
+export function buildReply(name, original, body, maxBytes, me = "") {
+  let theirs = collapse(original);
+  if (me && theirs.startsWith("@[" + me + "]")) theirs = collapse(theirs.slice(me.length + 3));
+  const fits = (t) => utf8Encode(t).length <= maxBytes;
+  for (const n of [10, 6]) {
+    const c = chars(theirs);
+    const quote = c.slice(0, n).join("").trim() + (c.length > n ? ".." : "");
+    const t = "@[" + name + "]\n>" + quote + "\n" + body;
+    if (quote.replace(/\.\.$/, "") && fits(t)) return t;
+  }
+  const t = "@[" + name + "]\n" + body;
+  return fits(t) ? t : null;
+}
+
+// A reply's parts, or null: {name, quote (may be ""), body, partial: the quote was cut}. MeshCore One's
+// "@[Name]\n>quote..\nreply" (and "@[Name]\nreply" with no quote line), and meshcore-open's "@[Name] re:quote…reply".
+// A plain mention ("@[Name] hello") isn't a reply.
+export function parseReply(text) {
+  let m = /^@\[([^\]\n]+)\]\n>([^\n]*)\n([\s\S]*)$/.exec(text);
+  if (m) {
+    const partial = m[2].endsWith("..");
+    return { name: m[1], quote: partial ? m[2].slice(0, -2) : m[2], body: m[3], partial };
+  }
+  m = /^@\[([^\]\n]+)\] re:([\s\S]*?)(?:…|\.\.\.)\s*([\s\S]*)$/i.exec(text);
+  if (m) return { name: m[1], quote: m[2], body: m[3], partial: true };
+  m = /^@\[([^\]\n]+)\]\n(?!>)([\s\S]+)$/.exec(text);
+  if (m) return { name: m[1], quote: "", body: m[2], partial: false };
+  return null;
+}
+
+// Whether a message's text is the one a reply quotes: it starts with the quote, ignoring case, runs of whitespace and
+// leading mentions on both sides.
+export function quoteMatches(original, quote) {
+  const norm = (s) => collapse(stripMentions(collapse(s))).toLowerCase();
+  const q = norm(quote);
+  return !!q && norm(original).startsWith(q);
+}

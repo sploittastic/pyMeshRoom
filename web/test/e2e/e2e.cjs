@@ -364,6 +364,31 @@ let b;
   await p.waitForSelector('.msg:last-child .gif img', { timeout: 10000 });
   ok(true, 'a g:ID GIF (meshcore-open) is shown');
 
+  // replies (MeshCore One's format): ours quotes theirs; theirs quoting ours shows the message it answers
+  await p.hover('.msg:has(.text:text("only once"))');
+  await p.click('.msg:has(.text:text("only once")) .reply-btn');
+  ok(await p.isVisible('#reply-bar') && await p.textContent('#reply-name') === 'Bob', 'reply: the bar names who we answer');
+  await p.fill('#text', 'sure thing');
+  await p.press('#text', 'Enter');
+  await p.waitForSelector('.msg.mine:has(.text:text("sure thing")) .quote.found', { timeout: 10000 });
+  ok(await p.isHidden('#reply-bar') && /Bob only once/.test(await p.textContent('.msg.mine:has(.text:text("sure thing")) .quote')),
+    'our reply shows the message it answers');
+  const wantReply = 'WebTester: @[Bob]\\n>only once\\nsure thing';
+  inject('Public', 'Bob', '@[WebTester]\n>hello from..\nnice one');
+  await p.waitForSelector('.msg:has(.text:text("nice one")) .quote.found', { timeout: 10000 });
+  ok(/hello from the browser/.test(await p.textContent('.msg:has(.text:text("nice one")) .quote')), 'their reply to us: the quote finds our message');
+  await p.hover('.msg:has(.text:text("nice one"))');
+  await p.screenshot({ path: shotPrefix + '-replies.png' });
+  // a reaction that matches nothing: Look for it searches harder (and attaches it, or says why not)
+  inject('Public', 'Dave', '@[Bob]👏\n' + messageHash('only once', theirs.ts + 40));
+  await p.waitForSelector('.reaction-note:has-text("Dave") button', { timeout: 10000 });
+  await p.click('.reaction-note:has-text("Dave") button');
+  await p.waitForSelector('.msg:has(.text:text("only once")) .chip:has-text("👏")', { timeout: 15000 });
+  ok(await p.locator('.reaction-note:has-text("Dave")').count() === 0, 'look for it: a reaction 40 s off is found and attached');
+  await p.click('.reaction-note:has-text("Carol") button');
+  await p.waitForSelector('.reaction-note:has-text("Carol") button:text("why?")', { timeout: 15000 });
+  ok(/never received/.test(await p.getAttribute('.reaction-note:has-text("Carol")', 'title')), 'look for it: says why when nothing here matches');
+
   // the map
   await p.click('#open-map');
   await p.waitForSelector('#map-box .leaflet-interactive', { timeout: 15000 });
@@ -539,6 +564,7 @@ let b;
   ok(/ADVERT flood \w+ valid-sig WebTester/.test(tx), 'the radio sent our advert, with a valid signature');
   ok(tx.includes(wantReaction.replace('\n', '\\n')),                      // (readtx prints the line break as \n)
     'the radio sent our reaction, naming the message by its hash: ' + JSON.stringify(wantReaction));
+  ok(tx.includes(wantReply), 'the radio sent our reply in MeshCore One\'s format: ' + wantReply);
   for (const pg of [p, banned, served, mp]) errors.push(...pg.errors);
   ok(errors.length === 0, 'no page errors' + (errors.length ? ': ' + errors.join(' | ') : ''));
 })().catch(e => { console.log('FAIL', e.message); process.exitCode = 1; }).finally(() => b && b.close());

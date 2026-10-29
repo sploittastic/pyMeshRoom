@@ -2,7 +2,7 @@
 // (test/reaction_helper_test.dart).
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { emojiOnly, hashTexts, messageHash, parseReaction, reactionText } from "../src/format.js";
+import { buildReply, emojiOnly, hashTexts, messageHash, parseReaction, parseReply, quoteMatches, reactionText } from "../src/format.js";
 
 test("message hash: MeshCore One's pinned reference vectors", () => {
   assert.equal(messageHash("Hello", 1234567890), "66nf5k51");
@@ -41,4 +41,22 @@ test("text forms tried when matching, and emoji-only messages", () => {
   assert.equal(emojiOnly("👍👍👍👍👍👍"), false);
   assert.equal(emojiOnly("ok 👍"), false);
   assert.equal(emojiOnly("123"), false);
+});
+
+test("replies, as MeshCore One and MeshTrax write them", () => {
+  assert.equal(buildReply("GWQ∆🍓", "Heading to the  trailhead now", "Nice!", 160), "@[GWQ∆🍓]\n>Heading to..\nNice!");
+  assert.equal(buildReply("Bob", "short", "ok", 160), "@[Bob]\n>short\nok");                          // (no ".." when whole)
+  assert.equal(buildReply("Bob", "@[Me] are you there yet?", "yes", 160, "Me"), "@[Bob]\n>are you th..\nyes");
+  assert.equal(buildReply("Bob", "🎉🎉🎉🎉🎉🎉🎉🎉🎉🎉🎉🎉", "!", 160), "@[Bob]\n>🎉🎉🎉🎉🎉🎉🎉🎉🎉🎉..\n!");
+  const body = "x".repeat(140);
+  assert.equal(buildReply("Bob", "Heading to the trailhead", body, 160), "@[Bob]\n>Headin..\n" + body);   // shrinks
+  assert.equal(buildReply("Bob", "Heading to the trailhead", "y".repeat(150), 160), "@[Bob]\n" + "y".repeat(150));
+  assert.equal(buildReply("Bob", "hi", "z".repeat(160), 160), null);
+  assert.deepEqual(parseReply("@[GWQ∆🍓]\n>Heading to..\nNice!"), { name: "GWQ∆🍓", quote: "Heading to", body: "Nice!", partial: true });
+  assert.deepEqual(parseReply("@[Bob]\n>short\nok\nmore"), { name: "Bob", quote: "short", body: "ok\nmore", partial: false });
+  assert.deepEqual(parseReply("@[Bob] Re:what time…  noon"), { name: "Bob", quote: "what time", body: "noon", partial: true });
+  assert.deepEqual(parseReply("@[Bob]\nsure"), { name: "Bob", quote: "", body: "sure", partial: false });
+  assert.equal(parseReply("@[Bob] hello"), null);                                                  // a mention, not a reply
+  assert.equal(quoteMatches("@[Me]  Heading TO the trailhead", "heading to"), true);
+  assert.equal(quoteMatches("Somewhere else", "heading to"), false);
 });

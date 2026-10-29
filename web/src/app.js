@@ -1,7 +1,9 @@
 // The web app: log in, then talk on MeshCore channels, in DMs and in rooms through pyMeshRoom's KaaS API.
 // The private key, channel secrets and room passwords never leave the browser; the server only sees encrypted packets.
 import { bytesToHex, hexToBytes, randomBytes, utf8Decode, utf8Encode } from "./bytes.js";
-import { QUICK_REACTIONS, emojiOnly, hashTexts, messageHash, parseReaction, reactionText } from "./format.js";
+import {
+  QUICK_REACTIONS, buildReply, emojiOnly, hashTexts, messageHash, parseReaction, parseReply, quoteMatches, reactionText,
+} from "./format.js";
 import { EMOJI_CATEGORIES, RECENT_MAX } from "./emoji.js";
 import { findGifs, gifFallbackUrl, gifPageUrl, gifThumbUrl, gifUrl } from "./gif.js";
 import { AuthError, KaasClient, PagePasswordNeeded, kaasEndpoints } from "./kaas.js";
@@ -757,12 +759,14 @@ async function sendMessage(ev) {
   const text = ta.value.trim();
   const cv = conv();
   if (!text || !cv || !canSend()) return;
-  if (utf8Encode(text).length > budget(cv)) return toast("Too long for one message.");
+  const wire = composed(cv, text);
+  if (wire === null || utf8Encode(wire).length > budget(cv)) return toast("Too long for one message.");
   ta.value = "";
+  setReply(null);
   autosize();
   updateComposer();
   updateGifPreview();
-  const msg = { id: newId(), ts: uniqueTime(), at: Date.now(), sender: app.name, text, mine: true, status: "sending" };
+  const msg = { id: newId(), ts: uniqueTime(), at: Date.now(), sender: app.name, text: wire, mine: true, status: "sending" };
   (app.history[cv.key] ||= []).push(msg);
   appendMessage(msg);
   if (cv.kind === "dm") app.dms = [cv.contact.pubHex, ...app.dms.filter((p) => p !== cv.contact.pubHex)];
@@ -881,6 +885,7 @@ function renderSidebar() {
 
 function select(key) {
   if (!conv(key)) return;
+  if (key !== app.active) setReply(null);
   app.active = key;
   delete app.unread[key];
   $("sidebar").classList.remove("open");
@@ -940,10 +945,14 @@ function appendMessage(m, scroll = true) {
 function messageNode(m) {
   const when = new Date(shownTime(m));
   if (m.reaction) {
-    return el("div", { class: "reaction-note", dataset: { id: m.id }, title: when.toLocaleString() },
+    return el("div", { class: "reaction-note", dataset: { id: m.id }, title: when.toLocaleString() +
+      (m.reaction.hash ? " · message hash " + m.reaction.hash : "") + (m.reaction.why ? "\n" + m.reaction.why : "") },
       el("b", {}, m.sender || "(no name)"), " reacted ", el("span", { class: "emoji" }, m.reaction.emoji),
-      m.reaction.to ? " to a message from " + m.reaction.to : " to a message", " not shown here");
+      m.reaction.to ? " to a message from " + m.reaction.to : " to a message", " not shown here",
+      m.reaction.hash ? el("button", { type: "button", class: "linkish small", onclick: (ev) => lookHarder(m, ev.currentTarget) },
+        m.reaction.why ? "why?" : "Look for it") : null);
   }
+  const reply = parseReply(m.text);
   const reactions = Object.entries(m.reactions || {}).filter(([, who]) => who.length);
   const route = [];
   if (m.hops != null) route.push(m.hops === 0 ? "direct" : m.hops + (m.hops === 1 ? " hop" : " hops"));
@@ -957,14 +966,70 @@ function messageNode(m) {
       el("time", { datetime: when.toISOString(), title: when.toLocaleString() },
         when.toLocaleTimeString(undefined, { hour: "2-digit", minute: "2-digit" })),
       route.length ? el("span", {}, route.join(" · ")) : null),
-    el("div", { class: "text" + (emojiOnly(m.text) ? " big" : "") }, ...richText(m.text)),
+    reply ? quoteNode(reply) : null,
+    el("div", { class: "text" + (emojiOnly(reply ? reply.body : m.text) ? " big" : "") }, ...richText(reply ? reply.body : m.text)),
     reactions.length ? el("div", { class: "reactions" }, ...reactions.map(([e, who]) => el("button", {
       type: "button", class: "chip" + (who.includes(app.name) ? " me" : ""), title: who.join(", "),
       "aria-label": e + " from " + who.join(", "), onclick: () => react(m, e),
     }, e + (who.length > 1 ? " " + who.length : "")))) : null,
-    el("button", { type: "button", class: "react-btn", title: "React", "aria-label": "React to this message",
-      onclick: (ev) => openReactPicker(m, ev.currentTarget) }, "☺+"),
+    el("div", { class: "msg-acts" },
+      el("button", { type: "button", class: "reply-btn", title: "Reply", "aria-label": "Reply to this message",
+        onclick: () => setReply(m) }, "↩"),
+      el("button", { type: "button", class: "react-btn", title: "React", "aria-label": "React to this message",
+        onclick: (ev) => openReactPicker(m, ev.currentTarget) }, "☺+")),
     m.mine ? statusNode(m) : null);
+}
+
+// A reply's quote: the message it answers when it's here (click to see it), else what it quoted.
+function quoteNode(r) {
+  const since = Date.now() - 48 * 3600 * 1000;
+  const orig = r.quote ? (app.history[app.active] || []).filter((x) => !x.reaction && (x.at || x.ts * 1000) >= since)
+    .reverse().find((x) => (x.sender === r.name || (x.mine && r.name === app.name)) &&
+      quoteMatches(parseReply(x.text)?.body ?? x.text, r.quote)) : null;
+  const shown = orig ? parseReply(orig.text)?.body ?? orig.text : r.quote + (r.partial ? "…" : "");
+  return el("div", { class: "quote" + (orig ? " found" : ""), title: orig ? "Show the message" : null,
+    onclick: orig ? () => {
+      const node = $("messages").querySelector(`[data-id="${CSS.escape(orig.id)}"]`);
+      node?.scrollIntoView({ block: "center", behavior: "smooth" });
+      node?.classList.add("flash");
+      setTimeout(() => node?.classList.remove("flash"), 1200);
+    } : null }, el("b", {}, r.name), shown ? " " + shown : "");
+}
+
+// A reaction that matched nothing: search harder (each recent message's text forms, with every stamp ±5 minutes).
+// Found: it goes onto that message, and says how far off it was (worth reporting: the usual forms should find it).
+async function lookHarder(note, button) {
+  if (note.reaction.why) return toast(note.reaction.why);
+  button.disabled = true;
+  button.textContent = "Looking…";
+  const key = Object.keys(app.history).find((k) => app.history[k].includes(note));
+  const cv = conv(key);
+  const msgs = (app.history[key] || []).filter((x) => !x.reaction && x !== note).slice(-40).reverse();
+  let hit = null;
+  for (const m of msgs) {
+    const texts = [...hashTexts(m.text), ...(cv?.kind === "channel" ? [(m.sender || "") + ": " + m.text] : [])];
+    const stamps = [m.ts, ...(m.tsAlt || [])];
+    for (let d = 0; d <= 300 && !hit; d++) {
+      for (const base of stamps) for (const sign of d ? [1, -1] : [1]) for (const [i, t] of texts.entries())
+        if (!hit && messageHash(t, base + sign * d) === note.reaction.hash) hit = { m, d: sign * d, named: i >= hashTexts(m.text).length };
+    }
+    if (hit) break;
+    await new Promise((r) => setTimeout(r, 0));          // (a message at a time: the page stays responsive)
+  }
+  if (hit) {
+    addReaction(hit.m, note.reaction.emoji, note.sender);
+    app.history[key] = app.history[key].filter((x) => x !== note);
+    scheduleSave();
+    renderConversation();
+    toast("Found it: a reaction to " + (hit.m.sender || "a message") + "'s \"" + Array.from(hit.m.text).slice(0, 30).join("") +
+      "\" (its time off by " + hit.d + " s" + (hit.named ? ", hashed with the sender's name" : "") + "). Worth reporting: it should have matched.");
+    return;
+  }
+  note.reaction.why = "No message from the last " + msgs.length + " here matches, even ±5 minutes off: it was for a message " +
+    "this page never received (one sent or received by another device with your key, say, or before you joined).";
+  scheduleSave();
+  updateMessage(note);
+  toast(note.reaction.why);
 }
 
 function statusNode(m) {
@@ -1031,14 +1096,35 @@ function withMentions(text) {
   return out;
 }
 
+// What a message goes out as: with the reply markup when replying (MeshCore One's format; null if it can't fit).
+function composed(cv, text) {
+  const r = app.reply;
+  if (!r || r.key !== cv.key || !text) return text;
+  return buildReply(r.msg.sender || "", parseReply(r.msg.text)?.body ?? r.msg.text, text, budget(cv), app.name);
+}
+
+function setReply(m) {
+  app.reply = m ? { key: app.active, msg: m } : null;
+  $("reply-bar").hidden = !m;
+  if (m) {
+    const shown = parseReply(m.text)?.body ?? m.text;
+    $("reply-name").textContent = m.sender || "(no name)";
+    $("reply-quote").textContent = Array.from(shown).length > 60 ? Array.from(shown).slice(0, 60).join("") + "…" : shown;
+    $("text").focus();
+  }
+  updateComposer();
+}
+
 function updateComposer() {
   if (!app.identity) return;
-  const left = budget() - utf8Encode($("text").value.trim()).length;
+  const typed = $("text").value.trim(), cv = conv();
+  const wire = cv ? composed(cv, typed) : typed;
+  const left = budget() - (wire === null ? budget() + 1 : utf8Encode(wire).length);
   const count = $("count");
   count.textContent = String(left);
   count.className = "count" + (left < 0 ? " over" : "");
   const ok = canSend();
-  $("send").disabled = !ok || left < 0 || !$("text").value.trim();
+  $("send").disabled = !ok || left < 0 || !typed;
   $("text").placeholder = ok ? "Message " + (conv()?.title || "") : "Can't send right now";
   $("gif-btn").hidden = !gifsOn() || !giphyKey();
   $("advert").disabled = !ok;
@@ -1596,6 +1682,7 @@ function wire() {
   $("gif-q").addEventListener("input", () => { clearTimeout(gifTimer); gifTimer = setTimeout(searchGifs, 350); });
   $("pick-pop").addEventListener("mousedown", (e) => { if (e.target.closest("button")) e.preventDefault(); });
   $("messages").addEventListener("scroll", closeReactPicker);
+  $("reply-cancel").addEventListener("click", () => setReply(null));
   document.addEventListener("visibilitychange", () => {
     if (!document.hidden && app.active && app.unread[app.active]) {
       delete app.unread[app.active];

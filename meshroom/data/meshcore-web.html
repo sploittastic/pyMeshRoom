@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover, interactive-widget=resizes-content">
-<meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'sha256-DQntkxX9eZ2rce3b/+vbgWbFoDb1ocBg/uLa8yR2HKs=' 'self' https://unpkg.com/leaflet@1.9.4/dist/leaflet.js; style-src 'sha256-C6gXufUwd1rhQ1IlRWX8V0NxELRKitI0du69w5Lh6wI=' 'self' https://unpkg.com/leaflet@1.9.4/dist/leaflet.css; img-src 'self' data: https://media.giphy.com https://i.giphy.com https://tile.openstreetmap.org https://*.tile.openstreetmap.org https://unpkg.com/leaflet@1.9.4/dist/images/; connect-src https: wss: http: ws:; base-uri 'none'; form-action 'none'">
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'sha256-fapqU6ElO8NXz0dOJ9NlmsbJH9AN4jNk4b7NQsOG8gc=' 'self' https://unpkg.com/leaflet@1.9.4/dist/leaflet.js; style-src 'sha256-YnPxhVgz52EcL+z/bLaa3UNl8S2T+RieeeyZwLKDakE=' 'self' https://unpkg.com/leaflet@1.9.4/dist/leaflet.css; img-src 'self' data: https://media.giphy.com https://i.giphy.com https://tile.openstreetmap.org https://*.tile.openstreetmap.org https://unpkg.com/leaflet@1.9.4/dist/images/; connect-src https: wss: http: ws:; base-uri 'none'; form-action 'none'">
 <meta name="referrer" content="no-referrer">
 <title>MeshCore Web</title>
 <style>:root {
@@ -315,6 +315,21 @@ dialog.wide { width: min(760px, calc(100% - 32px)); }
 .suggested .mono { font-family: ui-monospace, monospace; }
 button.small { padding: 1px 8px; font-size: 12px; }
 .dim { color: var(--muted); }
+
+/* replies */
+.reply-bar { display: flex; align-items: center; gap: 8px; padding: 6px 16px; background: var(--panel); border-top: 1px solid var(--line); font-size: 13px; }
+.reply-label { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.quote { border-left: 3px solid var(--accent); padding: 2px 8px; margin: 2px 0 4px; font-size: 13px; color: var(--muted);
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap; max-width: 100%; }
+.quote b { color: var(--text); font-weight: 600; }
+.quote.found { cursor: pointer; }
+.msg.flash { outline: 2px solid var(--accent); outline-offset: 2px; transition: outline-color .3s; }
+.msg-acts { position: absolute; top: -10px; right: 6px; display: flex; gap: 4px; opacity: 0; transition: opacity .1s; }
+.msg:hover .msg-acts, .msg:focus-within .msg-acts { opacity: 1; }
+@media (hover: none) { .msg-acts { opacity: .75; } }
+.msg-acts button { position: static; opacity: 1; padding: 0 6px; font-size: 12px; line-height: 18px; border-radius: 9px;
+  background: var(--panel); border-color: var(--line); color: var(--muted); }
+.reaction-note button.linkish { margin-left: 6px; font-size: 12px; }
 </style>
 <script type="module">// src/bytes.js
 const __src_bytes_js = (() => {
@@ -612,7 +627,54 @@ function emojiOnly(text) {
   return parts.length <= 5 && parts.every((s) => /\p{Extended_Pictographic}|\p{Regional_Indicator}|⃣/u.test(s.segment));
 }
 
-return { QUICK_REACTIONS, messageHash, parseReaction, reactionText, hashTexts, emojiOnly };
+// ---------------------------------------------------------------- replies (MeshCore One's format, as MeshTrax uses it)
+
+const collapse = (s) => s.replace(/\s+/g, " ").trim();
+const chars = (s) => Array.from(s);                       // (characters, not UTF-16 units: an emoji counts once)
+const stripMentions = (s) => s.replace(/^(?:@\[[^\]]+\][ \n]?)+/, "");
+
+// A reply's wire text: "@[Name]\n>{first 10 characters of theirs}..\n{reply}" (".." only when theirs was longer). Theirs
+// leaves out a leading mention of the one replying (me). When it doesn't fit maxBytes, the quote shrinks to 6
+// characters, then goes, leaving "@[Name]\n{reply}". -> the text, or null when the reply alone doesn't fit.
+function buildReply(name, original, body, maxBytes, me = "") {
+  let theirs = collapse(original);
+  if (me && theirs.startsWith("@[" + me + "]")) theirs = collapse(theirs.slice(me.length + 3));
+  const fits = (t) => utf8Encode(t).length <= maxBytes;
+  for (const n of [10, 6]) {
+    const c = chars(theirs);
+    const quote = c.slice(0, n).join("").trim() + (c.length > n ? ".." : "");
+    const t = "@[" + name + "]\n>" + quote + "\n" + body;
+    if (quote.replace(/\.\.$/, "") && fits(t)) return t;
+  }
+  const t = "@[" + name + "]\n" + body;
+  return fits(t) ? t : null;
+}
+
+// A reply's parts, or null: {name, quote (may be ""), body, partial: the quote was cut}. MeshCore One's
+// "@[Name]\n>quote..\nreply" (and "@[Name]\nreply" with no quote line), and meshcore-open's "@[Name] re:quote…reply".
+// A plain mention ("@[Name] hello") isn't a reply.
+function parseReply(text) {
+  let m = /^@\[([^\]\n]+)\]\n>([^\n]*)\n([\s\S]*)$/.exec(text);
+  if (m) {
+    const partial = m[2].endsWith("..");
+    return { name: m[1], quote: partial ? m[2].slice(0, -2) : m[2], body: m[3], partial };
+  }
+  m = /^@\[([^\]\n]+)\] re:([\s\S]*?)(?:…|\.\.\.)\s*([\s\S]*)$/i.exec(text);
+  if (m) return { name: m[1], quote: m[2], body: m[3], partial: true };
+  m = /^@\[([^\]\n]+)\]\n(?!>)([\s\S]+)$/.exec(text);
+  if (m) return { name: m[1], quote: "", body: m[2], partial: false };
+  return null;
+}
+
+// Whether a message's text is the one a reply quotes: it starts with the quote, ignoring case, runs of whitespace and
+// leading mentions on both sides.
+function quoteMatches(original, quote) {
+  const norm = (s) => collapse(stripMentions(collapse(s))).toLowerCase();
+  const q = norm(quote);
+  return !!q && norm(original).startsWith(q);
+}
+
+return { QUICK_REACTIONS, messageHash, parseReaction, reactionText, hashTexts, emojiOnly, buildReply, parseReply, quoteMatches };
 })();
 
 // src/emoji.js
@@ -2166,7 +2228,7 @@ const __src_app_js = (() => {
 // The web app: log in, then talk on MeshCore channels, in DMs and in rooms through pyMeshRoom's KaaS API.
 // The private key, channel secrets and room passwords never leave the browser; the server only sees encrypted packets.
 const { bytesToHex, hexToBytes, randomBytes, utf8Decode, utf8Encode } = __src_bytes_js;
-const { QUICK_REACTIONS, emojiOnly, hashTexts, messageHash, parseReaction, reactionText } = __src_format_js;
+const { QUICK_REACTIONS, buildReply, emojiOnly, hashTexts, messageHash, parseReaction, parseReply, quoteMatches, reactionText } = __src_format_js;
 const { EMOJI_CATEGORIES, RECENT_MAX } = __src_emoji_js;
 const { findGifs, gifFallbackUrl, gifPageUrl, gifThumbUrl, gifUrl } = __src_gif_js;
 const { AuthError, KaasClient, PagePasswordNeeded, kaasEndpoints } = __src_kaas_js;
@@ -2915,12 +2977,14 @@ async function sendMessage(ev) {
   const text = ta.value.trim();
   const cv = conv();
   if (!text || !cv || !canSend()) return;
-  if (utf8Encode(text).length > budget(cv)) return toast("Too long for one message.");
+  const wire = composed(cv, text);
+  if (wire === null || utf8Encode(wire).length > budget(cv)) return toast("Too long for one message.");
   ta.value = "";
+  setReply(null);
   autosize();
   updateComposer();
   updateGifPreview();
-  const msg = { id: newId(), ts: uniqueTime(), at: Date.now(), sender: app.name, text, mine: true, status: "sending" };
+  const msg = { id: newId(), ts: uniqueTime(), at: Date.now(), sender: app.name, text: wire, mine: true, status: "sending" };
   (app.history[cv.key] ||= []).push(msg);
   appendMessage(msg);
   if (cv.kind === "dm") app.dms = [cv.contact.pubHex, ...app.dms.filter((p) => p !== cv.contact.pubHex)];
@@ -3039,6 +3103,7 @@ function renderSidebar() {
 
 function select(key) {
   if (!conv(key)) return;
+  if (key !== app.active) setReply(null);
   app.active = key;
   delete app.unread[key];
   $("sidebar").classList.remove("open");
@@ -3098,10 +3163,14 @@ function appendMessage(m, scroll = true) {
 function messageNode(m) {
   const when = new Date(shownTime(m));
   if (m.reaction) {
-    return el("div", { class: "reaction-note", dataset: { id: m.id }, title: when.toLocaleString() },
+    return el("div", { class: "reaction-note", dataset: { id: m.id }, title: when.toLocaleString() +
+      (m.reaction.hash ? " · message hash " + m.reaction.hash : "") + (m.reaction.why ? "\n" + m.reaction.why : "") },
       el("b", {}, m.sender || "(no name)"), " reacted ", el("span", { class: "emoji" }, m.reaction.emoji),
-      m.reaction.to ? " to a message from " + m.reaction.to : " to a message", " not shown here");
+      m.reaction.to ? " to a message from " + m.reaction.to : " to a message", " not shown here",
+      m.reaction.hash ? el("button", { type: "button", class: "linkish small", onclick: (ev) => lookHarder(m, ev.currentTarget) },
+        m.reaction.why ? "why?" : "Look for it") : null);
   }
+  const reply = parseReply(m.text);
   const reactions = Object.entries(m.reactions || {}).filter(([, who]) => who.length);
   const route = [];
   if (m.hops != null) route.push(m.hops === 0 ? "direct" : m.hops + (m.hops === 1 ? " hop" : " hops"));
@@ -3115,14 +3184,70 @@ function messageNode(m) {
       el("time", { datetime: when.toISOString(), title: when.toLocaleString() },
         when.toLocaleTimeString(undefined, { hour: "2-digit", minute: "2-digit" })),
       route.length ? el("span", {}, route.join(" · ")) : null),
-    el("div", { class: "text" + (emojiOnly(m.text) ? " big" : "") }, ...richText(m.text)),
+    reply ? quoteNode(reply) : null,
+    el("div", { class: "text" + (emojiOnly(reply ? reply.body : m.text) ? " big" : "") }, ...richText(reply ? reply.body : m.text)),
     reactions.length ? el("div", { class: "reactions" }, ...reactions.map(([e, who]) => el("button", {
       type: "button", class: "chip" + (who.includes(app.name) ? " me" : ""), title: who.join(", "),
       "aria-label": e + " from " + who.join(", "), onclick: () => react(m, e),
     }, e + (who.length > 1 ? " " + who.length : "")))) : null,
-    el("button", { type: "button", class: "react-btn", title: "React", "aria-label": "React to this message",
-      onclick: (ev) => openReactPicker(m, ev.currentTarget) }, "☺+"),
+    el("div", { class: "msg-acts" },
+      el("button", { type: "button", class: "reply-btn", title: "Reply", "aria-label": "Reply to this message",
+        onclick: () => setReply(m) }, "↩"),
+      el("button", { type: "button", class: "react-btn", title: "React", "aria-label": "React to this message",
+        onclick: (ev) => openReactPicker(m, ev.currentTarget) }, "☺+")),
     m.mine ? statusNode(m) : null);
+}
+
+// A reply's quote: the message it answers when it's here (click to see it), else what it quoted.
+function quoteNode(r) {
+  const since = Date.now() - 48 * 3600 * 1000;
+  const orig = r.quote ? (app.history[app.active] || []).filter((x) => !x.reaction && (x.at || x.ts * 1000) >= since)
+    .reverse().find((x) => (x.sender === r.name || (x.mine && r.name === app.name)) &&
+      quoteMatches(parseReply(x.text)?.body ?? x.text, r.quote)) : null;
+  const shown = orig ? parseReply(orig.text)?.body ?? orig.text : r.quote + (r.partial ? "…" : "");
+  return el("div", { class: "quote" + (orig ? " found" : ""), title: orig ? "Show the message" : null,
+    onclick: orig ? () => {
+      const node = $("messages").querySelector(`[data-id="${CSS.escape(orig.id)}"]`);
+      node?.scrollIntoView({ block: "center", behavior: "smooth" });
+      node?.classList.add("flash");
+      setTimeout(() => node?.classList.remove("flash"), 1200);
+    } : null }, el("b", {}, r.name), shown ? " " + shown : "");
+}
+
+// A reaction that matched nothing: search harder (each recent message's text forms, with every stamp ±5 minutes).
+// Found: it goes onto that message, and says how far off it was (worth reporting: the usual forms should find it).
+async function lookHarder(note, button) {
+  if (note.reaction.why) return toast(note.reaction.why);
+  button.disabled = true;
+  button.textContent = "Looking…";
+  const key = Object.keys(app.history).find((k) => app.history[k].includes(note));
+  const cv = conv(key);
+  const msgs = (app.history[key] || []).filter((x) => !x.reaction && x !== note).slice(-40).reverse();
+  let hit = null;
+  for (const m of msgs) {
+    const texts = [...hashTexts(m.text), ...(cv?.kind === "channel" ? [(m.sender || "") + ": " + m.text] : [])];
+    const stamps = [m.ts, ...(m.tsAlt || [])];
+    for (let d = 0; d <= 300 && !hit; d++) {
+      for (const base of stamps) for (const sign of d ? [1, -1] : [1]) for (const [i, t] of texts.entries())
+        if (!hit && messageHash(t, base + sign * d) === note.reaction.hash) hit = { m, d: sign * d, named: i >= hashTexts(m.text).length };
+    }
+    if (hit) break;
+    await new Promise((r) => setTimeout(r, 0));          // (a message at a time: the page stays responsive)
+  }
+  if (hit) {
+    addReaction(hit.m, note.reaction.emoji, note.sender);
+    app.history[key] = app.history[key].filter((x) => x !== note);
+    scheduleSave();
+    renderConversation();
+    toast("Found it: a reaction to " + (hit.m.sender || "a message") + "'s \"" + Array.from(hit.m.text).slice(0, 30).join("") +
+      "\" (its time off by " + hit.d + " s" + (hit.named ? ", hashed with the sender's name" : "") + "). Worth reporting: it should have matched.");
+    return;
+  }
+  note.reaction.why = "No message from the last " + msgs.length + " here matches, even ±5 minutes off: it was for a message " +
+    "this page never received (one sent or received by another device with your key, say, or before you joined).";
+  scheduleSave();
+  updateMessage(note);
+  toast(note.reaction.why);
 }
 
 function statusNode(m) {
@@ -3189,14 +3314,35 @@ function withMentions(text) {
   return out;
 }
 
+// What a message goes out as: with the reply markup when replying (MeshCore One's format; null if it can't fit).
+function composed(cv, text) {
+  const r = app.reply;
+  if (!r || r.key !== cv.key || !text) return text;
+  return buildReply(r.msg.sender || "", parseReply(r.msg.text)?.body ?? r.msg.text, text, budget(cv), app.name);
+}
+
+function setReply(m) {
+  app.reply = m ? { key: app.active, msg: m } : null;
+  $("reply-bar").hidden = !m;
+  if (m) {
+    const shown = parseReply(m.text)?.body ?? m.text;
+    $("reply-name").textContent = m.sender || "(no name)";
+    $("reply-quote").textContent = Array.from(shown).length > 60 ? Array.from(shown).slice(0, 60).join("") + "…" : shown;
+    $("text").focus();
+  }
+  updateComposer();
+}
+
 function updateComposer() {
   if (!app.identity) return;
-  const left = budget() - utf8Encode($("text").value.trim()).length;
+  const typed = $("text").value.trim(), cv = conv();
+  const wire = cv ? composed(cv, typed) : typed;
+  const left = budget() - (wire === null ? budget() + 1 : utf8Encode(wire).length);
   const count = $("count");
   count.textContent = String(left);
   count.className = "count" + (left < 0 ? " over" : "");
   const ok = canSend();
-  $("send").disabled = !ok || left < 0 || !$("text").value.trim();
+  $("send").disabled = !ok || left < 0 || !typed;
   $("text").placeholder = ok ? "Message " + (conv()?.title || "") : "Can't send right now";
   $("gif-btn").hidden = !gifsOn() || !giphyKey();
   $("advert").disabled = !ok;
@@ -3754,6 +3900,7 @@ function wire() {
   $("gif-q").addEventListener("input", () => { clearTimeout(gifTimer); gifTimer = setTimeout(searchGifs, 350); });
   $("pick-pop").addEventListener("mousedown", (e) => { if (e.target.closest("button")) e.preventDefault(); });
   $("messages").addEventListener("scroll", closeReactPicker);
+  $("reply-cancel").addEventListener("click", () => setReply(null));
   document.addEventListener("visibilitychange", () => {
     if (!document.hidden && app.active && app.unread[app.active]) {
       delete app.unread[app.active];
@@ -3877,6 +4024,10 @@ return {  };
     <div class="messages" id="messages" aria-live="polite"></div>
     <div class="gif-preview" id="gif-preview" hidden></div>
     <div class="mentions" id="mentions" role="listbox" aria-label="Mention someone" hidden></div>
+    <div class="reply-bar" id="reply-bar" hidden>
+      <span class="reply-label">Replying to <b id="reply-name"></b> <span id="reply-quote" class="dim"></span></span>
+      <button type="button" id="reply-cancel" class="ghost icon" aria-label="Don't reply" title="Don't reply">×</button>
+    </div>
     <form class="composer" id="composer" autocomplete="off">
       <button type="button" id="emoji-btn" class="ghost tool" aria-label="Emoji" title="Emoji">😊</button>
       <button type="button" id="gif-btn" class="ghost tool gif-tool" aria-label="GIF" title="GIFs from Giphy" hidden>GIF</button>

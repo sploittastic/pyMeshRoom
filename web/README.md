@@ -92,6 +92,14 @@ What you get:
     shows as a short note, not as raw text, and moves onto its message if that turns up later (during a catch-up,
     say).
   * **Picking:** the quick row, or **＋** for any emoji.
+  * **Look for it**, on a reaction that found nothing: searches the conversation's last 40 messages harder (each text
+    form, every stamp up to 5 minutes off). Found, it goes on the message and says how far off it was (worth
+    reporting); not found, it says so: the reaction was for a message this page never received, such as one sent from
+    another device with your key.
+* **Replies**, in MeshCore One's format as MeshTrax uses it: **↩** on a message, then type. It goes out as
+  `@[Name]`, a line with `>` and the first 10 characters of theirs (`..` when there's more), then yours; the quote
+  shrinks to 6 characters, or goes, when the reply is long. Replies show the message they answer when it's here (click
+  to see it), else what they quoted. meshcore-open's `@[Name] re:quote…reply` is read too.
   * **Sending:** react from the button on any message, or press a chip to add yours.
   * **meshcore-open's older `r:HASH:INDEX`:** shown as a note. Its hash can't be reproduced outside Dart, so it can't
     be attached to a message.
