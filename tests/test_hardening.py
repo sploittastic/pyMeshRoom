@@ -8,6 +8,7 @@ import struct
 import sys
 import threading
 import time
+import types
 import unittest
 import urllib.request
 
@@ -250,6 +251,20 @@ class HardeningTests(WebHelpers):
                                                        "web_password": "tenantpw1"})
         self.assertEqual(code, 400, d)
         self.assertIn("already used", d["error"])
+
+    def test_the_observer_needs_a_region_code(self):
+        """No IATA code by default: the observer can't be turned on (or start) until one is set."""
+        self.assertEqual(mr.DEFAULT_CONFIG["observer_iata"], "")
+        self.http("POST", "/api/login", {"password": "adminpw"})
+        code, d = self.http("POST", "/api/observer", {"observer_enabled": True})
+        self.assertEqual(code, 400)
+        self.assertIn("IATA region code", d["error"])
+        self.assertEqual(self.http("POST", "/api/observer", {"observer_iata": "sj"})[0], 400)
+        self.assertEqual(self.http("POST", "/api/observer", {"observer_enabled": True, "observer_iata": "mry"})[0], 200)
+        sys.path.insert(0, str(pathlib.Path(mr.__file__).parent))
+        import meshroom_observer
+        with self.assertRaises(ValueError):
+            meshroom_observer.ObserverBridge(types.SimpleNamespace(observer_iata=""), self.h.room.id, start=False)
 
 
 class RepeaterTableTests(unittest.TestCase):

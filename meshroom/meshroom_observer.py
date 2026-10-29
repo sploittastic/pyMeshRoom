@@ -75,7 +75,9 @@ class ObserverBridge:
         self.cfg = cfg
         self.identity = identity
         self.public_key = identity.pub_key.hex().upper()
-        self.iata = str(getattr(cfg, "observer_iata", "SJC")).upper()
+        self.iata = str(getattr(cfg, "observer_iata", "") or "").upper()
+        if len(self.iata) != 3 or not self.iata.isalpha():
+            raise ValueError("no IATA region code set (your nearest airport, like SJC)")
         self.q = queue.Queue(maxsize=max(10, int(getattr(cfg, "observer_queue_max", 1000))))
         self.dropped = 0
         self.started = time.time()
@@ -315,7 +317,7 @@ class ObserverBridge:
 
     def _sync_clients(self, mqtt, rebuild=False):
         """Reconcile broker settings in the observer worker thread."""
-        self.iata = str(getattr(self.cfg, "observer_iata", "SJC")).upper()
+        self.iata = str(getattr(self.cfg, "observer_iata", "") or self.iata).upper()
         self.q.maxsize = max(10, int(getattr(self.cfg, "observer_queue_max", 1000)))
         specs = self._servers()
         enabled = set(self._enabled())

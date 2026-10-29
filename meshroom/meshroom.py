@@ -135,7 +135,7 @@ DEFAULT_CONFIG = {
     # MQTT observer is opt-in.  Disabled keeps MeshRoom's normal runtime free
     # of both the MQTT dependency and all observer activity.
     "observer_enabled": False,
-    "observer_iata": "SJC",
+    "observer_iata": "",
     "observer_status": True,
     "observer_packets": True,
     "observer_rx": True,
@@ -224,6 +224,11 @@ class RepeaterTable(dict):
             old = sorted((r.get("last_advert") or 0, pub) for pub, r in self.items() if pub != k and not self.keep(pub))
             for _, pub in old[:len(self) - REPEATERS_MAX + REPEATERS_MAX // 10]:
                 del self[pub]
+
+
+def valid_iata(code):
+    """An observer's region code: three letters (an airport code, like SJC)."""
+    return isinstance(code, str) and len(code) == 3 and code.isascii() and code.isalpha() and code.isupper()
 
 
 RETIRED_SETTINGS = {"web_trust_observers"}   # settings older versions had: ignored quietly
@@ -8788,7 +8793,7 @@ A key is shown once, when it is made: only a hash of it is kept, so a lost key c
 <div class="mapwrap"><div><div id="map"></div><div id="mapnote" class="dim small"></div></div>
 <div id="rdetail" class="rdetail"><div class="dim pick">Select a repeater from the map</div></div></div></div>
 <div class="card" id="observercard" style="display:none"><h2>MQTT observer <span class="hdesc">admin only</span></h2>
-<div class="advrow"><label><input id="obs_enabled" type="checkbox" onchange="saveObserverToggle()"> Enabled</label><label>IATA <input id="obs_iata" maxlength="3" size="4"></label>
+<div class="advrow"><label><input id="obs_enabled" type="checkbox" onchange="saveObserverToggle()"> Enabled</label><label>IATA <input id="obs_iata" maxlength="3" size="6" placeholder="e.g. SJC" title="Your region: the nearest airport code. Required: everything the observer publishes is filed under it"></label>
 <label><input id="obs_status" type="checkbox"> Status</label><label><input id="obs_packets" type="checkbox"> Packets</label><label><input id="obs_rx" type="checkbox"> RX</label>
 <label>Queue <input id="obs_queue" type="number" min="10" max="10000" style="width:80px"></label><button onclick="saveObserver()">Save observer settings</button><span id="obsmsg" class="small dim"></span></div>
 <div class="rprow"><label>Name <input id="os_name" placeholder="Regional MQTT"></label><label>Host <input id="os_host" placeholder="mqtt.example.org"></label><label>Port <input id="os_port" type="number" value="443"></label><label>Audience <input id="os_aud" placeholder="mqtt.example.org"></label><label>Path <input id="os_path" value="/"></label><label>Prefix <input id="os_prefix" value="meshcore"></label><label><input id="os_enabled" type="checkbox" checked> Enabled</label><label><input id="os_tls" type="checkbox" checked> TLS</label><label><input id="os_verify" type="checkbox" checked> Verify TLS</label><button onclick="addObserverServer()">Add server</button></div>
@@ -8994,8 +8999,8 @@ function saveObserverServers(){fetch("api/observer",{method:"POST",headers:{"Con
 function addObserverServer(){const n=$("os_name").value.trim(),h=$("os_host").value.trim();if(!n||!h){$("obsmsg").textContent="Server name and host are required";return}OBS_SERVERS.push({name:n,host:h,port:+$("os_port").value,audience:$("os_aud").value.trim()||h,ws_path:$("os_path").value.trim()||"/",topic_prefix:$("os_prefix").value.trim()||"meshcore",enabled:$("os_enabled").checked,tls:$("os_tls").checked,tls_verify:$("os_verify").checked});saveObserverServers()}
 function removeObserverServer(i){if(confirm("Delete this observer server?")){OBS_SERVERS.splice(i,1);saveObserverServers()}}
 function observerState(o,key){
- const d=o||{enabled:false,iata:"SJC",queue_depth:0,queue_max:1000,dropped:0,uptime:0,last_rx:0,last_error:"",brokers:{}};
- if(ADMIN){$("obs_enabled").checked=!!d.enabled;$("obs_iata").value=d.iata||"SJC";$("obs_status").checked=d.status!==false;$("obs_packets").checked=d.packets!==false;$("obs_rx").checked=d.rx!==false;
+ const d=o||{enabled:false,iata:"",queue_depth:0,queue_max:1000,dropped:0,uptime:0,last_rx:0,last_error:"",brokers:{}};
+ if(ADMIN){$("obs_enabled").checked=!!d.enabled;$("obs_iata").value=d.iata||"";$("obs_status").checked=d.status!==false;$("obs_packets").checked=d.packets!==false;$("obs_rx").checked=d.rx!==false;
   $("obs_queue").value=d.queue_max||1000;OBS_SERVERS=d.servers||[];renderObserverServers();}
  const bs=d.brokers||{}, row=n=>{const b=bs[n]||{},s=b.connected?'<span class="good">connected</span>':'<span class="poor">disconnected</span>';return `<tr><td>${n}</td><td>${s}</td><td>${b.last_publish?ago(b.last_publish)+" ago":"never"}</td><td class="small">${esc(b.last_error||"-")}</td></tr>`};
  $("observerstatus").innerHTML=`<tr><th>Public key</th><td class="mono">${esc(d.public_key||key)}</td><th>Queue</th><td>${d.queue_depth}/${d.queue_max} &middot; ${d.dropped} dropped</td><th>Uptime</th><td>${d.uptime||0}s</td></tr>`+
@@ -10088,9 +10093,13 @@ class WebUI:
                             updates[key] = body[key]
                     if "observer_iata" in body:
                         iata = str(body["observer_iata"]).strip().upper()
-                        if len(iata) != 3 or any(c < "A" or c > "Z" for c in iata):
+                        if iata and not valid_iata(iata):
                             return self._send(400, '{"error":"IATA must be exactly three letters"}')
                         updates["observer_iata"] = iata
+                    if updates.get("observer_enabled", cfg.observer_enabled) and \
+                            not valid_iata(updates.get("observer_iata", cfg.observer_iata)):
+                        return self._send(400, '{"error":"set the IATA region code first: your nearest airport, like '
+                                               'SJC (everything the observer publishes is filed under it)"}')
                     if "observer_queue_max" in body:
                         qmax = body["observer_queue_max"]
                         if isinstance(qmax, bool) or not isinstance(qmax, int) or not 10 <= qmax <= 10000:
@@ -10295,6 +10304,10 @@ def main():
         """Start the optional worker without allowing its failure to stop MeshRoom."""
         nonlocal observer
         if observer or not cfg.observer_enabled:
+            return
+        if not valid_iata(cfg.observer_iata):
+            log.error("MQTT observer not started: set its IATA region code (your nearest airport, like SJC) on the "
+                      "dashboard's Observer card")
             return
         try:
             # Kept optional: installations that do not opt in never import

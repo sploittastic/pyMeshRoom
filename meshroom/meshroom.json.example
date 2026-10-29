@@ -138,7 +138,7 @@
   "observer": {
     "_note": "Optional MQTT packet observer. Bundled paho-mqtt is used when no installed copy is available; it never opens the serial device. Packets and RX are compatibility gates for the same RX-only packet reporting path.",
     "observer_enabled": false,
-    "observer_iata": "SJC",
+    "observer_iata": "",
     "observer_status": true,
     "observer_packets": true,
     "observer_rx": true,
