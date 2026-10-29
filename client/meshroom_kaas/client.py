@@ -132,6 +132,13 @@ class KaasClient:
         msg = self._request("route", timeout, limit=limit, **{"from": _hex(src), "to": _hex(dst)})
         return {"from": msg["from"], "to": msg["to"], "routes": msg["routes"]}
 
+    def paths(self, node, limit=4, timeout=10.0):
+        """Direct paths from the server's radio to a node, best first, as its room plans its own deliveries: a list of
+        {"path_len", "path" (hex), "hops", "names", "score": 0..1, "source": "measured" (delivered on before), "map"
+        (built from the repeaters that hear it), "shortcut" or "direct" (heard with no hops)}. path_len and path go
+        straight into Packet.direct(...). node: its public key (bytes or hex, all 32 bytes). limit: 1 to 8."""
+        return self._request("paths", timeout, node=_hex(node), limit=limit)["paths"]
+
     def nodes(self, days=7, timeout=10.0):
         """The server's node directory: every node heard advertising in the last `days`, most recent first, as
         {"pub", "type": "chat" | "repeater" | "room" | "sensor", "name", "lat", "lon", "last_heard", "rf", "obs"}."""
@@ -194,7 +201,8 @@ class KaasClient:
                         if msg.get("status") in FINAL:
                             w[1]["final"] = msg
                             w[0].set()
-                elif t in ("near_result", "routes_result", "route_result", "nodes_result", "error") and msg.get("id") in self.queries:
+                elif t in ("near_result", "routes_result", "route_result", "paths_result", "nodes_result", "error") \
+                        and msg.get("id") in self.queries:
                     with self.lock:
                         q = self.queries.pop(msg.get("id"), None)
                     if q:

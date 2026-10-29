@@ -87,6 +87,8 @@ export class MeshNode extends EventTarget {
     return [...this.contacts.values()].map((c) => ({
       pub: c.pubHex, name: c.name, type: c.type, lat: c.lat, lon: c.lon, lastHeard: c.lastHeard, lastAdvert: c.lastAdvert,
       outPath: c.outLen == null ? null : bytesToHex(c.outPath), outLen: c.outLen,
+      routeMode: c.routeMode === "auto" ? undefined : c.routeMode,
+      manual: c.manual ? { path: bytesToHex(c.manual.path), plen: c.manual.plen } : undefined,
       room: c.room ? { syncSince: c.room.syncSince, sealedPassword: this.sealer.seal(c.room.password || "") } : null,
     }));
   }
@@ -96,6 +98,8 @@ export class MeshNode extends EventTarget {
       try {
         const c = this.contact(s.pub, { name: s.name, type: s.type, lat: s.lat, lon: s.lon, lastHeard: s.lastHeard, lastAdvert: s.lastAdvert });
         if (s.outLen != null && pathValid(s.outLen)) [c.outPath, c.outLen] = [hexToBytes(s.outPath || ""), s.outLen];
+        if (s.manual && pathValid(s.manual.plen)) c.manual = { path: hexToBytes(s.manual.path || ""), plen: s.manual.plen };
+        if (["manual", "flood"].includes(s.routeMode) && (s.routeMode !== "manual" || c.manual)) c.routeMode = s.routeMode;
         if (s.room) {
           // (a password saved in the clear by an older version is read too, and sealed when next saved)
           const password = s.room.sealedPassword ? this.sealer.open(s.room.sealedPassword) : s.room.password;
@@ -128,6 +132,39 @@ export class MeshNode extends EventTarget {
     return c.outLen == null || flood ? floodPacket(ptype, payload) : directPacket(ptype, payload, c.outPath, c.outLen);
   }
 
+  // How to send to c, try by try: [{plen, path, source} | {flood: true}], `tries` long. c.routeMode: "flood", only floods;
+  // "manual", only c.manual; "auto" (the default): the path learned from c (if any) or else the server's best
+  // suggestion, then the next suggestion, then a flood. this.suggest(c) -> the server's suggestions (may be []).
+  async plan(c, tries = 3) {
+    const flood = { flood: true };
+    if (c.routeMode === "flood") return Array(tries).fill(flood);
+    if (c.routeMode === "manual" && c.manual) return Array(tries).fill({ ...c.manual, source: "manual" });
+    const direct = [];
+    if (c.outLen != null) direct.push({ plen: c.outLen, path: c.outPath, source: "learned" });
+    if (direct.length < tries - 1 && this.suggest) {
+      for (const p of await this.suggest(c).catch(() => [])) {
+        if (direct.length >= tries - 1) break;
+        if (!direct.some((d) => d.plen === p.plen && equalBytes(d.path, p.path))) direct.push({ ...p, source: p.source || "suggested" });
+      }
+    }
+    if (!direct.length) return Array(tries).fill(flood);
+    return [...direct, ...Array(tries - direct.length).fill(flood)];
+  }
+
+  // A try's outcome, in automatic mode: a path that worked is the one to use from now on; the learned one failing is
+  // forgotten (the next message asks the server again, then floods).
+  tried(c, step, ok) {
+    if (c.routeMode && c.routeMode !== "auto") return;
+    if (ok && !step.flood && step.source !== "learned") [c.outPath, c.outLen] = [step.path, step.plen];
+    if (!ok && step.source === "learned" && c.outLen === step.plen && equalBytes(c.outPath, step.path))
+      [c.outPath, c.outLen] = [new Uint8Array(0), null];
+    this.emit("contacts");
+  }
+
+  packetFor(step, ptype, payload) {
+    return step.flood ? floodPacket(ptype, payload) : directPacket(ptype, payload, step.path, step.plen);
+  }
+
   datagram(c, data) {
     return concatBytes(new Uint8Array([c.pub[0], this.id.pub[0]]), encryptThenMac(this.id.sharedSecret(c.pub), data));
   }
@@ -152,20 +189,23 @@ export class MeshNode extends EventTarget {
 
   // A direct message (or a post, to a room). Retries until ACKed, the last try by flood. -> {acked, status, reason}
   // ts: its timestamp (the same on every try), which a reaction to it hashes.
+  // -> {acked, status, reason, via: the try that was ACKed ({plen, path, source} | {flood: true})}
   async sendDm(c, text, attempts = 3, onAttempt = () => {}, ts = this.uniqueTime()) {
     const body = utf8Cut(utf8Encode(text), c.room ? MAX_ROOM_POST_LEN : MAX_TEXT_LEN);
+    const plan = await this.plan(c, attempts);
     let last = { status: "dropped", reason: "not sent" };
-    for (let attempt = 0; attempt < attempts; attempt++) {
+    for (let attempt = 0; attempt < plan.length; attempt++) {
+      const step = plan[attempt];
       const data = concatBytes(u32le(ts), new Uint8Array([(TXT_TYPE_PLAIN << 2) | (attempt & 3)]), body);
       const ack = bytesToHex(sha256(concatBytes(data, this.id.pub)).subarray(0, 4));
-      const flood = attempt > 0 && attempt === attempts - 1;
-      const raw = this.route(c, PT_TXT_MSG, this.datagram(c, data), flood);
+      const raw = this.packetFor(step, PT_TXT_MSG, this.datagram(c, data));
       const acked = new Promise((resolve) => this.expected.set(ack, resolve));
-      onAttempt(attempt, flood);
+      onAttempt(attempt, step);
       last = await this.send(raw);
       if (last.status === "sent" || last.status === "local") {
         const got = await Promise.race([acked.then(() => true), sleep(this.ackTimeoutMs(raw) + 2000).then(() => false)]);
-        if (got) return { acked: true, status: last.status };
+        this.tried(c, step, got);
+        if (got) return { acked: true, status: last.status, via: step };
       }
       this.expected.delete(ack);
     }
@@ -180,13 +220,24 @@ export class MeshNode extends EventTarget {
     const data = concatBytes(u32le(this.uniqueTime()), u32le(c.room.syncSince), utf8Encode(password).subarray(0, 15));
     const payload = concatBytes(new Uint8Array([c.pub[0]]), this.id.pub, encryptThenMac(this.id.sharedSecret(c.pub), data));
     const answer = new Promise((resolve) => this.logins.set(pubHex, resolve));
-    const res = await this.send(this.route(c, PT_ANON_REQ, payload));
-    if (res.status !== "sent" && res.status !== "local") {
-      this.logins.delete(pubHex);
-      throw new LoginFailed("the login wasn't sent: " + (res.reason || res.status));
+    // a direct try first (when there's a path to try), then a flood with the rest of the time
+    const plan = (await this.plan(c, 2)).filter((s, i, all) => !s.flood || i === all.length - 1 || !all[i + 1]?.flood);
+    let ok = null, sent = null;
+    for (const [i, step] of plan.entries()) {
+      const res = await this.send(this.packetFor(step, PT_ANON_REQ, payload));
+      if (res.status !== "sent" && res.status !== "local") {
+        sent ||= res;
+        continue;
+      }
+      sent = res;
+      const wait = i < plan.length - 1 ? Math.min(12000, timeoutMs / 2) : timeoutMs;
+      ok = await Promise.race([answer, sleep(wait).then(() => null)]);
+      this.tried(c, step, ok !== null);
+      if (ok !== null) break;
     }
-    const ok = await Promise.race([answer, sleep(timeoutMs).then(() => null)]);
     this.logins.delete(pubHex);
+    if (sent && sent.status !== "sent" && sent.status !== "local")
+      throw new LoginFailed("the login wasn't sent: " + (sent.reason || sent.status));
     if (ok === null) throw new LoginFailed("no answer from the room (a wrong password, or it didn't hear the login)");
     if (!ok.ok) throw new LoginFailed("the room refused the login");
     Object.assign(c.room, { loggedIn: true, isAdmin: ok.isAdmin, perms: ok.perms });

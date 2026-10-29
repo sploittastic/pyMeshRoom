@@ -11,8 +11,12 @@ dashboard's port, and it reaches the mesh through that radio over the KaaS API. 
   from disk or from any static web host.
 * **Channels.** You join **Public** by default. You can also join **#hashtag** channels (the key comes from the name)
   and **private** channels (a 16-byte secret you share yourself).
-* **Direct messages**, delivered and confirmed the way the MeshCore apps do it: retried until the other node ACKs,
-  the last try by flood, and sent direct once a route is learned.
+* **Direct messages**, delivered and confirmed the way the MeshCore apps do it: three tries until the other node
+  ACKs, the last by flood. **Routes** are automatic by default: the path learned from their answers, else the
+  server's suggestions (its radio's best direct paths to them, as its room plans its own deliveries), then a flood. A
+  path that gets through is kept; the learned one failing is dropped. **Details** shows the route, the server's
+  suggestions (**Use** one), and lets you set a path by hand (repeater ids, like `a1,b2,c3`) or always flood.
+  Delivered messages say which way they went. Room logins and posts on other servers route the same way.
 * **Rooms**: log in with the room's password, read the posts you missed, and post.
 * **Contacts and a map**: everyone the server knows of from the last 30 days, refreshed every 15 minutes, plus any
   advert heard while you're here.

@@ -46,6 +46,7 @@ The server has learned which repeaters hear each node, and good routes from its 
 client.near("@[platinum]")   # or by name (plain or mention); same answer as by key
 client.near(pub)          # [{"id": "44c3", "name": "Seaside", "share": 0.62}, ..., {"direct": True, "id": "9a1f", "name": "...", "share": 0.13}]
 client.route(pub, "@[platinum]")   # {"from", "to", "routes": [{"hops": [...], "path": ..., "score": 0.62}, ...]}
+client.paths(pub)         # direct paths from the server's radio to a node: [{"path_len", "path", "hops", "score", "source"}]
 client.routes("44c3")     # [{"path_len": 66, "path": "55b244c3", "hops": [...], "names": [...], "confidence": 0.81}]
 client.nodes(days=7)      # the directory: [{"pub", "type": "chat" | "repeater" | "room" | "sensor", "name", "lat", "lon", "last_heard", ...}]
 

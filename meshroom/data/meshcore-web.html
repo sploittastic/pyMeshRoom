@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover, interactive-widget=resizes-content">
-<meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'sha256-EzAXClCTnwqGjRcgHRICSG77l7YeaUm2ZlhlB6Y3Rfs=' 'self' https://unpkg.com/leaflet@1.9.4/dist/leaflet.js; style-src 'sha256-H4R3hSzOToYncAmlANpU7VdX8Mx1SfSYzYInLvbD8Xs=' 'self' https://unpkg.com/leaflet@1.9.4/dist/leaflet.css; img-src 'self' data: https://media.giphy.com https://i.giphy.com https://tile.openstreetmap.org https://*.tile.openstreetmap.org https://unpkg.com/leaflet@1.9.4/dist/images/; connect-src https: wss: http: ws:; base-uri 'none'; form-action 'none'">
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'sha256-1ymPiSqagC074h0vosDsGtjkc71LtLgyDdWoeSUr9wo=' 'self' https://unpkg.com/leaflet@1.9.4/dist/leaflet.js; style-src 'sha256-C6gXufUwd1rhQ1IlRWX8V0NxELRKitI0du69w5Lh6wI=' 'self' https://unpkg.com/leaflet@1.9.4/dist/leaflet.css; img-src 'self' data: https://media.giphy.com https://i.giphy.com https://tile.openstreetmap.org https://*.tile.openstreetmap.org https://unpkg.com/leaflet@1.9.4/dist/images/; connect-src https: wss: http: ws:; base-uri 'none'; form-action 'none'">
 <meta name="referrer" content="no-referrer">
 <title>MeshCore Web</title>
 <style>:root {
@@ -304,6 +304,17 @@ dialog.wide { width: min(760px, calc(100% - 32px)); }
 .reaction-note { align-self: center; color: var(--muted); font-size: 12px; }
 .reaction-note .emoji { font-size: 15px; }
 .msg .text.big { font-size: 34px; line-height: 1.2; }
+
+/* a contact's or room's route (Details) */
+.route-box { margin-top: 14px; }
+.route-modes { display: flex; flex-wrap: wrap; gap: 4px 16px; margin: 4px 0 2px; }
+.route-modes .check { margin: 0; }
+.suggested { list-style: none; margin: 4px 0 0; padding: 0; font-size: 13px; }
+.suggested li { padding: 4px 0; border-top: 1px solid var(--line); overflow-wrap: anywhere; }
+.suggested li:first-child { border-top: none; }
+.suggested .mono { font-family: ui-monospace, monospace; }
+button.small { padding: 1px 8px; font-size: 12px; }
+.dim { color: var(--muted); }
 </style>
 <script type="module">// src/bytes.js
 const __src_bytes_js = (() => {
@@ -1796,6 +1807,8 @@ class MeshNode extends EventTarget {
     return [...this.contacts.values()].map((c) => ({
       pub: c.pubHex, name: c.name, type: c.type, lat: c.lat, lon: c.lon, lastHeard: c.lastHeard, lastAdvert: c.lastAdvert,
       outPath: c.outLen == null ? null : bytesToHex(c.outPath), outLen: c.outLen,
+      routeMode: c.routeMode === "auto" ? undefined : c.routeMode,
+      manual: c.manual ? { path: bytesToHex(c.manual.path), plen: c.manual.plen } : undefined,
       room: c.room ? { syncSince: c.room.syncSince, sealedPassword: this.sealer.seal(c.room.password || "") } : null,
     }));
   }
@@ -1805,6 +1818,8 @@ class MeshNode extends EventTarget {
       try {
         const c = this.contact(s.pub, { name: s.name, type: s.type, lat: s.lat, lon: s.lon, lastHeard: s.lastHeard, lastAdvert: s.lastAdvert });
         if (s.outLen != null && pathValid(s.outLen)) [c.outPath, c.outLen] = [hexToBytes(s.outPath || ""), s.outLen];
+        if (s.manual && pathValid(s.manual.plen)) c.manual = { path: hexToBytes(s.manual.path || ""), plen: s.manual.plen };
+        if (["manual", "flood"].includes(s.routeMode) && (s.routeMode !== "manual" || c.manual)) c.routeMode = s.routeMode;
         if (s.room) {
           // (a password saved in the clear by an older version is read too, and sealed when next saved)
           const password = s.room.sealedPassword ? this.sealer.open(s.room.sealedPassword) : s.room.password;
@@ -1837,6 +1852,39 @@ class MeshNode extends EventTarget {
     return c.outLen == null || flood ? floodPacket(ptype, payload) : directPacket(ptype, payload, c.outPath, c.outLen);
   }
 
+  // How to send to c, try by try: [{plen, path, source} | {flood: true}], `tries` long. c.routeMode: "flood", only floods;
+  // "manual", only c.manual; "auto" (the default): the path learned from c (if any) or else the server's best
+  // suggestion, then the next suggestion, then a flood. this.suggest(c) -> the server's suggestions (may be []).
+  async plan(c, tries = 3) {
+    const flood = { flood: true };
+    if (c.routeMode === "flood") return Array(tries).fill(flood);
+    if (c.routeMode === "manual" && c.manual) return Array(tries).fill({ ...c.manual, source: "manual" });
+    const direct = [];
+    if (c.outLen != null) direct.push({ plen: c.outLen, path: c.outPath, source: "learned" });
+    if (direct.length < tries - 1 && this.suggest) {
+      for (const p of await this.suggest(c).catch(() => [])) {
+        if (direct.length >= tries - 1) break;
+        if (!direct.some((d) => d.plen === p.plen && equalBytes(d.path, p.path))) direct.push({ ...p, source: p.source || "suggested" });
+      }
+    }
+    if (!direct.length) return Array(tries).fill(flood);
+    return [...direct, ...Array(tries - direct.length).fill(flood)];
+  }
+
+  // A try's outcome, in automatic mode: a path that worked is the one to use from now on; the learned one failing is
+  // forgotten (the next message asks the server again, then floods).
+  tried(c, step, ok) {
+    if (c.routeMode && c.routeMode !== "auto") return;
+    if (ok && !step.flood && step.source !== "learned") [c.outPath, c.outLen] = [step.path, step.plen];
+    if (!ok && step.source === "learned" && c.outLen === step.plen && equalBytes(c.outPath, step.path))
+      [c.outPath, c.outLen] = [new Uint8Array(0), null];
+    this.emit("contacts");
+  }
+
+  packetFor(step, ptype, payload) {
+    return step.flood ? floodPacket(ptype, payload) : directPacket(ptype, payload, step.path, step.plen);
+  }
+
   datagram(c, data) {
     return concatBytes(new Uint8Array([c.pub[0], this.id.pub[0]]), encryptThenMac(this.id.sharedSecret(c.pub), data));
   }
@@ -1861,20 +1909,23 @@ class MeshNode extends EventTarget {
 
   // A direct message (or a post, to a room). Retries until ACKed, the last try by flood. -> {acked, status, reason}
   // ts: its timestamp (the same on every try), which a reaction to it hashes.
+  // -> {acked, status, reason, via: the try that was ACKed ({plen, path, source} | {flood: true})}
   async sendDm(c, text, attempts = 3, onAttempt = () => {}, ts = this.uniqueTime()) {
     const body = utf8Cut(utf8Encode(text), c.room ? MAX_ROOM_POST_LEN : MAX_TEXT_LEN);
+    const plan = await this.plan(c, attempts);
     let last = { status: "dropped", reason: "not sent" };
-    for (let attempt = 0; attempt < attempts; attempt++) {
+    for (let attempt = 0; attempt < plan.length; attempt++) {
+      const step = plan[attempt];
       const data = concatBytes(u32le(ts), new Uint8Array([(TXT_TYPE_PLAIN << 2) | (attempt & 3)]), body);
       const ack = bytesToHex(sha256(concatBytes(data, this.id.pub)).subarray(0, 4));
-      const flood = attempt > 0 && attempt === attempts - 1;
-      const raw = this.route(c, PT_TXT_MSG, this.datagram(c, data), flood);
+      const raw = this.packetFor(step, PT_TXT_MSG, this.datagram(c, data));
       const acked = new Promise((resolve) => this.expected.set(ack, resolve));
-      onAttempt(attempt, flood);
+      onAttempt(attempt, step);
       last = await this.send(raw);
       if (last.status === "sent" || last.status === "local") {
         const got = await Promise.race([acked.then(() => true), sleep(this.ackTimeoutMs(raw) + 2000).then(() => false)]);
-        if (got) return { acked: true, status: last.status };
+        this.tried(c, step, got);
+        if (got) return { acked: true, status: last.status, via: step };
       }
       this.expected.delete(ack);
     }
@@ -1889,13 +1940,24 @@ class MeshNode extends EventTarget {
     const data = concatBytes(u32le(this.uniqueTime()), u32le(c.room.syncSince), utf8Encode(password).subarray(0, 15));
     const payload = concatBytes(new Uint8Array([c.pub[0]]), this.id.pub, encryptThenMac(this.id.sharedSecret(c.pub), data));
     const answer = new Promise((resolve) => this.logins.set(pubHex, resolve));
-    const res = await this.send(this.route(c, PT_ANON_REQ, payload));
-    if (res.status !== "sent" && res.status !== "local") {
-      this.logins.delete(pubHex);
-      throw new LoginFailed("the login wasn't sent: " + (res.reason || res.status));
+    // a direct try first (when there's a path to try), then a flood with the rest of the time
+    const plan = (await this.plan(c, 2)).filter((s, i, all) => !s.flood || i === all.length - 1 || !all[i + 1]?.flood);
+    let ok = null, sent = null;
+    for (const [i, step] of plan.entries()) {
+      const res = await this.send(this.packetFor(step, PT_ANON_REQ, payload));
+      if (res.status !== "sent" && res.status !== "local") {
+        sent ||= res;
+        continue;
+      }
+      sent = res;
+      const wait = i < plan.length - 1 ? Math.min(12000, timeoutMs / 2) : timeoutMs;
+      ok = await Promise.race([answer, sleep(wait).then(() => null)]);
+      this.tried(c, step, ok !== null);
+      if (ok !== null) break;
     }
-    const ok = await Promise.race([answer, sleep(timeoutMs).then(() => null)]);
     this.logins.delete(pubHex);
+    if (sent && sent.status !== "sent" && sent.status !== "local")
+      throw new LoginFailed("the login wasn't sent: " + (sent.reason || sent.status));
     if (ok === null) throw new LoginFailed("no answer from the room (a wrong password, or it didn't hear the login)");
     if (!ok.ok) throw new LoginFailed("the room refused the login");
     Object.assign(c.room, { loggedIn: true, isAdmin: ok.isAdmin, perms: ok.perms });
@@ -2105,6 +2167,7 @@ const { LoginFailed, MAX_ROOM_POST_LEN, MeshNode } = __src_node_js;
 const { loadChannels, loadContacts, loadCursor, saveCursor, loadConversations, loadHistory, loadRecentEmoji, loadSettings, saveChannels, saveContacts, saveConversations, saveHistory, saveRecentEmoji, saveSettings } = __src_store_js;
 const { seal, unseal } = __src_vault_js;
 const HISTORY_PER_CONVERSATION = 300;
+const SUGGEST_KEEP_MS = 5 * 60 * 1000;
 const SEEN_MAX = 4096;
 const DIRECTORY_EVERY_MS = 15 * 60 * 1000;     // the server's node directory, refreshed this often
 const DIRECTORY_DAYS = 30;
@@ -2343,6 +2406,7 @@ function startChat(identity, name, client) {
   });
   node.loadContacts(loadContacts(identity.pubHex));
   node.isLocalRoom = isLocalRoom;
+  node.suggest = suggestPaths;
   app.server = client.endpoints.ws;
   app.cursor = loadCursor(identity.pubHex, app.server);
   for (const c of node.contacts.values()) if (c.room) c.room.loggedIn = false;
@@ -2413,6 +2477,38 @@ async function refreshDirectory() {
 function loginRooms() {
   if (!canSend()) return;                                 // (rooms wait until this key may send, on this server too)
   for (const c of app.node.contacts.values()) if (c.room && !c.room.loggedIn) roomLogin(c, c.room.password || "", true);
+}
+
+// The server's suggested direct paths to c (KaaS "paths": as its room plans its own deliveries), kept 5 minutes.
+// -> [{plen, path: bytes, hops: [hex], names, score, source}] (none when the server can't say, or is too old to know)
+async function suggestPaths(c, fresh = false) {
+  const got = c.suggested;
+  if (!fresh && got && Date.now() - got.at < SUGGEST_KEEP_MS) return got.paths;
+  let paths = [];
+  try {
+    const r = await app.client.request("paths", { node: c.pubHex, limit: 4 });
+    paths = (r.paths || []).map((p) => ({ ...p, plen: p.path_len, path: hexToBytes(p.path) }));
+  } catch {
+    // (an older server, or none of its budget left: the learned path and floods still work)
+  }
+  c.suggested = { at: Date.now(), paths };
+  return paths;
+}
+
+// A path for people: "a1 › b2 › c3" (repeater ids), "zero hop", or "flood".
+function pathText(step) {
+  if (!step || step.flood) return "flood";
+  const sz = (step.plen >> 6) + 1, n = step.plen & 63;
+  if (!n) return "zero hop";
+  return Array.from({ length: n }, (_, i) => bytesToHex(step.path.subarray(i * sz, (i + 1) * sz))).join(" › ");
+}
+
+// What a DM or room conversation will be sent by, for its subtitle.
+function routeText(c) {
+  if (c.routeMode === "flood") return "route: flood (set)";
+  if (c.routeMode === "manual" && c.manual) return "route: " + pathText(c.manual) + " (set)";
+  return c.outLen == null ? "route: automatic (server's suggestion, then flood)"
+    : "route: " + pathText({ plen: c.outLen, path: c.outPath }) + " (learned)";
 }
 
 // A room on the server we're connected to (its own room, or a tenant room).
@@ -2529,11 +2625,12 @@ function conv(key = app.active) {
     const c = app.node.contact(pub);
     if (key.startsWith("dm:")) {
       return { kind: "dm", key, contact: c, title: contactName(c),
-        sub: "Direct message · " + pub.slice(0, 8) + (c.outLen == null ? " · no route yet: sent by flood" : " · direct route") };
+        sub: "Direct message · " + pub.slice(0, 8) + " · " + routeText(c) };
     }
     if (!c.room) return null;
     return { kind: "room", key, contact: c, title: contactName(c),
-      sub: "Room · " + (c.room.loggedIn ? "logged in" + (c.room.isAdmin ? " as admin" : "") : "not logged in") };
+      sub: "Room · " + (c.room.loggedIn ? "logged in" + (c.room.isAdmin ? " as admin" : "") : "not logged in") +
+        (isLocalRoom(c.pubHex) ? " · on this server" : " · " + routeText(c)) };
   }
   const ch = app.channels.find((c) => c.keyHex === key);
   return ch && { kind: "channel", key, channel: ch, title: ch.name, sub: {
@@ -2858,12 +2955,14 @@ async function deliver(cv, msg) {
         return scheduleSave();
       }
     }
-    const res = await app.node.sendDm(c, msg.text, 3, (attempt, flood) => {
-      if (attempt) Object.assign(msg, { status: "retrying", reason: flood ? "by flood" : "" });
+    const res = await app.node.sendDm(c, msg.text, 3, (attempt, step) => {
+      if (attempt) Object.assign(msg, { status: "retrying", reason: step.flood ? "by flood" : "via " + pathText(step) });
       updateMessage(msg);
     }, msg.ts);
     msg.status = res.acked ? "delivered" : res.status === "dropped" ? "failed" : "unconfirmed";
     msg.reason = res.acked ? "" : res.reason || "";
+    msg.via = res.acked ? pathText(res.via) : undefined;
+    if (app.active === cv.key) $("room-sub").textContent = conv().sub;
   }
   updateMessage(msg);
   scheduleSave();
@@ -3020,7 +3119,7 @@ function messageNode(m) {
 function statusNode(m) {
   const text = {
     sending: "Sending…", waiting: "Waiting for the rate limit…", sent: "Sent", local: "Delivered on the radio",
-    delivered: "Delivered", retrying: "No answer yet, trying again" + (m.reason ? " " + m.reason : "") + "…",
+    delivered: "Delivered" + (m.via ? " via " + m.via : ""), retrying: "No answer yet, trying again" + (m.reason ? " " + m.reason : "") + "…",
     unconfirmed: "Not delivered: no ACK", failed: "Not sent" + (m.reason ? ": " + m.reason : ""), unknown: "Not confirmed",
   }[m.status] || m.status;
   const bad = ["failed", "unknown", "unconfirmed"].includes(m.status);
@@ -3341,7 +3440,49 @@ function openInfo() {
   $("i-leave").hidden = cv.kind === "channel" && cv.channel.kind === "public";
   $("i-leave").textContent = { channel: "Leave channel", dm: "Close conversation", room: "Leave room" }[cv.kind];
   $("i-relogin").hidden = cv.kind !== "room";
+  const routed = cv.kind === "dm" || (cv.kind === "room" && !isLocalRoom(cv.contact.pubHex));
+  $("i-route-box").hidden = !routed;
+  if (routed) renderRouteBox(cv.contact, true);
   $("dlg-info").showModal();
+}
+
+// Details: how to reach this contact or room. Automatic, a path set by hand, or flood; with the server's suggestions.
+async function renderRouteBox(c, fetch = false) {
+  const mode = c.routeMode === "manual" && c.manual ? "manual" : c.routeMode === "flood" ? "flood" : "auto";
+  for (const r of document.querySelectorAll('input[name="i-route"]')) r.checked = r.value === mode;
+  $("i-manual").value = c.manual ? pathText(c.manual).replace(/ › /g, ",") : "";
+  $("i-manual").disabled = mode !== "manual";
+  $("i-learned").textContent = c.outLen == null ? "No path learned yet: the next message tries the server's suggestions, then floods."
+    : "Learned from their answers: " + pathText({ plen: c.outLen, path: c.outPath }) + ".";
+  $("i-forget").hidden = c.outLen == null;
+  const list = $("i-suggested");
+  if (fetch) list.replaceChildren(el("li", { class: "dim" }, "Asking the server…"));
+  const paths = fetch ? await suggestPaths(c, true) : c.suggested?.paths || [];
+  if (conv()?.contact !== c) return;
+  list.replaceChildren(...(paths.length ? paths.map((p) => el("li", {},
+    el("span", { class: "mono" }, pathText(p)),
+    el("span", { class: "dim" }, " · " + Math.round(p.score * 100) + "% · " + ({ measured: "delivered on before", map: "from the map",
+      shortcut: "a shortcut", direct: "heard directly" }[p.source] || p.source) + (p.names?.some(Boolean) ? " · " + p.names.map((n) => n || "?").join(" › ") : "")),
+    " ", el("button", { type: "button", class: "ghost small", onclick: () => setRoute(c, "manual", p) }, "Use"))) :
+    [el("li", { class: "dim" }, "The server knows no path to them (it hasn't heard them flood lately).")]));
+}
+
+// Parse "a1,b2,c3" (or with spaces / ›): 1-, 2- or 3-byte repeater ids, all the same size. -> {plen, path} | null
+function parsePath(text) {
+  const ids = text.split(/[\s,›>]+/).filter(Boolean);
+  if (!ids.length || ids.length > 63 || !ids.every((x) => /^([0-9a-f]{2}){1,3}$/i.test(x))) return null;
+  const sz = ids[0].length / 2;
+  if (!ids.every((x) => x.length === sz * 2)) return null;
+  return { plen: ((sz - 1) << 6) | ids.length, path: hexToBytes(ids.join("").toLowerCase()) };
+}
+
+function setRoute(c, mode, manual = null) {
+  if (manual) c.manual = { plen: manual.plen, path: manual.path };
+  if (mode === "manual" && !c.manual) return toast("Enter a path first, like a1,b2,c3.");
+  c.routeMode = mode;
+  scheduleSave();
+  renderRouteBox(c);
+  $("room-sub").textContent = conv().sub;
 }
 
 function leaveConversation() {
@@ -3533,6 +3674,29 @@ function wire() {
   $("c-search").addEventListener("input", renderContacts);
   $("open-map").addEventListener("click", () => openMap());
   $("channel-info").addEventListener("click", openInfo);
+  for (const r of document.querySelectorAll('input[name="i-route"]')) r.addEventListener("change", () => {
+    const c = conv()?.contact;
+    if (!c) return;
+    if (r.value === "manual" && !c.manual) {
+      $("i-manual").disabled = false;
+      return $("i-manual").focus();
+    }
+    setRoute(c, r.value);
+  });
+  $("i-manual-set").addEventListener("click", () => {
+    const c = conv()?.contact, p = parsePath($("i-manual").value);
+    if (!c) return;
+    if (!p) return toast("A path is repeater ids, all the same length: like a1,b2,c3 or a1b2,c3d4.");
+    setRoute(c, "manual", p);
+  });
+  $("i-forget").addEventListener("click", () => {
+    const c = conv()?.contact;
+    if (!c) return;
+    [c.outPath, c.outLen] = [new Uint8Array(0), null];
+    scheduleSave();
+    renderRouteBox(c);
+    $("room-sub").textContent = conv().sub;
+  });
   $("i-leave").addEventListener("click", leaveConversation);
   $("i-clear").addEventListener("click", clearHistory);
   $("i-relogin").addEventListener("click", async () => {
@@ -3756,6 +3920,23 @@ return {  };
         <button type="button" id="i-copy" class="ghost">Copy</button>
       </div>
       <p class="hint" id="i-secret-hint">Anyone with this secret can read and send on the channel.</p>
+    </div>
+    <div id="i-route-box" class="route-box" hidden>
+      <label>Route</label>
+      <div class="route-modes">
+        <label class="check"><input type="radio" name="i-route" value="auto"> Automatic</label>
+        <label class="check"><input type="radio" name="i-route" value="manual"> Set by hand</label>
+        <label class="check"><input type="radio" name="i-route" value="flood"> Flood</label>
+      </div>
+      <p class="hint">Automatic: the path learned from their answers, else the server's suggestions, and a flood as the
+        last try. A path that gets through is kept; one that fails is dropped.</p>
+      <div class="row">
+        <input id="i-manual" type="text" placeholder="Repeater ids: a1,b2,c3" spellcheck="false" autocomplete="off">
+        <button type="button" id="i-manual-set" class="ghost">Set</button>
+      </div>
+      <p class="hint"><span id="i-learned"></span> <button type="button" id="i-forget" class="linkish">Forget it</button></p>
+      <label>The server suggests</label>
+      <ul class="suggested" id="i-suggested"></ul>
     </div>
     <div class="buttons">
       <button type="button" class="danger" id="i-leave">Leave channel</button>

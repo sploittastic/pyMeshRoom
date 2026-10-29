@@ -296,3 +296,14 @@ dialog.wide { width: min(760px, calc(100% - 32px)); }
 .reaction-note { align-self: center; color: var(--muted); font-size: 12px; }
 .reaction-note .emoji { font-size: 15px; }
 .msg .text.big { font-size: 34px; line-height: 1.2; }
+
+/* a contact's or room's route (Details) */
+.route-box { margin-top: 14px; }
+.route-modes { display: flex; flex-wrap: wrap; gap: 4px 16px; margin: 4px 0 2px; }
+.route-modes .check { margin: 0; }
+.suggested { list-style: none; margin: 4px 0 0; padding: 0; font-size: 13px; }
+.suggested li { padding: 4px 0; border-top: 1px solid var(--line); overflow-wrap: anywhere; }
+.suggested li:first-child { border-top: none; }
+.suggested .mono { font-family: ui-monospace, monospace; }
+button.small { padding: 1px 8px; font-size: 12px; }
+.dim { color: var(--muted); }

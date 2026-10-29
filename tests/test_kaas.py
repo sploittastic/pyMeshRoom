@@ -372,6 +372,31 @@ class RouteQueryTests(WebTestCase):
             self.h.run_client(lambda: c.near("@[nobody]"))
         c.close()
 
+    def test_paths_from_this_radio(self):
+        """Direct paths to a node: built from the repeaters that hear it, and measured ones when it's a member."""
+        room = self.h.room
+        node = os.urandom(32)
+        a, b = bytes.fromhex("44c3"), bytes.fromhex("55b2")
+        for _ in range(4):
+            room.observe_near(node, a)
+        rr = mr.RptRoute(0x42, b + a, mr.now_s())
+        rr.w = 5.0
+        room.rroutes[a] = {(0x42, b + a): rr}
+        self.http("POST", "/api/login", {"password": "adminpw"})
+        c = kc.KaasClient(self.url, self.make_key(receive=False, send=True))
+        self.h.run_client(c.connect)
+        built = self.h.run_client(lambda: c.paths(node))
+        self.assertEqual([(p["path_len"], p["hops"], p["source"]) for p in built], [(0x42, ["55b2", "44c3"], "map")])
+        m = room.put_member(node)                                       # delivered to before, along another route
+        for _ in range(5):
+            room.learn_route(m, 0x41, bytes.fromhex("66a1"), proven=True)
+        measured = self.h.run_client(lambda: c.paths(node))
+        self.assertIn(("66a1", "measured"), [(p["path"], p["source"]) for p in measured])
+        self.assertEqual(self.h.run_client(lambda: c.paths(os.urandom(32))), [])     # never heard: nothing to suggest
+        with self.assertRaises(kc.RequestError):
+            self.h.run_client(lambda: c.paths("abcd"))
+        c.close()
+
 
 class RouteSuggestTests(WebTestCase):
     def test_route_between_two_nodes(self):

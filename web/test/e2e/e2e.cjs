@@ -233,6 +233,23 @@ let b;
   await p.waitForSelector('.msg:not(.mine) .text:text("echo: ping over the mesh")', { timeout: 30000 });
   ok(true, 'DM received: the bot\'s answer, decrypted here');
   ok(await p.locator('#dm-list button:has-text("EchoBot")').count() === 1, 'the DM is listed in the sidebar');
+  ok(/Delivered via (flood|zero hop|[0-9a-f]{2})/.test(await p.textContent('.msg.mine:has(.text:text("ping over the mesh")) .status')),
+    'a delivered DM says which way it went: ' + await p.textContent('.msg.mine:has(.text:text("ping over the mesh")) .status'));
+  // its route: automatic, a path set by hand, or flood (Details)
+  await p.click('#channel-info');
+  await p.waitForSelector('#i-route-box:not([hidden])');
+  await p.waitForSelector('#i-suggested li', { timeout: 10000 });
+  ok(await p.isChecked('input[name="i-route"][value="auto"]'), 'a DM\'s route: automatic to start with');
+  await p.locator('#dlg-info').screenshot({ path: shotPrefix + '-route.png' });
+  await p.check('input[name="i-route"][value="flood"]');
+  ok(/route: flood \(set\)/.test(await p.textContent('#room-sub')), 'route set to flood: ' + await p.textContent('#room-sub'));
+  await p.check('input[name="i-route"][value="manual"]');
+  await p.fill('#i-manual', 'a1, b2');
+  await p.click('#i-manual-set');
+  ok(/route: a1 › b2 \(set\)/.test(await p.textContent('#room-sub')), 'a route set by hand: ' + await p.textContent('#room-sub'));
+  await p.check('input[name="i-route"][value="auto"]');
+  ok(/route: (automatic|.*\(learned\))/.test(await p.textContent('#room-sub')), 'back to automatic');
+  await p.click('#dlg-info [data-close]');
 
   // the room on this radio: read and posted to through the server, not over the air (that's for our companion app)
   const txBefore = fs.readFileSync(W + '/dev.log', 'utf8').split('\n').filter((l) => l.startsWith('TX ')).length;

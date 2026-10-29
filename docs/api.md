@@ -332,6 +332,20 @@ The repeater is the last hop. `path_len` and `path` go straight into a direct pa
 two answers give a route to a node you have no path for: send direct along the best route to the repeater that hears
 it most. A first hop that is this radio's own virtual repeater is dropped when the packet is sent, as the room does.
 
+**paths**: direct paths from this radio to a node, best first, as the room plans its own deliveries. `node` is the
+node's full public key in hex; `limit` is 1 to 8, default 4. They come from routes the room has delivered on before
+(when the node is a member here: `"source": "measured"`), from the repeaters that hear it (as in `near`) and this
+radio's best route to each (`"map"`), from shortcuts that skip hops the radio doesn't need (`"shortcut"`), and
+`"direct"` for a node this radio hears with no hops. Empty when the node hasn't flooded lately. `path_len` and `path`
+go straight onto a direct packet.
+
+```json
+{"type": "paths", "id": 9, "node": "<64 hex>"}
+{"type": "paths_result", "id": 9, "node": "<64 hex>", "name": "Platinum",
+ "paths": [{"path_len": 66, "path": "55b244c3", "hops": ["55b2", "44c3"], "names": [null, "Seaside"],
+            "score": 0.71, "source": "map"}]}
+```
+
 **route**: suggested routes between any two nodes, not just from this radio. `from` and `to` are each a node's public
 key in hex (at least 8 bytes), its name or `@[name]`, or a repeater's 2-byte id. The room takes the repeaters near
 each end (as in `near`) and finds the best chains between them through the repeater links it has seen: links in the

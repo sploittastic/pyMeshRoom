@@ -166,6 +166,23 @@
       </div>
       <p class="hint" id="i-secret-hint">Anyone with this secret can read and send on the channel.</p>
     </div>
+    <div id="i-route-box" class="route-box" hidden>
+      <label>Route</label>
+      <div class="route-modes">
+        <label class="check"><input type="radio" name="i-route" value="auto"> Automatic</label>
+        <label class="check"><input type="radio" name="i-route" value="manual"> Set by hand</label>
+        <label class="check"><input type="radio" name="i-route" value="flood"> Flood</label>
+      </div>
+      <p class="hint">Automatic: the path learned from their answers, else the server's suggestions, and a flood as the
+        last try. A path that gets through is kept; one that fails is dropped.</p>
+      <div class="row">
+        <input id="i-manual" type="text" placeholder="Repeater ids: a1,b2,c3" spellcheck="false" autocomplete="off">
+        <button type="button" id="i-manual-set" class="ghost">Set</button>
+      </div>
+      <p class="hint"><span id="i-learned"></span> <button type="button" id="i-forget" class="linkish">Forget it</button></p>
+      <label>The server suggests</label>
+      <ul class="suggested" id="i-suggested"></ul>
+    </div>
     <div class="buttons">
       <button type="button" class="danger" id="i-leave">Leave channel</button>
       <button type="button" class="ghost" id="i-relogin" hidden>Log in again</button>

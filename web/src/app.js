@@ -18,6 +18,7 @@ import {
 import { seal, unseal } from "./vault.js";
 
 const HISTORY_PER_CONVERSATION = 300;
+const SUGGEST_KEEP_MS = 5 * 60 * 1000;
 const SEEN_MAX = 4096;
 const DIRECTORY_EVERY_MS = 15 * 60 * 1000;     // the server's node directory, refreshed this often
 const DIRECTORY_DAYS = 30;
@@ -256,6 +257,7 @@ function startChat(identity, name, client) {
   });
   node.loadContacts(loadContacts(identity.pubHex));
   node.isLocalRoom = isLocalRoom;
+  node.suggest = suggestPaths;
   app.server = client.endpoints.ws;
   app.cursor = loadCursor(identity.pubHex, app.server);
   for (const c of node.contacts.values()) if (c.room) c.room.loggedIn = false;
@@ -326,6 +328,38 @@ async function refreshDirectory() {
 function loginRooms() {
   if (!canSend()) return;                                 // (rooms wait until this key may send, on this server too)
   for (const c of app.node.contacts.values()) if (c.room && !c.room.loggedIn) roomLogin(c, c.room.password || "", true);
+}
+
+// The server's suggested direct paths to c (KaaS "paths": as its room plans its own deliveries), kept 5 minutes.
+// -> [{plen, path: bytes, hops: [hex], names, score, source}] (none when the server can't say, or is too old to know)
+async function suggestPaths(c, fresh = false) {
+  const got = c.suggested;
+  if (!fresh && got && Date.now() - got.at < SUGGEST_KEEP_MS) return got.paths;
+  let paths = [];
+  try {
+    const r = await app.client.request("paths", { node: c.pubHex, limit: 4 });
+    paths = (r.paths || []).map((p) => ({ ...p, plen: p.path_len, path: hexToBytes(p.path) }));
+  } catch {
+    // (an older server, or none of its budget left: the learned path and floods still work)
+  }
+  c.suggested = { at: Date.now(), paths };
+  return paths;
+}
+
+// A path for people: "a1 › b2 › c3" (repeater ids), "zero hop", or "flood".
+function pathText(step) {
+  if (!step || step.flood) return "flood";
+  const sz = (step.plen >> 6) + 1, n = step.plen & 63;
+  if (!n) return "zero hop";
+  return Array.from({ length: n }, (_, i) => bytesToHex(step.path.subarray(i * sz, (i + 1) * sz))).join(" › ");
+}
+
+// What a DM or room conversation will be sent by, for its subtitle.
+function routeText(c) {
+  if (c.routeMode === "flood") return "route: flood (set)";
+  if (c.routeMode === "manual" && c.manual) return "route: " + pathText(c.manual) + " (set)";
+  return c.outLen == null ? "route: automatic (server's suggestion, then flood)"
+    : "route: " + pathText({ plen: c.outLen, path: c.outPath }) + " (learned)";
 }
 
 // A room on the server we're connected to (its own room, or a tenant room).
@@ -442,11 +476,12 @@ function conv(key = app.active) {
     const c = app.node.contact(pub);
     if (key.startsWith("dm:")) {
       return { kind: "dm", key, contact: c, title: contactName(c),
-        sub: "Direct message · " + pub.slice(0, 8) + (c.outLen == null ? " · no route yet: sent by flood" : " · direct route") };
+        sub: "Direct message · " + pub.slice(0, 8) + " · " + routeText(c) };
     }
     if (!c.room) return null;
     return { kind: "room", key, contact: c, title: contactName(c),
-      sub: "Room · " + (c.room.loggedIn ? "logged in" + (c.room.isAdmin ? " as admin" : "") : "not logged in") };
+      sub: "Room · " + (c.room.loggedIn ? "logged in" + (c.room.isAdmin ? " as admin" : "") : "not logged in") +
+        (isLocalRoom(c.pubHex) ? " · on this server" : " · " + routeText(c)) };
   }
   const ch = app.channels.find((c) => c.keyHex === key);
   return ch && { kind: "channel", key, channel: ch, title: ch.name, sub: {
@@ -771,12 +806,14 @@ async function deliver(cv, msg) {
         return scheduleSave();
       }
     }
-    const res = await app.node.sendDm(c, msg.text, 3, (attempt, flood) => {
-      if (attempt) Object.assign(msg, { status: "retrying", reason: flood ? "by flood" : "" });
+    const res = await app.node.sendDm(c, msg.text, 3, (attempt, step) => {
+      if (attempt) Object.assign(msg, { status: "retrying", reason: step.flood ? "by flood" : "via " + pathText(step) });
       updateMessage(msg);
     }, msg.ts);
     msg.status = res.acked ? "delivered" : res.status === "dropped" ? "failed" : "unconfirmed";
     msg.reason = res.acked ? "" : res.reason || "";
+    msg.via = res.acked ? pathText(res.via) : undefined;
+    if (app.active === cv.key) $("room-sub").textContent = conv().sub;
   }
   updateMessage(msg);
   scheduleSave();
@@ -933,7 +970,7 @@ function messageNode(m) {
 function statusNode(m) {
   const text = {
     sending: "Sending…", waiting: "Waiting for the rate limit…", sent: "Sent", local: "Delivered on the radio",
-    delivered: "Delivered", retrying: "No answer yet, trying again" + (m.reason ? " " + m.reason : "") + "…",
+    delivered: "Delivered" + (m.via ? " via " + m.via : ""), retrying: "No answer yet, trying again" + (m.reason ? " " + m.reason : "") + "…",
     unconfirmed: "Not delivered: no ACK", failed: "Not sent" + (m.reason ? ": " + m.reason : ""), unknown: "Not confirmed",
   }[m.status] || m.status;
   const bad = ["failed", "unknown", "unconfirmed"].includes(m.status);
@@ -1254,7 +1291,49 @@ function openInfo() {
   $("i-leave").hidden = cv.kind === "channel" && cv.channel.kind === "public";
   $("i-leave").textContent = { channel: "Leave channel", dm: "Close conversation", room: "Leave room" }[cv.kind];
   $("i-relogin").hidden = cv.kind !== "room";
+  const routed = cv.kind === "dm" || (cv.kind === "room" && !isLocalRoom(cv.contact.pubHex));
+  $("i-route-box").hidden = !routed;
+  if (routed) renderRouteBox(cv.contact, true);
   $("dlg-info").showModal();
+}
+
+// Details: how to reach this contact or room. Automatic, a path set by hand, or flood; with the server's suggestions.
+async function renderRouteBox(c, fetch = false) {
+  const mode = c.routeMode === "manual" && c.manual ? "manual" : c.routeMode === "flood" ? "flood" : "auto";
+  for (const r of document.querySelectorAll('input[name="i-route"]')) r.checked = r.value === mode;
+  $("i-manual").value = c.manual ? pathText(c.manual).replace(/ › /g, ",") : "";
+  $("i-manual").disabled = mode !== "manual";
+  $("i-learned").textContent = c.outLen == null ? "No path learned yet: the next message tries the server's suggestions, then floods."
+    : "Learned from their answers: " + pathText({ plen: c.outLen, path: c.outPath }) + ".";
+  $("i-forget").hidden = c.outLen == null;
+  const list = $("i-suggested");
+  if (fetch) list.replaceChildren(el("li", { class: "dim" }, "Asking the server…"));
+  const paths = fetch ? await suggestPaths(c, true) : c.suggested?.paths || [];
+  if (conv()?.contact !== c) return;
+  list.replaceChildren(...(paths.length ? paths.map((p) => el("li", {},
+    el("span", { class: "mono" }, pathText(p)),
+    el("span", { class: "dim" }, " · " + Math.round(p.score * 100) + "% · " + ({ measured: "delivered on before", map: "from the map",
+      shortcut: "a shortcut", direct: "heard directly" }[p.source] || p.source) + (p.names?.some(Boolean) ? " · " + p.names.map((n) => n || "?").join(" › ") : "")),
+    " ", el("button", { type: "button", class: "ghost small", onclick: () => setRoute(c, "manual", p) }, "Use"))) :
+    [el("li", { class: "dim" }, "The server knows no path to them (it hasn't heard them flood lately).")]));
+}
+
+// Parse "a1,b2,c3" (or with spaces / ›): 1-, 2- or 3-byte repeater ids, all the same size. -> {plen, path} | null
+function parsePath(text) {
+  const ids = text.split(/[\s,›>]+/).filter(Boolean);
+  if (!ids.length || ids.length > 63 || !ids.every((x) => /^([0-9a-f]{2}){1,3}$/i.test(x))) return null;
+  const sz = ids[0].length / 2;
+  if (!ids.every((x) => x.length === sz * 2)) return null;
+  return { plen: ((sz - 1) << 6) | ids.length, path: hexToBytes(ids.join("").toLowerCase()) };
+}
+
+function setRoute(c, mode, manual = null) {
+  if (manual) c.manual = { plen: manual.plen, path: manual.path };
+  if (mode === "manual" && !c.manual) return toast("Enter a path first, like a1,b2,c3.");
+  c.routeMode = mode;
+  scheduleSave();
+  renderRouteBox(c);
+  $("room-sub").textContent = conv().sub;
 }
 
 function leaveConversation() {
@@ -1446,6 +1525,29 @@ function wire() {
   $("c-search").addEventListener("input", renderContacts);
   $("open-map").addEventListener("click", () => openMap());
   $("channel-info").addEventListener("click", openInfo);
+  for (const r of document.querySelectorAll('input[name="i-route"]')) r.addEventListener("change", () => {
+    const c = conv()?.contact;
+    if (!c) return;
+    if (r.value === "manual" && !c.manual) {
+      $("i-manual").disabled = false;
+      return $("i-manual").focus();
+    }
+    setRoute(c, r.value);
+  });
+  $("i-manual-set").addEventListener("click", () => {
+    const c = conv()?.contact, p = parsePath($("i-manual").value);
+    if (!c) return;
+    if (!p) return toast("A path is repeater ids, all the same length: like a1,b2,c3 or a1b2,c3d4.");
+    setRoute(c, "manual", p);
+  });
+  $("i-forget").addEventListener("click", () => {
+    const c = conv()?.contact;
+    if (!c) return;
+    [c.outPath, c.outLen] = [new Uint8Array(0), null];
+    scheduleSave();
+    renderRouteBox(c);
+    $("room-sub").textContent = conv().sub;
+  });
   $("i-leave").addEventListener("click", leaveConversation);
   $("i-clear").addEventListener("click", clearHistory);
   $("i-relogin").addEventListener("click", async () => {

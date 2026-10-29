@@ -151,3 +151,39 @@ test("partial contacts (8-byte keys from the name cache): listed, never DMed, re
   assert.equal(alice.contacts.has(bob.pubHex.slice(0, 16)), false);             // (not back as a stub)
   assert.deepEqual([...alice.contacts.values()].map((c) => [c.name, c.partial]), [["Eve", true], ["Bob", false]]);
 });
+
+test("route plans: automatic (learned, the server's suggestions, flood), set by hand, flood", async () => {
+  const net = air();
+  const alice = node(net, P.a_private, "Alice");
+  const c = alice.contact(node(net, P.b_private, "Bob").id.pubHex);
+  const s1 = { plen: 0x42, path: hexToBytes("a1a1b2b2"), source: "map" }, s2 = { plen: 0x01, path: hexToBytes("c3"), source: "measured" };
+  alice.suggest = async () => [s1, s2];
+  const show = (plan) => plan.map((p) => (p.flood ? "flood" : bytesToHex(p.path) + "/" + p.source));
+  assert.deepEqual(show(await alice.plan(c)), ["a1a1b2b2/map", "c3/measured", "flood"]);
+  [c.outPath, c.outLen] = [hexToBytes("c3"), 0x01];                       // learned: first, and not tried twice
+  assert.deepEqual(show(await alice.plan(c)), ["c3/learned", "a1a1b2b2/map", "flood"]);
+  alice.suggest = async () => { throw new Error("an older server"); };
+  assert.deepEqual(show(await alice.plan(c)), ["c3/learned", "flood", "flood"]);
+  [c.outPath, c.outLen] = [new Uint8Array(0), null];
+  assert.deepEqual(show(await alice.plan(c)), ["flood", "flood", "flood"]);
+  c.routeMode = "flood";
+  assert.deepEqual(show(await alice.plan(c, 2)), ["flood", "flood"]);
+  c.routeMode = "manual";
+  c.manual = { plen: 0x41, path: hexToBytes("d4") };
+  assert.deepEqual(show(await alice.plan(c)), ["d4/manual", "d4/manual", "d4/manual"]);
+  const saved = alice.saveContacts().find((x) => x.pub === c.pubHex);
+  assert.deepEqual([saved.routeMode, saved.manual], ["manual", { path: "d4", plen: 0x41 }]);
+});
+
+test("automatic routes: a path that gets through is kept; the learned one failing is dropped", () => {
+  const net = air();
+  const alice = node(net, P.a_private, "Alice");
+  const c = alice.contact(node(net, P.b_private, "Bob").id.pubHex);
+  alice.tried(c, { plen: 0x42, path: hexToBytes("a1a1b2b2"), source: "map" }, true);
+  assert.equal(bytesToHex(c.outPath) + "/" + c.outLen, "a1a1b2b2/66");
+  alice.tried(c, { plen: 0x42, path: hexToBytes("a1a1b2b2"), source: "learned" }, false);
+  assert.equal(c.outLen, null);
+  c.routeMode = "manual";                                                  // (set by hand: nothing changes by itself)
+  alice.tried(c, { plen: 0x01, path: hexToBytes("c3"), source: "manual" }, true);
+  assert.equal(c.outLen, null);
+});

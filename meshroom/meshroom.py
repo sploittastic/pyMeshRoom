@@ -44,6 +44,7 @@ import struct
 import sys
 import threading
 import time
+import types
 import urllib.parse
 
 try:
@@ -7946,7 +7947,7 @@ class KaasHub:
             rid = None
         if t == "ping":
             return conn.send_json({"type": "pong", "id": rid})
-        if t in ("near", "routes", "route", "nodes"):
+        if t in ("near", "routes", "route", "nodes", "paths"):
             return self.ask(conn, t, msg, rid)
         if t == "replay":
             return self.replay(conn, msg, rid)
@@ -7954,7 +7955,7 @@ class KaasHub:
             return self.room_ask(conn, t, msg, rid)
         if t != "send":
             return conn.send_json({"type": "error", "id": rid,
-                                   "error": "unknown message type: use send, near, routes, route, nodes or ping"})
+                                   "error": "unknown message type: use send, near, routes, route, paths, nodes or ping"})
 
         def drop(reason):
             self.stats["dropped"] += 1
@@ -8147,6 +8148,23 @@ class KaasHub:
                     return err("too many requests waiting: wait for their answers")
                 conn.inflight += 1
             return self.room.events_put(("kaas_query", conn, t, float(days), NODES_ANSWER_MAX, rid))
+        if t == "paths":
+            try:
+                node = bytes.fromhex(str(msg.get("node", "")))
+            except ValueError:
+                node = b""
+            limit = msg.get("limit", 4)
+            if len(node) != PUB_KEY_SIZE:
+                return err("node: its public key in hex (64 characters)")
+            if isinstance(limit, bool) or not isinstance(limit, int) or not 1 <= limit <= 8:
+                return err("limit: 1 to 8")
+            if over_budget():
+                return
+            with conn.cv:
+                if conn.inflight >= KAAS_MAX_INFLIGHT:
+                    return err("too many requests waiting: wait for their answers")
+                conn.inflight += 1
+            return self.room.events_put(("kaas_query", conn, t, node, limit, rid))
         try:
             key = bytes.fromhex(str(msg.get("node" if t == "near" else "repeater", "")))
         except ValueError:
@@ -8303,6 +8321,8 @@ class KaasHub:
             key = k8
         if t == "route":
             return self.route(conn, key, limit, rid, name)
+        if t == "paths":
+            return self.paths_answer(conn, key, limit, rid, name)
         if t == "near":
             rows = r.locations(key[:8])[:limit]
             nm = r.names.get(key[:8])
@@ -8393,6 +8413,33 @@ class KaasHub:
             rows.append({"path_len": 0x40 | len(hops), "path": b"".join(hops).hex(), "hops": [h.hex() for h in hops],
                          "names": [name(h) for h in hops], "score": round(score, 3)})
         conn.send_json({"type": "route_result", "id": rid, "from": sides[0][0], "to": sides[1][0], "routes": rows})
+
+    def paths_answer(self, conn, pub, limit, rid, name):
+        """paths: direct paths from this radio to a node, best first, as the room plans its own pushes: routes measured
+        by delivering to it (when it's a member here), routes built from the repeaters that hear it and this radio's
+        best route to each, and shortcuts. Each is ready to put on a packet (path_len, path)."""
+        r = self.room
+        found = {}
+        rooms = [x for x in [r] + list(r.tenants.values()) if pub in x.members]
+        for room, m in [(x, x.members[pub]) for x in rooms] or [(r, types.SimpleNamespace(pub=pub, routes=[]))]:
+            for c in room.candidates(m):
+                if c["plen"] is None:
+                    continue
+                k = (c["plen"], bytes(c["path"]))
+                old = found.get(k)
+                if old is None or c["score"] > old["score"] or (c["proven"] is not None and old["proven"] is None):
+                    found[k] = c
+        rows = []
+        for c in sorted(found.values(), key=lambda c: (-round(c["score"], 2), c["plen"] & 63))[:limit]:
+            sz, n = (c["plen"] >> 6) + 1, c["plen"] & 63
+            hops = [bytes(c["path"])[i * sz:(i + 1) * sz] for i in range(n)]
+            rows.append({"path_len": c["plen"], "path": bytes(c["path"]).hex(), "hops": [h.hex() for h in hops],
+                         "names": [name(h) for h in hops], "score": round(c["score"], 3),
+                         "source": "measured" if c["proven"] is not None else "shortcut" if c["built"] == "shortcut"
+                         else "direct" if n == 0 else "map"})
+        nm = r.names.get(pub[:8])
+        conn.send_json({"type": "paths_result", "id": rid, "node": pub.hex(), "name": nm[1] if nm else None,
+                        "paths": rows})
 
     def own_keys(self):
         r = self.room
