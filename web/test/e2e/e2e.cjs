@@ -124,9 +124,16 @@ let b;
   await p.fill('#f-url', SERVER); await p.fill('#f-priv', PRIV); await p.fill('#f-name', 'WebTester');
   await p.waitForFunction(() => document.getElementById('f-pub').textContent.startsWith('Public key:'));
   await p.screenshot({ path: shotPrefix + '-login.png' });
+  ok(await admin('/api/v1/web/settings', { motd_enabled: true, motd: 'Welcome to the mesh!\nBe nice.' }) === 200, 'admin sets a message of the day');
   await p.click('#login-go');
   await p.waitForSelector('#conn-dot.open', { timeout: 10000 });
   ok(true, 'logged in by signing with the private key');
+  await p.waitForSelector('#dlg-motd[open]', { timeout: 10000 });
+  ok(await p.textContent('#motd-text') === 'Welcome to the mesh!\nBe nice.', 'the message of the day pops up on login, line breaks kept');
+  await p.check('#motd-hide');
+  await p.click('#motd-ok');
+  ok(await p.isHidden('#dlg-motd'), 'and is dismissed');
+  ok(await admin('/api/v1/web/settings', { motd_enabled: false }) === 200, 'admin turns it off again');
   ok(/can read, but not send yet: Your key must be heard on RF before you can send messages\. Please send a flood advert\./
     .test(await p.textContent('#banner')), 'a key not heard on the air yet is pending: read only, with the admin\'s message');
   ok(await p.isDisabled('#send') && await p.isDisabled('#advert'), 'pending: can\'t send or advertise');

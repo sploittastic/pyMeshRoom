@@ -360,7 +360,8 @@ class CompanionRoomTests(unittest.TestCase):
             self.assertEqual(second.call(bytes([5]), 9)[0], 9)        # the new app is answered...
             first.sock.settimeout(3)
             with self.assertRaises((ConnectionError, OSError)):
-                first.recv()                                        # ...and the old connection was closed
+                for _ in range(50):                                 # ...and the old connection was closed (after any
+                    first.recv()                                    # notification already on its way to it)
             for _ in range(100):                                    # a burst of commands is all answered
                 second.send(bytes([5]))
             for _ in range(100):

@@ -6,6 +6,7 @@ import {
 } from "./format.js";
 import { EMOJI_CATEGORIES, RECENT_MAX } from "./emoji.js";
 import { findGifs, gifFallbackUrl, gifPageUrl, gifThumbUrl, gifUrl } from "./gif.js";
+import { sha256 } from "./hash.js";
 import { AuthError, KaasClient, PagePasswordNeeded, kaasEndpoints } from "./kaas.js";
 import { showMap } from "./map.js";
 import {
@@ -14,8 +15,8 @@ import {
 } from "./meshcore.js";
 import { LoginFailed, MAX_ROOM_POST_LEN, MeshNode } from "./node.js";
 import {
-  loadChannels, loadContacts, loadCursor, saveCursor, loadConversations, loadHistory, loadRecentEmoji, loadSettings,
-  saveChannels, saveContacts, saveConversations, saveHistory, saveRecentEmoji, saveSettings,
+  loadChannels, loadContacts, loadCursor, saveCursor, loadConversations, loadHistory, loadMotdHidden, loadRecentEmoji,
+  loadSettings, saveChannels, saveContacts, saveConversations, saveHistory, saveMotdHidden, saveRecentEmoji, saveSettings,
 } from "./store.js";
 import { seal, unseal } from "./vault.js";
 
@@ -247,7 +248,7 @@ async function login(ev) {
 // ---------------------------------------------------------------- chat session
 
 function startChat(identity, name, client) {
-  Object.assign(app, { identity, name, client, unread: {}, seen: new Set() });
+  Object.assign(app, { identity, name, client, unread: {}, seen: new Set(), motdShown: false });
   app.channels = [makeChannel("Public", "public")];
   for (const c of loadChannels(identity.pubHex) || []) {
     if (c.kind === "public") continue;
@@ -317,6 +318,7 @@ function onHello() {
   const h = app.client?.hello;
   renderServer();
   if (!h) return;
+  showMotd(h.motd);
   for (const pub of [h.nodes?.room, ...(h.nodes?.tenants || [])].filter(Boolean))
     app.node.contact(pub, { type: "room", name: h.names?.[pub] });
   refreshDirectory();
@@ -338,6 +340,22 @@ async function refreshDirectory() {
 function loginRooms() {
   if (!canSend()) return;                                 // (rooms wait until this key may send, on this server too)
   for (const c of app.node.contacts.values()) if (c.room && !c.room.loggedIn) roomLogin(c, c.room.password || "", true);
+}
+
+// The admin's message of the day: once per login (not on every reconnect), unless this browser was asked not to show
+// this one again. Plain text.
+function showMotd(text) {
+  if (app.motdShown || !text) return;
+  app.motdShown = true;
+  const id = bytesToHex(sha256(utf8Encode(text))).slice(0, 16);
+  if (loadMotdHidden() === id) return;
+  $("motd-text").textContent = text;
+  $("motd-hide").checked = false;
+  $("motd-ok").onclick = () => {
+    if ($("motd-hide").checked) saveMotdHidden(id);
+    $("dlg-motd").close();
+  };
+  $("dlg-motd").showModal();
 }
 
 // The server's suggested direct paths to c (KaaS "paths": as its room plans its own deliveries), kept 5 minutes.

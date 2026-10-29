@@ -119,6 +119,7 @@ What you get:
   DMs, rooms (with their passwords and where their posts left off), contacts with their routes, and the last 300
   messages per conversation are kept in this browser, per identity, as is the conversation you had open. Room
   passwords are saved encrypted with a key derived from your private key, so they can't be read without it.
+* A **message of the day**, when the server's admin sets one (**Message of the day** on the Web users card), pops up when you log in or open the page. **Don't show this again** hides that message on this browser until it changes.
 * Rooms you've joined log you in again by themselves each time you connect.
 * **The room on the server you're connected to** (and its tenant rooms) is read and posted to through the server, not
   over the air. So you can use the same key on a companion app at the same time: the room's sync point and route for

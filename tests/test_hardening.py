@@ -266,6 +266,22 @@ class HardeningTests(WebHelpers):
         with self.assertRaises(ValueError):
             meshroom_observer.ObserverBridge(types.SimpleNamespace(observer_iata=""), self.h.room.id, start=False)
 
+    def test_message_of_the_day(self):
+        """Off by default; when on, web sessions get it in hello (API keys never do)."""
+        self.enable()
+        c = self.connect(self.login(kc.Identity.generate())[1]["ticket"])
+        self.assertIsNone(c.hello["motd"])
+        self.assertEqual(self.http("POST", "/api/v1/web/settings", {"motd": " Welcome!\r\nBe nice. ", "motd_enabled": True})[0], 200)
+        self.h.pump(lambda: self.h.cfg.web_motd_enabled, 5)
+        c = self.connect(self.login(kc.Identity.generate())[1]["ticket"])
+        self.assertEqual(c.hello["motd"], "Welcome!\nBe nice.")
+        users = self.http("GET", "/api/v1/web/users")[1]
+        self.assertEqual((users["motd_enabled"], users["motd"]), (True, "Welcome!\nBe nice."))
+        bot = kc.KaasClient(self.url, self.make_key())
+        self.assertIsNone(self.h.run_client(bot.connect)["motd"])
+        bot.close()
+        self.assertEqual(self.http("POST", "/api/v1/web/settings", {"motd": "x" * 1001})[0], 400)
+
 
 class RepeaterTableTests(unittest.TestCase):
     def test_capped_keeping_the_recent_and_our_own(self):

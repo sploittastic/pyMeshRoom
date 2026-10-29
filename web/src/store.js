@@ -24,6 +24,10 @@ function write(key, value) {
 export const loadSettings = () => read("settings", {});
 export const saveSettings = (s) => write("settings", s);
 
+// The message of the day this browser was asked not to show again (its hash): a new one shows.
+export const loadMotdHidden = () => read("motd.hidden", null);
+export const saveMotdHidden = (h) => write("motd.hidden", h);
+
 // The emoji picker's recently used, most recent first.
 export const loadRecentEmoji = () => read("emoji.recent", []);
 export const saveRecentEmoji = (list) => write("emoji.recent", list);

@@ -180,6 +180,8 @@ DEFAULT_CONFIG = {
     "web_banned": [],               #   [{"pub", "name", "ts"}]: may not log in
     "web_unknown_key_message":      #   what a web user whose key may not send yet is told
         "Your key must be heard on RF before you can send messages. Please send a flood advert.",
+    "web_motd_enabled": False,      #   show web users a message of the day when they log in...
+    "web_motd": "",                 #   ...this one (plain text, line breaks kept; at most 1000 characters)
     "web_hosts": [],                #   the names MeshCore Web is reached by (a domain, a proxy): logins signed for others are refused
     "web_page_password": "",        #   a password for the MeshCore Web page and its logins (hashed; "" = none)
     "web_giphy_key": "",            #   a Giphy API key for MeshCore Web's GIF picker ("" = no picker; links still show)
@@ -7938,6 +7940,7 @@ class KaasHub:
                 "airtime_pct": float(room.cfg.kaas_airtime_pct),
                 "radio": radio,
                 "giphy_key": (room.cfg.web_giphy_key or None) if key.get("web") else None,   # (Giphy keys are for browsers)
+                "motd": (str(room.cfg.web_motd).strip() or None) if key.get("web") and room.cfg.web_motd_enabled else None,
                 "nodes": {"room": hexs(room.id.pub_key),
                           "tenants": [hexs(t.id.pub_key) for t in list(room.tenants.values())],
                           "repeater": hexs(room.vr.pub) if room.vr is not None else None,
@@ -8762,6 +8765,8 @@ A key is shown once, when it is made: only a hash of it is kept, so a lost key c
 <span class="small" id="wb_refused"></span></div>
 <div class="rprow"><label title="Shown to a web user whose key may not send yet: not heard advertising on this radio (an MQTT report doesn't count), and not allowed by you">Unknown key message
 <input id="wb_unk" type="text" size="60" maxlength="200" autocomplete="off"></label><button onclick="wbUnknown(this)">Save</button></div>
+<div class="rprow" style="align-items:flex-start"><label class="sw" title="Shown to web users as a popup when they log in or open the page (each can tick &quot;don't show this again&quot;, until you change the text)"><input id="wb_motd_on" type="checkbox" onchange="wbSettings({motd_enabled:this.checked})"> Message of the day</label>
+<textarea id="wb_motd" rows="3" cols="60" maxlength="1000" placeholder="Shown when web users log in" style="font:inherit"></textarea><button onclick="wbMotd(this)">Save</button></div>
 <div class="rprow"><label title="For MeshCore Web's GIF picker: a free key from developers.giphy.com (an API key, not an SDK key). Web users' browsers use it to search Giphy">Giphy API key
 <input id="wb_giphy" type="password" size="18" maxlength="64" autocomplete="off" placeholder="none"></label>
 <button onclick="wbGiphy(this,false)">Set</button><button id="wb_giphy_rm" onclick="wbGiphy(this,true)">Remove</button>
@@ -8891,6 +8896,7 @@ async function loadWeb(){if(!MAINADM)return;let d;try{const r=await fetch("api/v
  $("wb_giphy_state").textContent=d.giphy_key?"set: web users get a GIF picker":"none: no GIF picker (Giphy links still show)";$("wb_giphy_rm").disabled=!d.giphy_key;
  {const b=d.backlog||{};if(document.activeElement!==$("wb_days"))$("wb_days").value=b.days;$("wb_bk_mqtt").checked=!!b.mqtt;
   $("wb_bk_state").textContent=b.days?(b.count||0).toLocaleString()+" packets kept"+(b.oldest?", the oldest from "+ago(b.oldest)+" ago":""):"off: web users don't catch up";}if(document.activeElement!==$("wb_unk"))$("wb_unk").value=d.unknown_key_message||"";
+ $("wb_motd_on").checked=!!d.motd_enabled;if(document.activeElement!==$("wb_motd"))$("wb_motd").value=d.motd||"";
  WBH=d.hosts||[];if(document.activeElement!==$("wb_hosts"))$("wb_hosts").value=WBH.join(", ");
  $("wb_refused").innerHTML=(d.refused_hosts||[]).length?'<span class="mid">Refused:</span> '+d.refused_hosts.map(r=>
   `<span class="mono">${esc(r.host)}</span> <span class="dim">(${r.count}, ${ago(r.last)} ago)</span> <button data-h="${esc(r.host)}" onclick="wbHosts(this,this.dataset.h)">Allow</button>`).join(" "):"";$("wb_conn").textContent=d.connected;$("wb_max").textContent=d.max;
@@ -8928,6 +8934,7 @@ let WBH=[];
 async function wbHosts(btn,add){const l=add?[...WBH,add]:$("wb_hosts").value.split(/[\s,]+/).filter(Boolean);
  if(l.some(h=>!/^[A-Za-z0-9.\-:\[\]]{1,100}$/.test(h))){$("wbmsg").className="poor small";$("wbmsg").textContent=" Host names look like mesh.example.com or 10.0.0.5:8081.";return}
  btn.disabled=true;await wbSettings({web_hosts:l});btn.disabled=false}
+async function wbMotd(btn){btn.disabled=true;await wbSettings({motd:$("wb_motd").value});btn.disabled=false}
 async function wbUnknown(btn){const t=$("wb_unk").value.trim();
  if(!t){$("wbmsg").className="poor small";$("wbmsg").textContent=" The unknown key message can't be empty.";return}
  btn.disabled=true;await wbSettings({unknown_key_message:t});btn.disabled=false}
@@ -9820,6 +9827,7 @@ class WebUI:
                     hub = room.kaas
                     return self._send(200, json.dumps({
                         "enabled": bool(cfg.web_login), "unknown_key_message": str(cfg.web_unknown_key_message or ""),
+                        "motd_enabled": bool(cfg.web_motd_enabled), "motd": str(cfg.web_motd or ""),
                         "hosts": [str(h) for h in (cfg.web_hosts or [])],
                         "refused_hosts": [dict(host=h, count=v[0], last=v[1]) for h, v in list(hub.refused_hosts.items())
                                           if h not in [str(x).lower() for x in (cfg.web_hosts or [])]],
@@ -9993,6 +10001,13 @@ class WebUI:
                                 isinstance(h, str) and re.fullmatch(r"[A-Za-z0-9.\-:\[\]]{1,100}", h.strip()) for h in hl):
                             return self._send(400, '{"error":"host names: up to 16, like mesh.example.com or 10.0.0.5:8081"}')
                         change["web_hosts"] = sorted({h.strip().lower() for h in hl})
+                    if "motd_enabled" in body and isinstance(body["motd_enabled"], bool):
+                        change["web_motd_enabled"] = body["motd_enabled"]
+                    if "motd" in body:
+                        t = body["motd"]
+                        if not isinstance(t, str) or len(t) > 1000:
+                            return self._send(400, '{"error":"the message of the day: at most 1000 characters"}')
+                        change["web_motd"] = t.replace("\r\n", "\n").strip()
                     if "unknown_key_message" in body:
                         t = body["unknown_key_message"]
                         if not isinstance(t, str) or not t.strip() or len(t) > 200:

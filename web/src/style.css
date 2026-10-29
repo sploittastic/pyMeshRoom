@@ -322,3 +322,6 @@ button.small { padding: 1px 8px; font-size: 12px; }
 .msg-acts button { position: static; opacity: 1; padding: 0 6px; font-size: 12px; line-height: 18px; border-radius: 9px;
   background: var(--panel); border-color: var(--line); color: var(--muted); }
 .reaction-note button.linkish { margin-left: 6px; font-size: 12px; }
+
+/* the message of the day */
+.motd { white-space: pre-wrap; overflow-wrap: anywhere; max-height: 50vh; overflow-y: auto; }

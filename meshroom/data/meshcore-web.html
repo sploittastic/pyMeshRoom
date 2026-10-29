@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover, interactive-widget=resizes-content">
-<meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'sha256-vHmrW5pHE0Lnx7HNQTistj8gprCTDUz5WgU1YE64Pes=' 'self' https://unpkg.com/leaflet@1.9.4/dist/leaflet.js; style-src 'sha256-YnPxhVgz52EcL+z/bLaa3UNl8S2T+RieeeyZwLKDakE=' 'self' https://unpkg.com/leaflet@1.9.4/dist/leaflet.css; img-src 'self' data: https://media.giphy.com https://i.giphy.com https://tile.openstreetmap.org https://*.tile.openstreetmap.org https://unpkg.com/leaflet@1.9.4/dist/images/; connect-src https: wss: http: ws:; base-uri 'none'; form-action 'none'">
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'sha256-2O7xztALjzFNAY6IbRG3jJN0S377C65hPMPOyEl4bic=' 'self' https://unpkg.com/leaflet@1.9.4/dist/leaflet.js; style-src 'sha256-QAA9mnKovJKzu6MY1LBEguSKQQWkKeuAzEyWRJJ59iI=' 'self' https://unpkg.com/leaflet@1.9.4/dist/leaflet.css; img-src 'self' data: https://media.giphy.com https://i.giphy.com https://tile.openstreetmap.org https://*.tile.openstreetmap.org https://unpkg.com/leaflet@1.9.4/dist/images/; connect-src https: wss: http: ws:; base-uri 'none'; form-action 'none'">
 <meta name="referrer" content="no-referrer">
 <title>MeshCore Web</title>
 <style>:root {
@@ -330,6 +330,9 @@ button.small { padding: 1px 8px; font-size: 12px; }
 .msg-acts button { position: static; opacity: 1; padding: 0 6px; font-size: 12px; line-height: 18px; border-radius: 9px;
   background: var(--panel); border-color: var(--line); color: var(--muted); }
 .reaction-note button.linkish { margin-left: 6px; font-size: 12px; }
+
+/* the message of the day */
+.motd { white-space: pre-wrap; overflow-wrap: anywhere; max-height: 50vh; overflow-y: auto; }
 </style>
 <script type="module">// src/bytes.js
 const __src_bytes_js = (() => {
@@ -2190,6 +2193,10 @@ function write(key, value) {
 const loadSettings = () => read("settings", {});
 const saveSettings = (s) => write("settings", s);
 
+// The message of the day this browser was asked not to show again (its hash): a new one shows.
+const loadMotdHidden = () => read("motd.hidden", null);
+const saveMotdHidden = (h) => write("motd.hidden", h);
+
 // The emoji picker's recently used, most recent first.
 const loadRecentEmoji = () => read("emoji.recent", []);
 const saveRecentEmoji = (list) => write("emoji.recent", list);
@@ -2221,7 +2228,7 @@ function forgetEverything() {
   }
 }
 
-return { loadSettings, saveSettings, loadRecentEmoji, saveRecentEmoji, loadChannels, saveChannels, loadHistory, saveHistory, loadContacts, saveContacts, loadConversations, saveConversations, loadCursor, saveCursor, forgetEverything };
+return { loadSettings, saveSettings, loadMotdHidden, saveMotdHidden, loadRecentEmoji, saveRecentEmoji, loadChannels, saveChannels, loadHistory, saveHistory, loadContacts, saveContacts, loadConversations, saveConversations, loadCursor, saveCursor, forgetEverything };
 })();
 
 // src/app.js
@@ -2232,11 +2239,12 @@ const { bytesToHex, hexToBytes, randomBytes, utf8Decode, utf8Encode } = __src_by
 const { QUICK_REACTIONS, buildReply, emojiOnly, hashTexts, messageHash, parseReaction, parseReply, quoteMatches, reactionText } = __src_format_js;
 const { EMOJI_CATEGORIES, RECENT_MAX } = __src_emoji_js;
 const { findGifs, gifFallbackUrl, gifPageUrl, gifThumbUrl, gifUrl } = __src_gif_js;
+const { sha256 } = __src_hash_js;
 const { AuthError, KaasClient, PagePasswordNeeded, kaasEndpoints } = __src_kaas_js;
 const { showMap } = __src_map_js;
 const { Identity, MAX_NAME_LEN, MAX_TEXT_LEN, PT_ADVERT, PT_GRP_TXT, advertPayload, channelMessagePacket, floodPacket, makeChannel, packetHash, parsePacket, readChannelMessage, textBudget, zeroHopPacket } = __src_meshcore_js;
 const { LoginFailed, MAX_ROOM_POST_LEN, MeshNode } = __src_node_js;
-const { loadChannels, loadContacts, loadCursor, saveCursor, loadConversations, loadHistory, loadRecentEmoji, loadSettings, saveChannels, saveContacts, saveConversations, saveHistory, saveRecentEmoji, saveSettings } = __src_store_js;
+const { loadChannels, loadContacts, loadCursor, saveCursor, loadConversations, loadHistory, loadMotdHidden, loadRecentEmoji, loadSettings, saveChannels, saveContacts, saveConversations, saveHistory, saveMotdHidden, saveRecentEmoji, saveSettings } = __src_store_js;
 const { seal, unseal } = __src_vault_js;
 const HISTORY_PER_CONVERSATION = 300;
 const SUGGEST_KEEP_MS = 5 * 60 * 1000;
@@ -2466,7 +2474,7 @@ async function login(ev) {
 // ---------------------------------------------------------------- chat session
 
 function startChat(identity, name, client) {
-  Object.assign(app, { identity, name, client, unread: {}, seen: new Set() });
+  Object.assign(app, { identity, name, client, unread: {}, seen: new Set(), motdShown: false });
   app.channels = [makeChannel("Public", "public")];
   for (const c of loadChannels(identity.pubHex) || []) {
     if (c.kind === "public") continue;
@@ -2536,6 +2544,7 @@ function onHello() {
   const h = app.client?.hello;
   renderServer();
   if (!h) return;
+  showMotd(h.motd);
   for (const pub of [h.nodes?.room, ...(h.nodes?.tenants || [])].filter(Boolean))
     app.node.contact(pub, { type: "room", name: h.names?.[pub] });
   refreshDirectory();
@@ -2557,6 +2566,22 @@ async function refreshDirectory() {
 function loginRooms() {
   if (!canSend()) return;                                 // (rooms wait until this key may send, on this server too)
   for (const c of app.node.contacts.values()) if (c.room && !c.room.loggedIn) roomLogin(c, c.room.password || "", true);
+}
+
+// The admin's message of the day: once per login (not on every reconnect), unless this browser was asked not to show
+// this one again. Plain text.
+function showMotd(text) {
+  if (app.motdShown || !text) return;
+  app.motdShown = true;
+  const id = bytesToHex(sha256(utf8Encode(text))).slice(0, 16);
+  if (loadMotdHidden() === id) return;
+  $("motd-text").textContent = text;
+  $("motd-hide").checked = false;
+  $("motd-ok").onclick = () => {
+    if ($("motd-hide").checked) saveMotdHidden(id);
+    $("dlg-motd").close();
+  };
+  $("dlg-motd").showModal();
 }
 
 // The server's suggested direct paths to c (KaaS "paths": as its room plans its own deliveries), kept 5 minutes.
@@ -4084,6 +4109,17 @@ return {  };
       <button type="submit" class="primary" id="add-go">Join</button>
     </div>
   </form>
+</dialog>
+
+<dialog id="dlg-motd" aria-labelledby="motd-title">
+  <div class="card">
+    <h3 id="motd-title">From this server</h3>
+    <p class="motd" id="motd-text"></p>
+    <label class="check"><input type="checkbox" id="motd-hide"> Don't show this again</label>
+    <div class="buttons">
+      <button type="button" class="primary" id="motd-ok">OK</button>
+    </div>
+  </div>
 </dialog>
 
 <dialog id="dlg-info">

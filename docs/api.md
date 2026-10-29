@@ -210,6 +210,8 @@ Close codes from the server:
  "names": {"<64 hex>": "My Room"}}
 ```
 
+A web session's hello also has `"motd"`: the admin's message of the day (`web_motd`, when `web_motd_enabled`; set on the Web users card), or null.
+
 A web session's hello also has `"giphy_key"`: the admin's Giphy API key for the GIF picker (`web_giphy_key`, set on
 the Web users card), or null. Giphy API keys are meant for browsers; an API key's hello always has null.
 
