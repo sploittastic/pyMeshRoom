@@ -19,6 +19,11 @@ export class LoginFailed extends Error {}
 
 // Events: "advert" (contact), "dm" ({contact, text, ts}), "post" ({room, author: 4-byte key prefix in hex, text, ts}),
 // "contacts" (the list changed).
+// The server's suggested paths are tried when the best scores this (else floods), and then those scoring the second
+// (its room's own thresholds: _build_plan in meshroom.py).
+const SUGGEST_FIRST = 0.35;
+const SUGGEST_MORE = 0.2;
+
 export class MeshNode extends EventTarget {
   constructor(client, identity, name, { markSeen = () => false, uniqueTime } = {}) {
     super();
@@ -133,8 +138,10 @@ export class MeshNode extends EventTarget {
   }
 
   // How to send to c, try by try: [{plen, path, source} | {flood: true}], `tries` long. c.routeMode: "flood", only floods;
-  // "manual", only c.manual; "auto" (the default): the path learned from c (if any) or else the server's best
-  // suggestion, then the next suggestion, then a flood. this.suggest(c) -> the server's suggestions (may be []).
+  // "manual", only c.manual; "auto" (the default): the path learned from c (if any), the server's suggestions, then a
+  // flood. A suggestion's score is the chance the room's planner gives it of delivering; as that planner does for its
+  // own deliveries, none is used unless the best scores SUGGEST_FIRST, and then only those scoring SUGGEST_MORE: a
+  // weaker one is less likely to get through than another flood. this.suggest(c) -> the suggestions (may be []).
   async plan(c, tries = 3) {
     const flood = { flood: true };
     if (c.routeMode === "flood") return Array(tries).fill(flood);
@@ -142,7 +149,9 @@ export class MeshNode extends EventTarget {
     const direct = [];
     if (c.outLen != null) direct.push({ plen: c.outLen, path: c.outPath, source: "learned" });
     if (direct.length < tries - 1 && this.suggest) {
-      for (const p of await this.suggest(c).catch(() => [])) {
+      const got = await this.suggest(c).catch(() => []);
+      const usable = got.length && got[0].score >= SUGGEST_FIRST ? got.filter((p) => p.score >= SUGGEST_MORE) : [];
+      for (const p of usable) {
         if (direct.length >= tries - 1) break;
         if (!direct.some((d) => d.plen === p.plen && equalBytes(d.path, p.path))) direct.push({ ...p, source: p.source || "suggested" });
       }

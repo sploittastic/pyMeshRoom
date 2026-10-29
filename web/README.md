@@ -13,7 +13,7 @@ dashboard's port, and it reaches the mesh through that radio over the KaaS API. 
   and **private** channels (a 16-byte secret you share yourself).
 * **Direct messages**, delivered and confirmed the way the MeshCore apps do it: three tries until the other node
   ACKs, the last by flood. **Routes** are automatic by default: the path learned from their answers, else the
-  server's suggestions (its radio's best direct paths to them, as its room plans its own deliveries), then a flood. A
+  server's suggestions (its radio's best direct paths to them, as its room plans its own deliveries; used, like the room does, only when the best has at least a 35% chance, and then those with 20%), then a flood. A
   path that gets through is kept; the learned one failing is dropped. **Details** shows the route, the server's
   suggestions (**Use** one), and lets you set a path by hand (repeater ids, like `a1,b2,c3`) or always flood.
   Delivered messages say which way they went. Room logins and posts on other servers route the same way.

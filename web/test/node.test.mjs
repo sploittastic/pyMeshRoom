@@ -156,12 +156,19 @@ test("route plans: automatic (learned, the server's suggestions, flood), set by 
   const net = air();
   const alice = node(net, P.a_private, "Alice");
   const c = alice.contact(node(net, P.b_private, "Bob").id.pubHex);
-  const s1 = { plen: 0x42, path: hexToBytes("a1a1b2b2"), source: "map" }, s2 = { plen: 0x01, path: hexToBytes("c3"), source: "measured" };
+  const s1 = { plen: 0x42, path: hexToBytes("a1a1b2b2"), source: "map", score: 0.6 };
+  const s2 = { plen: 0x01, path: hexToBytes("c3"), source: "measured", score: 0.3 };
   alice.suggest = async () => [s1, s2];
   const show = (plan) => plan.map((p) => (p.flood ? "flood" : bytesToHex(p.path) + "/" + p.source));
   assert.deepEqual(show(await alice.plan(c)), ["a1a1b2b2/map", "c3/measured", "flood"]);
   [c.outPath, c.outLen] = [hexToBytes("c3"), 0x01];                       // learned: first, and not tried twice
   assert.deepEqual(show(await alice.plan(c)), ["c3/learned", "a1a1b2b2/map", "flood"]);
+  alice.suggest = async () => [{ ...s1, score: 0.1 }];                     // weak: another flood is likelier
+  assert.deepEqual(show(await alice.plan(c)), ["c3/learned", "flood", "flood"]);
+  alice.suggest = async () => [s1, { ...s2, path: hexToBytes("e5"), score: 0.15 }];   // only those worth a try
+  [c.outPath, c.outLen] = [new Uint8Array(0), null];
+  assert.deepEqual(show(await alice.plan(c)), ["a1a1b2b2/map", "flood", "flood"]);
+  [c.outPath, c.outLen] = [hexToBytes("c3"), 0x01];
   alice.suggest = async () => { throw new Error("an older server"); };
   assert.deepEqual(show(await alice.plan(c)), ["c3/learned", "flood", "flood"]);
   [c.outPath, c.outLen] = [new Uint8Array(0), null];
