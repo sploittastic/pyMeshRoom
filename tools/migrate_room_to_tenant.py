@@ -52,6 +52,7 @@ def main(argv=None):
     ap.add_argument("--path", required=True, help="the tenant room's page: /<path>/")
     ap.add_argument("--name", help="the room's name (default: the main room's)")
     ap.add_argument("--key", help="the private key, hex (default: asked for, so it isn't kept in shell history)")
+    ap.add_argument("--key-file", help="read the private key from this file (e.g. from tools/recover_room_key.py)")
     ap.add_argument("--expect-pub", help="the room's public key, hex: the private key must match it")
     ap.add_argument("--web-password", help="the room page's web UI password, 6+ characters (default: asked for)")
     ap.add_argument("--main-name", default="pyMeshRoom host", help="the emptied main room's new name")
@@ -69,7 +70,11 @@ def main(argv=None):
     if running(cfg):
         sys.exit("pyMeshRoom seems to be running (port %s answers): stop it first" % cfg.web_port)
 
-    key = a.key or getpass.getpass("private key (128 hex characters): ")
+    if a.key_file:
+        with open(a.key_file) as f:
+            key = f.read()
+    else:
+        key = a.key or getpass.getpass("private key (128 hex characters): ")
     key = "".join(key.replace("-", "").split()).lstrip(">").replace(":", "")   # (as copied: "> abcd...", spaces, colons)
     if len(key) not in (64, 128) or any(c not in "0123456789abcdefABCDEF" for c in key):
         bad = sorted({c for c in key if c not in "0123456789abcdefABCDEF"})

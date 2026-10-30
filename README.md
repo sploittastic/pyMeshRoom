@@ -460,7 +460,8 @@ How it fits together:
   web UI password for the room's page, backs up the config and `room.db`, and moves the room's members (with their
   saved secrets: nobody logs in again), posts, routes, bans, passwords and messages. The shared map stays. The main
   room is left empty, renamed `pyMeshRoom host`, with a random join password. Add `--dry-run` to check first, and
-  `--expect-pub <public key>` to check the key.
+  `--expect-pub <public key>` to check the key. If the key you copied was clipped, `tools/recover_room_key.py --pub <public key> --out room.key`
+  completes it from the public key (a few missing characters), and the migration reads it with `--key-file room.key`.
 
 ## Optional KaaS API
 
