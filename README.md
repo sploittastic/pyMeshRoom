@@ -454,6 +454,13 @@ How it fits together:
   turns pushing posts, and messages between rooms, the virtual
   companion and the virtual repeater on this radio never go on the air.
 * Without any tenant rooms, nothing changes for an existing installation.
+* To move the main room itself to a tenant room (say, after reading its key off the modem with the repeater
+  firmware's serial `get prv.key`, and reflashing the modem, which gives it a new key): stop pyMeshRoom, then run
+  `python3 tools/migrate_room_to_tenant.py --config meshroom.json --path <page>`. It asks for the private key and a
+  web UI password for the room's page, backs up the config and `room.db`, and moves the room's members (with their
+  saved secrets: nobody logs in again), posts, routes, bans, passwords and messages. The shared map stays. The main
+  room is left empty, renamed `pyMeshRoom host`, with a random join password. Add `--dry-run` to check first, and
+  `--expect-pub <public key>` to check the key.
 
 ## Optional KaaS API
 
