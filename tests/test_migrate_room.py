@@ -40,6 +40,11 @@ class MigrateTests(unittest.TestCase):
             with self.assertRaises(SystemExit):                                  # a key that isn't the room's
                 mig.main(argv + ["--expect-pub", "AB" * 32])
             self.assertEqual(mig.main(argv + ["--dry-run"]), 0)
+            pasted = ["--key", "> " + key.hex()[:64] + " " + key.hex()[64:] + "\n"]   # (as copied from the console)
+            self.assertEqual(mig.main(argv[:4] + pasted + argv[6:] + ["--dry-run"]), 0)
+            with self.assertRaises(SystemExit) as e:
+                mig.main(argv[:4] + ["--key", key.hex()[:100]] + argv[6:] + ["--dry-run"])
+            self.assertIn("got 100 characters", str(e.exception))
             self.assertFalse(os.path.exists(os.path.join(d, "tenants")))
             self.assertEqual(mig.main(argv + ["--expect-pub", pub.hex()]), 0)
             self.assertTrue(any(n.startswith("backup-before-migration-") for n in os.listdir(d)))

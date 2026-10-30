@@ -69,7 +69,12 @@ def main(argv=None):
     if running(cfg):
         sys.exit("pyMeshRoom seems to be running (port %s answers): stop it first" % cfg.web_port)
 
-    key = (a.key or getpass.getpass("private key (128 hex characters): ")).strip()
+    key = a.key or getpass.getpass("private key (128 hex characters): ")
+    key = "".join(key.replace("-", "").split()).lstrip(">").replace(":", "")   # (as copied: "> abcd...", spaces, colons)
+    if len(key) not in (64, 128) or any(c not in "0123456789abcdefABCDEF" for c in key):
+        bad = sorted({c for c in key if c not in "0123456789abcdefABCDEF"})
+        sys.exit("can't migrate: the private key should be 128 hex characters; got %d characters%s" % (
+            len(key), " including %s" % " ".join(repr(c) for c in bad[:8]) if bad else ""))
     web_pw = a.web_password or getpass.getpass("web UI password for the room's own page (6+ characters): ")
     taken_paths = {str(e.get("path", "")).lower() for e in (cfg.tenant_rooms or []) if isinstance(e, dict)}
     taken_keys = {bytes.fromhex(str(e["public_key"])) for e in (cfg.tenant_rooms or []) if isinstance(e, dict) and e.get("public_key")}
