@@ -217,7 +217,7 @@ Close codes from the server:
  "key": {"id": "3f2a9c1b", "receive": true, "send": true, "expires": null},
  "send_burst": 3, "send_window_s": 20, "airtime_pct": 10,
  "radio": {"freq_hz": 910525000, "bw_hz": 62500, "sf": 7, "cr": 5},
- "nodes": {"room": "<64 hex>", "tenants": [], "repeater": null, "companion": null},
+ "nodes": {"room": null, "tenants": ["<64 hex>"], "repeater": null, "companion": null},
  "names": {"<64 hex>": "My Room"}}
 ```
 
@@ -226,8 +226,9 @@ A web session's hello also has `"motd"`: the admin's message of the day (`web_mo
 A web session's hello also has `"giphy_key"`: the admin's Giphy API key for the GIF picker (`web_giphy_key`, set on
 the Web users card), or null. Giphy API keys are meant for browsers; an API key's hello always has null.
 
-`nodes` lists the public keys of the nodes running on this radio, and `names` gives the room's and each tenant room's
-name by public key.
+`nodes` lists the public keys of the nodes running on this radio, and `names` gives each room's name by public key.
+The server itself is only the host, with no room of its own, so `nodes.room` is always null and the rooms are in
+`nodes.tenants`.
 
 **packet**: one for every packet the radio hears (`"dir": "rx"`) or sends (`"dir": "tx"`). Keys that may receive only.
 
@@ -280,7 +281,7 @@ Other messages:
 
 ### Rooms on this server (web logins only)
 
-A web login reads and posts to this server's own room, and its tenant rooms, through the server rather than over the
+A web login reads and posts to this server's rooms through the server rather than over the
 air. A room keeps one sync point and one route per key, and those belong to the member's radio: the same key on a
 companion app would otherwise lose posts to the web page, or get them sent down the page's route.
 
@@ -387,7 +388,7 @@ unknown name. An empty list means no chain of seen links joins the two ends.
 at most 2000. For contact lists and maps. It merges these sources:
 
 * the node directory: adverts heard by this radio or by an MQTT observer;
-* what the room kept before: the repeater map and neighbours, the members of the room and of tenant rooms, and the
+* what the room kept before: the repeater map and neighbours, the members of the rooms, and the
   virtual companion's contacts;
 * the name cache, which holds only the first 8 bytes of a key. Those come with `"partial": true`, a 16-hex-character
   `pub`, and no position. They can be shown and mentioned, but not sent a DM until their full key is known.
@@ -445,7 +446,7 @@ in the room's order: its own ACKs and replies, then relays, then pushes, then AP
   pushes do.
 * **Checks**: the packet must parse as MeshCore, with a payload of at most 184 bytes. Adverts and logins that claim the
   identity of a node on this radio are refused.
-* **Shared with this radio**: a packet you send is offered to the room, tenant rooms, virtual companion and virtual
+* **Shared with this radio**: a packet you send is offered to the rooms, virtual companion and virtual
   repeater here first, as if they heard it. A flood or zero-hop packet that one of them takes stays off the air
   (`local`). Everything else is transmitted and is never relayed back by the room's own repeater.
 

@@ -25,12 +25,11 @@ See pyMeshRoom operating in the wild:
 
 | Capability | What it does | Default |
 | --- | --- | --- |
-| RF Room Server | Persistent room, routing, delivery planning, map, dashboard, and admin tools. | On |
+| Rooms | MeshCore room servers on the radio, each with its own key, members, passwords and admin page. The server itself is only the host: it has no room of its own. | None until you create one |
 | MQTT Observer | Publishes copies of locally received RF packets to one or more regional MeshCore observer brokers. | Off |
 | MQTT Augmentation | Read-only inbound MQTT observations can confirm deliveries and enrich map/activity data. | Off |
 | Virtual Repeater | A separate optional repeater identity sharing the room's KISS modem and TX scheduler. | Off |
 | Virtual Companion | A chat node on the room's radio that MeshCore apps connect to over TCP, like a WiFi companion. | Off |
-| Tenant Rooms | More rooms on the same radio, each with its own key, members, passwords and admin page. | None |
 
 ### The three optional subsystems
 
@@ -44,7 +43,7 @@ See pyMeshRoom operating in the wild:
 
 Read the installation guide below to build an instance, then enable only the optional components you actually need.
 
-**Jump to:** [install and first configuration](#first-configuration) · [MQTT Observer](#outbound-mqtt-observer) · [MQTT Augmentation](#inbound-mqtt-ingestion) · [Virtual Repeater](#optional-virtual-repeater) · [Virtual Companion](#optional-virtual-companion) · [Tenant Rooms](#tenant-rooms) · [dependencies](#dependencies)
+**Jump to:** [install and first configuration](#first-configuration) · [MQTT Observer](#outbound-mqtt-observer) · [MQTT Augmentation](#inbound-mqtt-ingestion) · [Virtual Repeater](#optional-virtual-repeater) · [Virtual Companion](#optional-virtual-companion) · [Rooms](#rooms) · [dependencies](#dependencies)
 
 See stats and what repeaters the room is well connected to
 <img width="1553" height="597" alt="image" src="https://github.com/user-attachments/assets/b9add1ee-5f80-4d57-b767-3be9e5889e07" />
@@ -424,44 +423,41 @@ Its data — contacts, channels, settings and messages waiting for the app — i
 
 **Security:** the companion protocol has no authentication. Anyone who can reach the port can read the companion's messages and send as it. Keep the port on a trusted network, never forward it from the internet, and use `companion_allow` to restrict it.
 
-## Tenant Rooms
+## Rooms
 
-Host more rooms on the same radio. Each tenant room is a full MeshCore room server with its own identity, members,
-posts, bans and passwords, and its own web page for its admins. The main admin creates them from the **Tenant rooms**
-card: room name, path (the page is at `http://<server>/<path>/`), private key (optional: a random one is generated if
-it's left blank), join password, admin password (used from MeshCore apps) and a web UI password for the room's page.
-**Create** starts the room straight away and announces it with an advert. Each room in the list has an **Actions** menu:
-**Reset web UI password** (anyone logged in to that room's page is logged out) and **Delete room**, which asks for the
-main admin password and erases the room's members, posts, settings and key for good. Up to 100 tenant rooms.
+The server hosts rooms; it has no room of its own. Its dashboard (the host page) runs the radio, the map, discovery,
+the virtual repeater and companion, KaaS and web users, and lists the **Rooms**. Each room is a full MeshCore room
+server with its own identity, members, posts, bans and passwords, and its own web page for its admins.
 
-A tenant's page shows its own members (active and suspended), bans, the room chat and the same repeater map and
-neighbour data as the main page. Its admins can post to the room, send its advert (zero-hop or flood), resync, suggest
-routes, kick, ban and unban, all for their room only. The main admin can also act on any tenant's page.
+The admin creates rooms from the **Rooms** card: room name, path (the page is at `http://<server>/<path>/`), private
+key (optional: a random one is generated if it's left blank), join password, admin password (used from MeshCore apps)
+and a web UI password for the room's page. **Create** starts the room straight away and announces it with an advert.
+Each room in the list has an **Actions** menu: **Reset web UI password** (anyone logged in to that room's page is logged
+out) and **Delete room**, which asks for the admin password and erases the room's members, posts, settings and key for
+good. Up to 100 rooms.
 
-Nothing a tenant does reaches outside its room. Over RF, a tenant's admin can change its name, position and passwords,
-read settings and manage its members, but not the radio, the push timing, discovery or the service (no reboot). The
-radio's settings and everything else in the main config are shared and can only be changed by the main admin.
+A room's page shows its own members (active and suspended), bans, the room chat and the same repeater map and
+neighbour data as the host page. Its admins can post to the room, send its advert (zero-hop or flood), resync, suggest
+routes, kick, ban and unban, all for their room only. The host's admin can also act on any room's page.
+
+Nothing a room's admin does reaches outside their room. Over RF, a room's admin can change its name, position and
+passwords, read settings and manage its members, but not the radio, the push timing, discovery or the service (no
+reboot). The radio's settings and everything else in the config are shared and can only be changed by the host's admin.
 
 How it fits together:
 
 * `tenant_rooms` in the config lists each room's name, path and public key, nothing else. Everything else, including
   its private key and passwords, is in its own database, `tenants/<public key>.db` in `data_dir` (readable only by the
   pyMeshRoom user). The web UI password is stored hashed.
-* Tenant rooms share the main room's map: heard repeaters, links and routes to repeaters, which only the main room
-  learns (tenants don't run discovery or traces).
+* The host never advertises or answers logins. Its key (the modem's) is used only for the radio work: discovery and
+  traces. The MQTT observer reports as a room or the virtual repeater, chosen on its card.
+* Rooms share the host's map: heard repeaters, links and routes to repeaters, which the host learns.
 * All rooms share one radio and its airtime (a max transmit duty cycle, 50% by default, split by weight
-  between ACKs and replies, relays, room delivery, web users, the virtual companion, API clients and adverts: see the dashboard's **Airtime** card and docs/api.md): they take
-  turns pushing posts, and messages between rooms, the virtual
+  between ACKs and replies, relays, room delivery, web users, the virtual companion, API clients and adverts: see the
+  dashboard's **Airtime** card and docs/api.md): they take turns pushing posts, and messages between rooms, the virtual
   companion and the virtual repeater on this radio never go on the air.
-* Without any tenant rooms, nothing changes for an existing installation.
-* To move the main room itself to a tenant room (say, after reading its key off the modem with the repeater
-  firmware's serial `get prv.key`, and reflashing the modem, which gives it a new key): stop pyMeshRoom, then run
-  `python3 tools/migrate_room_to_tenant.py --config meshroom.json --path <page>`. It asks for the private key and a
-  web UI password for the room's page, backs up the config and `room.db`, and moves the room's members (with their
-  saved secrets: nobody logs in again), posts, routes, bans, passwords and messages. The shared map stays. The main
-  room is left empty, renamed `pyMeshRoom host`, with a random join password. Add `--dry-run` to check first, and
-  `--expect-pub <public key>` to check the key. If the key you copied was clipped, `tools/recover_room_key.py --pub <public key> --out room.key`
-  completes it from the public key (a few missing characters), and the migration reads it with `--key-file room.key`.
+* **Upgrading from a version with a built-in room:** that room is no longer served. Its members and posts stay in
+  `room.db`, untouched, and the log says so at startup.
 
 ## Optional KaaS API
 

@@ -19,6 +19,7 @@ port, work = int(sys.argv[2]), sys.argv[3]
 h = Harness(web_password="adminpw", room_password="hello", kaas_send_window_s=2, push_quiet_ms=0)
 h.cfg.set("web_port", port); h.cfg.set("web_bind", "127.0.0.1"); h.cfg.set("web_login", True)
 h.cfg.set("web_giphy_key", "e2etestkey")                  # (the test answers api.giphy.com itself)
+room = h.add_room("Pi Room")                              # the room on this radio (the server itself is the host)
 web = mr.WebUI(h.room, h.events)
 token, entry = h.room.kaas.new_key(dict(receive=True, send=True, description="dev", expires=None))
 h.events.put(("kaas_key_add", entry))
@@ -51,13 +52,13 @@ def reader():
             if line.startswith("RX "):
                 h.events.put(("rxraw", bytes.fromhex(line[3:].strip())))
             elif line.startswith("SAY "):
-                h.events.put(("say", line[4:]))
+                h.events.put(("t_say", room.key, line[4:]))
             elif line.startswith("BOT_DM ") and "node" in bot:
                 _, pub, text = line.split(" ", 2)
                 threading.Thread(target=lambda: bot["node"].send_dm(bot["node"].contact(pub), text), daemon=True).start()
             elif line.startswith("MEMBER_POST "):
                 _, pub, text = line.split(" ", 2)
-                main_jobs.append(lambda pub=pub, text=text: h.room.store_post(bytes.fromhex(pub), text))
+                main_jobs.append(lambda pub=pub, text=text: room.store_post(bytes.fromhex(pub), text))
             elif line.strip() == "BOT_ADVERT" and "node" in bot:
                 threading.Thread(target=lambda: bot["node"].advert(flood=True), daemon=True).start()
         done = len(lines)

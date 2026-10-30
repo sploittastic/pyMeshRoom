@@ -284,10 +284,12 @@ class EndToEndTests(WebTestCase):
     def test_stream_then_revoke(self):
         self.http("POST", "/api/login", {"password": "adminpw"})
         token = self.make_key(receive=True, send=False)
+        r = self.h.add_room("Surf")
         c = kc.KaasClient(self.url, token)
         hello = self.h.run_client(c.connect)
-        self.assertEqual(hello["nodes"]["room"], mr.hexs(self.h.room.id.pub_key))
-        self.assertEqual(hello["names"], {mr.hexs(self.h.room.id.pub_key): self.h.room.cfg.name})
+        self.assertIsNone(hello["nodes"]["room"])                       # the server is the host: its rooms are Rooms
+        self.assertEqual(hello["nodes"]["tenants"], [mr.hexs(r.id.pub_key)])
+        self.assertEqual(hello["names"], {mr.hexs(r.id.pub_key): "Surf"})
         self.assertFalse(hello["key"]["send"])
         got = []
         c.on_packet(got.append)
@@ -312,7 +314,8 @@ class EndToEndTests(WebTestCase):
         self.h.run_client(b_client.connect)
         a = kc.Node(a_client, kc.Identity.generate(), "BotA")
         b = kc.Node(b_client, kc.Identity.generate(), "BotB")
-        room_pub = self.h.room.id.pub_key
+        r = self.h.add_room()
+        room_pub = r.id.pub_key
         posts, dms = [], []
 
         def join():
@@ -321,14 +324,14 @@ class EndToEndTests(WebTestCase):
             return a.join_room(room_pub, "hello")
         room = self.h.run_client(join)
         self.assertTrue(room.logged_in)
-        self.assertIn(a.id.pub, self.h.room.members)
-        room.on_post(lambda r, author, text, ts: posts.append(text))
-        self.h.events.put(("say", "welcome bots"))
+        self.assertIn(a.id.pub, r.members)
+        room.on_post(lambda rm, author, text, ts: posts.append(text))
+        self.h.events.put(("t_say", r.key, "welcome bots"))
         self.assertTrue(self.h.pump(lambda: "welcome bots" in posts, 30), posts)
-        m = self.h.room.members[a.id.pub]
-        self.assertTrue(self.h.pump(lambda: m.sync_since >= self.h.room.max_issued, 15), "the room got the bot's ACK")
+        m = r.members[a.id.pub]
+        self.assertTrue(self.h.pump(lambda: m.sync_since >= r.max_issued, 15), "the room got the bot's ACK")
         self.assertTrue(self.h.run_client(lambda: room.post("hi from a bot")))
-        self.assertIn("hi from a bot", [p[2] for p in self.h.room.posts])
+        self.assertIn("hi from a bot", [p[2] for p in r.posts])
         # two bots on the same radio: an advert, then a DM and its ACK, through the air both ways
         b.on_dm(lambda c, text, ts: dms.append((c.pub, text)))
         self.h.run_client(lambda: a.advert(flood=True))

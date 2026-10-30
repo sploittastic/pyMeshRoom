@@ -154,7 +154,8 @@ class TenantRoomTests(unittest.TestCase):
         on_air = [p for p in self.h.modem.on_air() if p is not None]
         self.assertFalse([p for p in on_air if p.ptype in (mr.PT_ANON_REQ, mr.PT_ACK, mr.PT_TXT_MSG, mr.PT_PATH, mr.PT_RESPONSE)],
                          "companion <-> tenant traffic went on the air")
-        self.assertTrue([p for p in on_air if p.ptype == mr.PT_ADVERT and p.payload[:32] == tpub], "the tenant never adverted")
+        adverted = lambda: [p for p in self.h.modem.on_air() if p and p.ptype == mr.PT_ADVERT and p.payload[:32] == tpub]
+        self.assertTrue(self.h.pump(adverted, timeout=10), "the tenant never adverted")
 
     def test_one_push_at_a_time_across_rooms(self):
         t, host = self.t, self.room

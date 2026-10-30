@@ -121,7 +121,7 @@ What you get:
   passwords are saved encrypted with a key derived from your private key, so they can't be read without it.
 * A **message of the day**, when the server's admin sets one (**Message of the day** on the Web users card), pops up when you log in or open the page. **Don't show this again** hides that message on this browser until it changes.
 * Rooms you've joined log you in again by themselves each time you connect.
-* **The room on the server you're connected to** (and its tenant rooms) is read and posted to through the server, not
+* **The rooms on the server you're connected to** are read and posted to through the server, not
   over the air. So you can use the same key on a companion app at the same time: the room's sync point and route for
   your key stay your radio's, and posts you make from the companion show here too. (Posts you make here don't reach
   your companion: no room sends anyone their own posts.) Other rooms are logged in to over the air, which a companion

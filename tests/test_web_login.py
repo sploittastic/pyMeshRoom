@@ -365,11 +365,12 @@ class LocalRoomTests(WebHelpers):
 
     def test_room_through_the_server(self):
         self.enable()
-        r, me = self.h.room, kc.Identity.generate()
+        r, me = self.h.add_room(), kc.Identity.generate()
         room = r.id.pub_key.hex()
         companion = r.put_member(me.pub)                                      # their companion app logged in already
         companion.perms, companion.secret = mr.PERM_READ_WRITE, r.id.shared_secret(me.pub)
-        companion.sync_since, companion.out_path, companion.out_path_len, companion.last_activity = 1234, b"\x11", 1, 999
+        companion.sync_since, companion.last_activity = 1234, 999
+        r.learn_route(companion, 1, b"\x11", proven=True)                     # (their radio's route)
         r.store_post(r.id.pub_key, "before")
         self.heard_on_air(me, "Me")
         c = self.connect(self.login(me)[1]["ticket"])
@@ -390,7 +391,7 @@ class LocalRoomTests(WebHelpers):
 
     def test_joining_from_the_web(self):
         self.enable()
-        r = self.h.room
+        r = self.h.add_room()
         room = r.id.pub_key.hex()
         guest = kc.Identity.generate()
         c = self.connect(self.login(guest)[1]["ticket"])

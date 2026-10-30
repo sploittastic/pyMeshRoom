@@ -66,6 +66,18 @@ class Harness:
         self.room.companion_apply()
         self.room.tenants_load()
 
+    def add_room(self, name=None, path="room", **settings):
+        """A Room on this server (the server itself is only the host now), with the harness's room passwords."""
+        before = set(self.room.tenants)
+        self.room.tenant_create(dict(name=name or self.cfg.name, path=path, private_key="",
+                                     room_password=self.cfg.room_password, admin_password=self.cfg.admin_password,
+                                     web_password_hash="", lat=0.0, lon=0.0))
+        (pub,) = set(self.room.tenants) - before
+        t = self.room.tenants[pub]
+        for k, v in settings.items():
+            t.cfg.set(k, v)
+        return t
+
     @property
     def port(self):
         return self.room.vc.link.port
@@ -237,7 +249,8 @@ class CompanionRoomTests(unittest.TestCase):
         self.assertTrue(os.path.exists(os.path.join(self.h.tmp.name, "companion.db")))
 
     def test_app_session_with_the_room_stays_off_the_air(self):
-        room_pub = self.room.id.pub_key
+        r = self.h.add_room()
+        room_pub = r.id.pub_key
         vc_pub = self.vc.pub
         events = self.h.events
 
@@ -268,7 +281,7 @@ class CompanionRoomTests(unittest.TestCase):
             ack = f[2:6]
             f = c.wait(0x82)
             self.assertEqual(f[1:5], ack)                           # the room's ACK came back
-            events.put(("say", "hi from the room"))
+            events.put(("t_say", r.key, "hi from the room"))
             texts = []
             deadline = time.monotonic() + 40
             while "hi from the room" not in texts and time.monotonic() < deadline:
@@ -287,8 +300,8 @@ class CompanionRoomTests(unittest.TestCase):
             c.close()
         self.h.run_client(client, timeout=90)
         self.assertEqual(self.room.cfg.radio_freq_mhz, DEFAULT_CONFIG["radio_freq_mhz"])   # ...and ignored
-        self.assertIn(vc_pub, self.room.members)
-        self.assertTrue(any(a == vc_pub and t == "hello room" for _, a, t, _ in self.room.posts))
+        self.assertIn(vc_pub, r.members)
+        self.assertTrue(any(a == vc_pub and t == "hello room" for _, a, t, _ in r.posts))
         on_air = [p for p in self.h.modem.on_air() if p is not None]
         self.assertFalse([p for p in on_air if p.ptype in (mr.PT_ANON_REQ, mr.PT_ACK, mr.PT_TXT_MSG, mr.PT_PATH,
                                                            mr.PT_RESPONSE, mr.PT_MULTIPART)],
@@ -326,8 +339,9 @@ class CompanionRoomTests(unittest.TestCase):
         other = os.urandom(32)
         now = int(time.time())
         history = ["old post %d" % i for i in range(3)]
-        self.room.posts = [(now - 600 + i, other, t, None) for i, t in enumerate(history)]
-        room_pub = self.room.id.pub_key
+        r = self.h.add_room()
+        r.posts = [(now - 600 + i, other, t, None) for i, t in enumerate(history)]
+        room_pub = r.id.pub_key
 
         def client():
             c = RawClient(self.h.port)
@@ -350,7 +364,7 @@ class CompanionRoomTests(unittest.TestCase):
         self.assertTrue(texts[0].startswith("Logged in to"), texts)       # the welcome first...
         self.assertEqual(texts[1:], history)                             # ...then all of the history, in order
         self.assertLess(got[0][0], got[1][0])                            # and stamped before it (apps sort by time)
-        self.assertFalse([p for p in self.room.posts if p[3] is not None])   # delivered private message dropped
+        self.assertFalse([p for p in r.posts if p[3] is not None])   # delivered private message dropped
 
     def test_a_new_connection_replaces_the_old_one(self):
         def client():

@@ -137,11 +137,11 @@ class WhereBotEndToEnd(WebTestCase):
 @unittest.skipIf(wb is None, "needs pyyaml")
 class WhereBotRoomTests(WebTestCase):
     def test_where_in_a_room(self):
-        room = self.h.room
+        room = self.h.add_room()
         node = os.urandom(32)
         for _ in range(3):
-            room.observe_near(node, bytes.fromhex("44c3"))
-        room.learn_name(node, 10, "platinum")
+            self.h.room.observe_near(node, bytes.fromhex("44c3"))           # (the map is the host's)
+        self.h.room.learn_name(node, 10, "platinum")
         self.http("POST", "/api/login", {"password": "adminpw"})
         token = self.make_key()
         bot_c, user_c = kc.KaasClient(self.url, token), kc.KaasClient(self.url, token)

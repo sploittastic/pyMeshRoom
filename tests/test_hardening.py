@@ -181,11 +181,12 @@ class HardeningTests(WebHelpers):
                 urllib.request.urlopen(req, timeout=10)
             except urllib.error.HTTPError as e:
                 return e.code
-        ts = [threading.Thread(target=wrong, args=("203.0.113.9",)) for _ in range(mr.FAIL_LIMIT)]
-        for t in ts:
-            t.start()
-        for t in ts:
-            t.join()
+        for batch in (mr.FAIL_LIMIT // 2, mr.FAIL_LIMIT - mr.FAIL_LIMIT // 2):    # (under the 16 requests at once,
+            ts = [threading.Thread(target=wrong, args=("203.0.113.9",)) for _ in range(batch)]   # so none is "busy")
+            for t in ts:
+                t.start()
+            for t in ts:
+                t.join()
         self.assertEqual(wrong("203.0.113.9"), 429)
         self.assertEqual(wrong("198.51.100.7"), 401)                                # someone else behind the proxy
 
@@ -307,7 +308,7 @@ class HardeningTests(WebHelpers):
         me = kc.Identity.generate()
         self.heard_on_air(me, "Me")
         c = self.connect(self.login(me)[1]["ticket"])
-        room = self.h.room.id.pub_key.hex()
+        room = self.h.add_room().id.pub_key.hex()
         for i in range(mr.ROOM_LOGIN_FAILS):
             self.assertIn("wrong password", self.ask(c, {"type": "room", "id": i, "room": room, "password": "nope"})["error"])
         self.assertIn("too many", self.ask(c, {"type": "room", "id": 99, "room": room, "password": "hello"})["error"])
@@ -351,6 +352,9 @@ class HardeningTests(WebHelpers):
         """No IATA code by default: the observer can't be turned on (or start) until one is set."""
         self.assertEqual(mr.DEFAULT_CONFIG["observer_iata"], "")
         self.http("POST", "/api/login", {"password": "adminpw"})
+        r = self.h.add_room("Surf")
+        self.assertEqual(self.http("POST", "/api/observer", {"observer_identity": r.key})[0], 200)
+        self.h.cfg.set("observer_identity", r.key)                               # (the main loop applies it)
         code, d = self.http("POST", "/api/observer", {"observer_enabled": True})
         self.assertEqual(code, 400)
         self.assertIn("IATA region code", d["error"])
@@ -360,6 +364,33 @@ class HardeningTests(WebHelpers):
         import meshroom_observer
         with self.assertRaises(ValueError):
             meshroom_observer.ObserverBridge(types.SimpleNamespace(observer_iata=""), self.h.room.id, start=False)
+
+    def test_the_observer_reports_as_the_repeater_or_a_room(self):
+        """It can't be enabled until it's told who it reports as; the choices are the virtual repeater (while on)
+        and the rooms, never the host's own key."""
+        self.http("POST", "/api/login", {"password": "adminpw"})
+        code, d = self.http("POST", "/api/observer", {"observer_enabled": True, "observer_iata": "SJC"})
+        self.assertEqual(code, 400)
+        self.assertIn("reports as", d["error"])
+        self.assertEqual(self.h.room.observer_choices(), [])
+        self.assertEqual(self.http("POST", "/api/observer", {"observer_identity": "repeater"})[0], 400)   # (off)
+        r = self.h.add_room("Surf")
+        self.assertEqual([c["label"] for c in self.h.room.observer_choices()], ["Room: Surf"])
+        self.assertEqual(self.http("POST", "/api/observer", {"observer_identity": "ab" * 32})[0], 400)
+        self.assertEqual(self.http("POST", "/api/observer", {"observer_identity": r.key, "observer_enabled": True,
+                                                             "observer_iata": "SJC"})[0], 200)
+        self.h.cfg.set("observer_identity", r.key)                               # (the main loop applies it)
+        ident, name = self.h.room.observer_who()
+        self.assertEqual((ident.pub_key, name), (r.id.pub_key, "Surf"))
+        self.h.room.tenant_delete(r.id.pub_key)                                    # its room is gone: nobody
+        self.assertIsNone(self.h.room.observer_who())
+        sys.path.insert(0, str(pathlib.Path(mr.__file__).parent))
+        import meshroom_observer
+        b = meshroom_observer.ObserverBridge(types.SimpleNamespace(observer_iata="SJC", observer_queue_max=100,
+                                                                   observer_servers=None, observer_gomesh=True,
+                                                                   observer_meshmapper=True, name="host"),
+                                             r.id, start=False, name="Surf")
+        self.assertEqual(json.loads(b._status_message())["origin"], "Surf")       # its name, not the host's
 
     def test_message_of_the_day(self):
         """Off by default; when on, web sessions get it in hello (API keys never do)."""

@@ -70,7 +70,7 @@ FIRMWARE_VER_LEVEL = 1
 DEFAULT_CONFIG = {
     "serial": "/dev/ttyACM0",
     "baud": 115200,
-    "name": "Pi Room",
+    "name": "pyMeshRoom",           # this server's name on its dashboard (each room has its own)
     "lat": 0.0,
     "lon": 0.0,
     # Empty means disabled for admin, and open for the room.  Never give a
@@ -143,6 +143,7 @@ DEFAULT_CONFIG = {
     # MQTT observer is opt-in.  Disabled keeps MeshRoom's normal runtime free
     # of both the MQTT dependency and all observer activity.
     "observer_enabled": False,
+    "observer_identity": "",        #   who it reports as: "repeater" (the virtual repeater) or a room's public key (hex)
     "observer_iata": "",
     "observer_status": True,
     "observer_packets": True,
@@ -1584,6 +1585,12 @@ class RoomServer:
             self.nodes[bytes(pub)] = dict(type=typ, name=name or "", lat=lat, lon=lon, adv_ts=adv_ts or 0, rf=rf, obs=obs)
         for h, last, w, t, last_direct, snr, disc, out_snr in st.read("SELECT hash, last, w, t, last_direct, snr, disc, out_snr FROM heard"):
             self.heard[bytes(h)] = dict(last=last, w=w, t=t, last_direct=last_direct, snr=snr, disc=disc or 0, out_snr=out_snr)
+        if not self.TENANT and (self.members or self.posts):
+            # the main room is the host now: rooms are all Rooms (tenants). An older main room's data stays in
+            # room.db, untouched, but isn't served
+            log.warning("room.db still holds a room of its own (%d members, %d posts): the server hosts Rooms only "
+                        "now, so they're kept in room.db but not used", len(self.members), len(self.posts))
+            self.members, self.posts = {}, []
         for m in self.members.values():
             self.update_current(m, mark=False)
         self.max_issued = max((p[0] for p in self.posts), default=0)
@@ -1963,6 +1970,8 @@ class RoomServer:
 
     def on_anon_req(self, pkt):
         p = pkt.payload
+        if not self.TENANT:
+            return                                          # the host takes no logins: Rooms do
         if len(p) <= 1 + PUB_KEY_SIZE + 2 or self.check_dup(pkt) or p[0] != self.self_hash:
             return
         sender = p[1:1 + PUB_KEY_SIZE]
@@ -3479,8 +3488,9 @@ class RoomServer:
                 self.vc.close()
             self.vc = VirtualCompanion(self, ident, CompanionStore(os.path.join(c.data_dir, "companion.db")))
             log.info("virtual companion %r on, id %s", c.companion_name, hexs(ident.pub_key[:2]))
-            try:                                            # introduce the room (and repeater) and the companion to each other
-                self.vc.deliver(self.make_advert())
+            try:                                            # introduce the Rooms (and repeater) and the companion to each other
+                for t in list(self.tenants.values()):
+                    self.vc.deliver(t.make_advert())
                 if self.vr is not None:
                     lat, lon = self.vr.position()
                     self.vc.deliver(make_advert(self.vr.id, ADV_TYPE_REPEATER, c.repeater_name, lat, lon))
@@ -3654,6 +3664,8 @@ class RoomServer:
         t = TenantRoom(self, store, tcfg)
         t.next_zero_advert, t.next_flood_advert = time.monotonic() + 3, time.monotonic() + 10   # announce it now
         self.tenants[ident.pub_key] = t
+        if self.vc is not None:
+            self.vc.deliver(t.make_advert())                # (the companion's app lists it at once)
         self.cfg.set("tenant_rooms", list(self.cfg.tenant_rooms or []) +
                      [dict(name=spec["name"], path=spec["path"], public_key=hexs(ident.pub_key))])
         log.info("tenant room %r created on /%s/, id %s", spec["name"], spec["path"], hexs(ident.pub_key[:2]))
@@ -4126,6 +4138,24 @@ class RoomServer:
         n[via] = now_s()
         self.nodes_dirty.add(pub)
 
+    def observer_choices(self):
+        """Who the MQTT observer may report as: the virtual repeater (while on) or a room."""
+        out = [dict(id="repeater", label="Virtual repeater: %s" % self.cfg.repeater_name, key=hexs(self.vr.pub))] \
+            if self.vr is not None else []
+        return out + [dict(id=hexs(t.id.pub_key), label="Room: %s" % t.cfg.name, key=hexs(t.id.pub_key))
+                      for t in list(self.tenants.values())]
+
+    def observer_who(self):
+        """(identity, name) the observer reports as, or None while what was chosen doesn't exist."""
+        sel = str(self.cfg.observer_identity or "")
+        if sel == "repeater":
+            return (self.vr.id, self.cfg.repeater_name) if self.vr is not None else None
+        try:
+            t = self.tenants.get(bytes.fromhex(sel)) if sel else None
+        except ValueError:
+            t = None
+        return (t.id, t.cfg.name) if t is not None else None
+
     def own_node_keys(self):
         """Every node identity this server has: the room, tenants, and the virtual repeater and companion (their
         configured keys too, while they're off: turning one back on mustn't give two nodes one key)."""
@@ -4156,14 +4186,14 @@ class RoomServer:
         return max(hits, key=lambda k: (bool(self.mrpts.get(k)), self.names[k][0]), default=None)
 
     def dashboard_advert(self, flood):
-        """The dashboard's advert buttons: the room's advert, and the virtual repeater's too when it's on."""
-        self.send_advert(flood)
+        """The host dashboard's advert buttons: the virtual repeater's advert (a Room's page sends the Room's)."""
         if self.vr is not None:
             self.vr.send_advert(flood)
-        log.info("%s sent from the dashboard%s", "flood advert" if flood else "advert (zero-hop)",
-                 " (room and virtual repeater)" if self.vr is not None else "")
+            log.info("virtual repeater %s sent from the dashboard", "flood advert" if flood else "advert (zero-hop)")
 
     def send_advert(self, flood):
+        if not self.TENANT:
+            return                                          # the host isn't a room: only Rooms advertise
         try:
             pkt = self.make_advert()
         except Exception as e:
@@ -4570,6 +4600,7 @@ class RoomServer:
         s = self.stats
         self.web_state = dict(
             room=dict(name=self.cfg.name, key=hexs(self.id.pub_key), lat=self.cfg.lat, lon=self.cfg.lon, fw=FIRMWARE_VERSION,
+                      host=not self.TENANT, rooms=len(self.tenants) if not self.TENANT else None,
                       radio=list(self.radio) if self.radio else None, uptime=int(time.monotonic() - self.boot), time=t,
                       clock_ok=t > 1735689600, noise_floor=self.noise_floor, batt_mv=self.batt_mv),
             stats=dict(s, posts_held=sum(1 for p in self.posts if p[3] is None), names_known=len(self.names),
@@ -4578,13 +4609,13 @@ class RoomServer:
             bans=[dict(pub=hexs(k), key=hexs(k[:6]), name=v["name"], ts=v["ts"]) for k, v in sorted(self.bans.items(), key=lambda x: -x[1]["ts"])],
             top_links=self.top_links(), discovery_min=self.cfg.discovery_interval_min, hour=self.hour_stats(),
             map_version=self.map_version, web=dict(viewers=self.web_clients[0], admins=self.web_clients[1]),
-            sys=self.sys_stats(), observer=self.observer.status() if self.observer else dict(
+            sys=self.sys_stats(), observer=dict(self.observer.status() if self.observer else dict(
                 enabled=bool(self.cfg.observer_enabled), iata=str(self.cfg.observer_iata).upper(),
                 status=bool(self.cfg.observer_status), packets=bool(self.cfg.observer_packets), rx=bool(self.cfg.observer_rx),
-                public_key=hexs(self.id.pub_key), queue_depth=0, queue_max=int(self.cfg.observer_queue_max), dropped=0,
+                public_key="", queue_depth=0, queue_max=int(self.cfg.observer_queue_max), dropped=0,
                 uptime=0, last_rx=0, last_error="", brokers={
                     "gomesh": dict(enabled=bool(self.cfg.observer_gomesh), connected=False, last_publish=0, last_error=""),
-                    "meshmapper": dict(enabled=bool(self.cfg.observer_meshmapper), connected=False, last_publish=0, last_error="")}),
+                    "meshmapper": dict(enabled=bool(self.cfg.observer_meshmapper), connected=False, last_publish=0, last_error="")}), identity=str(self.cfg.observer_identity or ""), choices=self.observer_choices()),
             mqtt=self.mqtt_state(), repeater=self.vr_state(), companion=self.vc_state(), airtime=self.air.state())
         self.web_vc_admin = self.vc_admin_state()          # (served to admins only)
         if self.tenants:
@@ -4992,6 +5023,7 @@ VC_QUEUE_MAX = 64                     # messages waiting for the app (firmware: 
 VC_MAX_FRAME = 176                    # BaseSerialInterface MAX_FRAME_SIZE
 VC_MAX_TEXT_LEN = 160                 # BaseChatMesh MAX_TEXT_LEN
 VC_ACK_TABLE = 8
+VC_ACK_COPY_S = 30                    # an ACK's other copies (multipart, plain, retries) are still its for this long
 VC_ADVERT_PATHS = 16
 VC_MAX_SIGN = 8 * 1024
 VC_PUBLIC_PSK = base64.b64decode("izOH6cXN6mrJ5e26oRXNcg==")
@@ -5427,6 +5459,7 @@ class VirtualCompanion:
         self.seen = {}
         self.inbox, self.outbox, self.seq = [], [], 0      # heaps: packets to/from the room, due when the radio would send
         self.expected = collections.deque(maxlen=VC_ACK_TABLE)   # [ack, sent (monotonic), contact pub]
+        self.acked = collections.deque(maxlen=VC_ACK_TABLE)      # (ack, monotonic) matched lately: its other copies
         self.pending = dict(login=None, status=None, telemetry=None, req=None, discovery=None)
         self.traces = {}                                    # tag -> expiry: our own traces (their results go to the app)
         self.connections = {}                               # server pub -> keep-alive state (logins with keep-alive)
@@ -5664,7 +5697,11 @@ class VirtualCompanion:
     # ---------------------------------------------------------------- what the room hands over
 
     def expects_ack(self, ack):
-        return any(e[0] == ack for e in self.expected) or any(cn["ack"] == ack for cn in self.connections.values())
+        """An ACK for this node: one it waits for, or another copy of one it just got (a room acknowledges twice,
+        multipart then plain: both are for this node, and neither belongs on the air)."""
+        now = time.monotonic()
+        return any(e[0] == ack for e in self.expected) or any(cn["ack"] == ack for cn in self.connections.values()) \
+            or any(a == ack and now - t < VC_ACK_COPY_S for a, t in self.acked)
 
     def claims(self, pkt):
         """Is this packet, about to be sent by the room or the virtual repeater, for this node? Then it's handed over
@@ -5904,6 +5941,7 @@ class VirtualCompanion:
             if e[0] == ack:
                 self.write(bytes([PUSH_SEND_CONFIRMED]) + ack + struct.pack("<I", int((time.monotonic() - e[1]) * 1000)))
                 e[0] = None                                 # the same ACK can arrive more than once
+                self.acked.append((ack, time.monotonic()))
                 c = self.contacts.get(e[2])
                 if pkt is not None and pkt.is_flood and c is not None and c.out_len is not None:
                     self.return_path_retry(c, pkt)
@@ -8116,12 +8154,11 @@ class KaasHub:
                 "radio": radio,
                 "giphy_key": (room.cfg.web_giphy_key or None) if key.get("web") else None,   # (Giphy keys are for browsers)
                 "motd": (str(room.cfg.web_motd).strip() or None) if key.get("web") and room.cfg.web_motd_enabled else None,
-                "nodes": {"room": hexs(room.id.pub_key),
+                "nodes": {"room": None,                     # (the host isn't a room: every room is in tenants)
                           "tenants": [hexs(t.id.pub_key) for t in list(room.tenants.values())],
                           "repeater": hexs(room.vr.pub) if room.vr is not None else None,
                           "companion": hexs(room.vc.pub) if room.vc is not None else None},
-                "names": dict([(hexs(room.id.pub_key), room.cfg.name)] +
-                              [(hexs(t.id.pub_key), t.cfg.name) for t in list(room.tenants.values())])}
+                "names": {hexs(t.id.pub_key): t.cfg.name for t in list(room.tenants.values())}}
 
     def on_message(self, conn, msg):
         """A client's message (its reader thread). Sends go to the main loop; at most KAAS_MAX_INFLIGHT wait there."""
@@ -8413,8 +8450,7 @@ class KaasHub:
         self.room.events_put(("kaas_room", conn, t, pub, arg, rid))
 
     def local_room(self, pub):
-        room = self.room
-        return room if pub == room.id.pub_key else room.tenants.get(pub)
+        return self.room.tenants.get(pub)
 
     def room_request(self, conn, t, pub, arg, rid):
         """In the main loop. room: (since, password) -> the posts this member may see after since (all of the newest
@@ -8839,7 +8875,7 @@ td.rcell .dir{flex:none}.mono4{font-family:ui-monospace,monospace}
 #tip h4{margin:0 0 4px;font-size:13px;color:var(--acc)}#tip .sec{margin-top:6px;color:var(--dim);text-transform:uppercase;font-size:10px;letter-spacing:.05em}
 #rpts tr[data-i]{cursor:pointer}#rpts tr[data-i]:hover td{background:#222a33}#rpts tr.sel td{background:#243447}.good{color:var(--ok)}.mid{color:var(--warn)}.poor{color:var(--bad)}.small{font-size:12px}.kpis{display:flex;flex-wrap:wrap;gap:22px}.kpi b{font-size:18px;display:block}
 .traffic-chart{height:88px;display:flex;align-items:flex-end;gap:1px;border-bottom:1px solid var(--line);padding:0 1px;margin:8px 0 4px}.traffic-chart i{display:block;flex:1;min-width:2px;background:var(--acc);border-radius:2px 2px 0 0}.traffic-chart i.zero{height:1px!important;background:var(--line)}.traffic-label{display:flex;justify-content:space-between}
-#advcard{order:1}#chatcard{order:2}#memberscard{order:3}#suspendedcard{order:4}#observercard{order:5}#trafficcard{order:6}#mqcard{order:7}#rpcard{order:8}#vccard{order:8}#tncard{order:8}#kaascard{order:8}#tnlist a{color:var(--acc)}.tenant #rmqtt,.tenant #rrpt,.tenant #rvc,.tenant #rsys,.tenant #rweb{display:none}#vcopts.locked{opacity:.5}#vcopts.locked *{cursor:not-allowed}#mapcard{order:9}#bestcard{order:10}#welcomecard{order:11}#repeaterscard{order:12}#banscard{order:13}
+#advcard{order:1}#chatcard{order:2}#memberscard{order:3}#suspendedcard{order:4}#observercard{order:5}#trafficcard{order:6}#mqcard{order:7}#rpcard{order:8}#vccard{order:8}#tncard{order:-1}.host #memberscard,.host #suspendedcard,.host #banscard,.host #chatcard{display:none!important}#kaascard{order:8}#tnlist a{color:var(--acc)}.tenant #rmqtt,.tenant #rrpt,.tenant #rvc,.tenant #rsys,.tenant #rweb{display:none}#vcopts.locked{opacity:.5}#vcopts.locked *{cursor:not-allowed}#mapcard{order:9}#bestcard{order:10}#welcomecard{order:11}#repeaterscard{order:12}#banscard{order:13}
 </style></head><body>
 <header><h1 id="rname">meshroom</h1><span class="dim" id="rinfo"></span><span class="dim" id="rclock"></span><span id="rmqtt" class="volt"></span><span id="rrpt" class="volt"></span><span id="rvc" class="volt"></span><span id="rweb" class="volt"></span><span id="rsys" class="volt"></span><span id="rvolt" class="volt"></span>
 <span style="margin-left:auto"><span id="who" class="dim small"></span> <button id="loginbtn" onclick="loginClick()">Log in</button></span>
@@ -8916,7 +8952,7 @@ the companion is enabled. The companion protocol has no password: anyone who can
 as it, so keep it on your own network (never forward it from the internet) and list allowed addresses (e.g. 192.168.1.0/24) to
 narrow it further. Radio settings, the Bluetooth PIN, reboot and factory reset from the app are acknowledged and ignored.
 Messages between the companion and this room or its repeater never go on the air.</div></div>
-<div class="card" id="tncard" style="display:none"><h2>Tenant rooms <span class="hdesc">more rooms on this radio, each with its own page, members and passwords</span></h2>
+<div class="card" id="tncard" style="display:none"><h2>Rooms <span class="hdesc">the rooms on this radio, each with its own page, members and passwords</span></h2>
 <div class="rprow"><label>Room name <input id="tn_name" maxlength="31" size="16"></label>
 <label>Path <span class="dim" id="tn_base"></span><input id="tn_path" maxlength="32" size="12" placeholder="e.g. hiking" autocomplete="off"></label>
 <label>Private key <input id="tn_key" type="password" autocomplete="new-password" size="22" placeholder="blank = random"></label></div>
@@ -8929,7 +8965,7 @@ Messages between the companion and this room or its repeater never go on the air
 <div class="hint" style="margin-left:26px">If no private key is entered, one is generated randomly. Each room gets its own page at its path, where its
 admins (web UI password) see its members and the map, chat, advert, resync, suggest routes, kick and ban. The join and admin passwords are what
 people use from their MeshCore apps. The location is what the room's adverts put on maps; change it later from the room's Actions.
-Tenant rooms share this radio, its map and its airtime; nothing a tenant does reaches outside its room.</div>
+Rooms share this radio, its map and its airtime; nothing a room's admin does reaches outside their room.</div>
 <table id="tnlist" style="margin-top:8px"></table></div>
 <div class="card" id="kaascard" style="display:none"><h2>KaaS <span class="hdesc">KISS radio as an API service - useful for bots or other integrations</span></h2>
 <div class="rprow"><label><input id="kk_receive" type="checkbox" checked> Receive</label><label><input id="kk_send" type="checkbox"> Send</label>
@@ -8973,7 +9009,7 @@ A key is shown once, when it is made: only a hash of it is kept, so a lost key c
 <label class="dlgrow"><input type="checkbox" id="wbban_ip"> IP address <span class="wbkey" id="wbban_addr"></span></label>
 <div class="small" id="wbban_note"></div>
 <div class="dlgbtns"><button value="cancel">Cancel</button><button id="wbban_go" value="ban" class="wbwarn">Ban</button></div></form></dialog>
-<div class="card" id="advcard" style="display:none"><h2>Adverts <span class="hdesc">the room's, and the virtual repeater's when it's on</span></h2><div class="advrow">
+<div class="card" id="advcard" style="display:none"><h2>Adverts <span class="hdesc">the virtual repeater's (each room sends its own from its page)</span></h2><div class="advrow">
 <div class="adv"><button class="act" title="Advert: zero-hop, heard by direct neighbours" onclick="sendAdvert(false,this)"><img src="icons/advert.png" alt="advert"></button><div>Advert<br><span class="dim small">zero-hop</span></div></div>
 <div class="adv"><button class="act" title="Flood advert: spreads across the whole mesh" onclick="sendAdvert(true,this)"><img src="icons/flood_advert.png" alt="flood advert"></button><div>Flood advert<br><span class="dim small">whole mesh</span></div></div>
 <span id="advmsg" class="dim small"></span></div></div>
@@ -8990,14 +9026,15 @@ A key is shown once, when it is made: only a hash of it is kept, so a lost key c
 <div class="mapwrap"><div><div id="map"></div><div id="mapnote" class="dim small"></div></div>
 <div id="rdetail" class="rdetail"><div class="dim pick">Select a repeater from the map</div></div></div></div>
 <div class="card" id="observercard" style="display:none"><h2>MQTT observer <span class="hdesc">admin only</span></h2>
-<div class="advrow"><label><input id="obs_enabled" type="checkbox" onchange="saveObserverToggle()"> Enabled</label><label>IATA <input id="obs_iata" maxlength="3" size="6" placeholder="e.g. SJC" title="Your region: the nearest airport code. Required: everything the observer publishes is filed under it"></label>
+<div class="advrow"><label title="The node the observer reports as: its public key and name are what MQTT maps show">Report as <select id="obs_who" onchange="saveObserverWho()"></select></label>
+<label><input id="obs_enabled" type="checkbox" onchange="saveObserverToggle()"> Enabled</label><span id="obswho_note" class="small dim"></span><label>IATA <input id="obs_iata" maxlength="3" size="6" placeholder="e.g. SJC" title="Your region: the nearest airport code. Required: everything the observer publishes is filed under it"></label>
 <label><input id="obs_status" type="checkbox"> Status</label><label><input id="obs_packets" type="checkbox"> Packets</label><label><input id="obs_rx" type="checkbox"> RX</label>
 <label>Queue <input id="obs_queue" type="number" min="10" max="10000" style="width:80px"></label><button onclick="saveObserver()">Save observer settings</button><span id="obsmsg" class="small dim"></span></div>
 <div class="rprow"><label>Name <input id="os_name" placeholder="Regional MQTT"></label><label>Host <input id="os_host" placeholder="mqtt.example.org"></label><label>Port <input id="os_port" type="number" value="443"></label><label>Audience <input id="os_aud" placeholder="mqtt.example.org"></label><label>Path <input id="os_path" value="/"></label><label>Prefix <input id="os_prefix" value="meshcore"></label><label><input id="os_enabled" type="checkbox" checked> Enabled</label><label><input id="os_tls" type="checkbox" checked> TLS</label><label><input id="os_verify" type="checkbox" checked> Verify TLS</label><button onclick="addObserverServer()">Add server</button></div>
 <table id="observerservers" style="margin-top:8px"></table>
 <table id="observerstatus" style="margin-top:10px"></table></div>
 <div class="card" id="trafficcard" style="display:none"><div id="observertraffic"></div></div>
-<div class="card" id="welcomecard" style="display:none"><h2>Welcome DMs <span class="hdesc">admin only &middot; sent only to newly logged-in members</span></h2>
+<div class="card" id="welcomecard" style="display:none"><h2>Welcome DMs <span class="hdesc">admin only &middot; sent only to newly logged-in members &middot; the default for every room</span></h2>
 <div class="advrow"><label><input id="welcome_enabled" type="checkbox"> Send welcome DM</label><button onclick="saveWelcome()">Save welcome settings</button><span id="welcomemsg" class="small dim"></span></div>
 <div style="margin-top:10px"><label>Welcome message<br><textarea id="welcome_message" rows="2" maxlength="151" style="width:min(680px,100%)"></textarea></label></div>
 <div style="margin-top:8px"><label>Name-unknown hint <span class="dim small">(optional; appended when the member has not sent an advert)</span><br><textarea id="welcome_hint" rows="2" maxlength="151" style="width:min(680px,100%)"></textarea></label></div>
@@ -9006,7 +9043,7 @@ A key is shown once, when it is made: only a hash of it is kept, so a lost key c
 </main>
 <script>
 const TENANT=!!window.TENANT;if(TENANT){document.body.classList.add("tenant");
- document.querySelector("#advcard .hdesc").textContent="this room's adverts"}
+ document.querySelector("#advcard .hdesc").textContent="this room's adverts"}else document.body.classList.add("host");
 const $=id=>document.getElementById(id), esc=s=>String(s??"").replace(/[&<>"'`]/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;","`":"&#96;"}[c]));
 function ago(t){if(!t)return"never";let d=Math.max(0,Date.now()/1000-t);return d<60?Math.round(d)+"s":d<3600?Math.round(d/60)+"m":d<86400?(d/3600).toFixed(1)+"h":(d/86400).toFixed(1)+"d"}
 async function act(url,label){if(!confirm(label))return;const r=await fetch(url,{method:"POST"});if(r.status===401){await session();alert("Your admin session has expired: log in again.")}setTimeout(load,300)}
@@ -9072,7 +9109,7 @@ async function vcToggle(cb){   // turning it on saves the options with it; they 
  cb.disabled=true;const ok=await vcSet(o);cb.disabled=false;if(!ok)cb.checked=!cb.checked}
 async function loadTenants(){if(!MAINADM)return;try{const r=await fetch("api/tenants");if(!r.ok)return;const d=await r.json();TN_ROWS=d.rooms||[]}catch(e){return}
  $("tn_base").textContent=location.host+"/";
- const t=$("tnlist");if(!TN_ROWS.length){t.innerHTML='<tr><td class="dim">No tenant rooms yet.</td></tr>';return}
+ const t=$("tnlist");if(!TN_ROWS.length){t.innerHTML='<tr><td class="dim">No rooms yet: create one above.</td></tr>';return}
  if(t.querySelector("select:focus"))return;
  t.innerHTML="<tr><th>Room</th><th>Page</th><th>ID</th><th>Location</th><th>Members</th><th>Suspended</th><th>Posts</th><th></th></tr>"+TN_ROWS.map(x=>
   `<tr><td>${esc(x.name)}</td><td><a href="${encodeURI(x.path)}/" target="_blank">/${esc(x.path)}/</a></td><td class="mono4" title="${esc(x.key)}">${esc(x.id)}</td>`+
@@ -9189,7 +9226,7 @@ async function tnAction(sel){const k=sel.dataset.key,n=sel.dataset.name,a=sel.va
   m=await tnPost("api/tenants/"+k+"/location",v.trim()?{lat:p[0],lon:p[1]}:{lat:"",lon:""});alert(m||"Location of "+n+" saved; it advertises it shortly.")}
  else if(a==="pw"){const pw=prompt("New web UI password for "+n+" (6+ characters). Anyone logged in to its page is logged out.");if(pw===null)return;
   m=await tnPost("api/tenants/"+k+"/password",{web_password:pw});alert(m||"Web UI password for "+n+" reset.")}
- else if(a==="del"){if(!confirm("Delete the tenant room "+n+"? Its members, posts, settings and key are erased for good."))return;
+ else if(a==="del"){if(!confirm("Delete the room "+n+"? Its members, posts, settings and key are erased for good."))return;
   const pw=prompt("Your admin (web) password, to confirm deleting "+n+":");if(pw===null)return;
   m=await tnPost("api/tenants/"+k+"/delete",{password:pw});alert(m||n+" deleted.")}
  setTimeout(loadTenants,700)}
@@ -9231,18 +9268,24 @@ function renderObserverServers(){const t=$("observerservers");t.innerHTML="<tr><
 function saveObserverServers(){fetch("api/observer",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({observer_servers:OBS_SERVERS})}).then(r=>r.json().then(d=>({ok:r.ok,d}))).then(x=>{$("obsmsg").textContent=x.ok?"Observer servers saved; refreshing.":(x.d.error||"Could not save");setTimeout(load,500)}).catch(()=>{$("obsmsg").textContent="Could not save"})}
 function addObserverServer(){const n=$("os_name").value.trim(),h=$("os_host").value.trim();if(!n||!h){$("obsmsg").textContent="Server name and host are required";return}OBS_SERVERS.push({name:n,host:h,port:+$("os_port").value,audience:$("os_aud").value.trim()||h,ws_path:$("os_path").value.trim()||"/",topic_prefix:$("os_prefix").value.trim()||"meshcore",enabled:$("os_enabled").checked,tls:$("os_tls").checked,tls_verify:$("os_verify").checked});saveObserverServers()}
 function removeObserverServer(i){if(confirm("Delete this observer server?")){OBS_SERVERS.splice(i,1);saveObserverServers()}}
-function observerState(o,key){
+function observerState(o){
  const d=o||{enabled:false,iata:"",queue_depth:0,queue_max:1000,dropped:0,uptime:0,last_rx:0,last_error:"",brokers:{}};
- if(ADMIN){$("obs_enabled").checked=!!d.enabled;$("obs_iata").value=d.iata||"";$("obs_status").checked=d.status!==false;$("obs_packets").checked=d.packets!==false;$("obs_rx").checked=d.rx!==false;
+ if(ADMIN){const ch=d.choices||[],sel=$("obs_who"),valid=ch.some(c=>c.id===d.identity);
+  if(document.activeElement!==sel&&changed("obswho",[ch,d.identity])){sel.innerHTML='<option value="">— choose —</option>'+ch.map(c=>`<option value="${esc(c.id)}">${esc(c.label)}</option>`).join("");sel.value=valid?d.identity:""}
+  $("obs_enabled").disabled=!valid&&!d.enabled;
+  $("obswho_note").textContent=!ch.length?"Turn on the virtual repeater or create a room: the observer reports as one of them.":!valid?"Choose who it reports as to enable it.":"";
+  $("obs_enabled").checked=!!d.enabled;$("obs_iata").value=d.iata||"";$("obs_status").checked=d.status!==false;$("obs_packets").checked=d.packets!==false;$("obs_rx").checked=d.rx!==false;
   $("obs_queue").value=d.queue_max||1000;OBS_SERVERS=d.servers||[];renderObserverServers();}
  const bs=d.brokers||{}, row=n=>{const b=bs[n]||{},s=b.connected?'<span class="good">connected</span>':'<span class="poor">disconnected</span>';return `<tr><td>${n}</td><td>${s}</td><td>${b.last_publish?ago(b.last_publish)+" ago":"never"}</td><td class="small">${esc(b.last_error||"-")}</td></tr>`};
- $("observerstatus").innerHTML=`<tr><th>Public key</th><td class="mono">${esc(d.public_key||key)}</td><th>Queue</th><td>${d.queue_depth}/${d.queue_max} &middot; ${d.dropped} dropped</td><th>Uptime</th><td>${d.uptime||0}s</td></tr>`+
+ $("observerstatus").innerHTML=`<tr><th>Public key</th><td class="mono">${esc(d.public_key||((d.choices||[]).find(c=>c.id===d.identity)||{}).key||"-")}</td><th>Queue</th><td>${d.queue_depth}/${d.queue_max} &middot; ${d.dropped} dropped</td><th>Uptime</th><td>${d.uptime||0}s</td></tr>`+
   `<tr><th>Broker</th><th>State</th><th>Last publish</th><th colspan="3">Last error</th></tr>`+Object.keys(bs).map(row).join("")+(d.last_error?`<tr><th>Observer</th><td colspan="5" class="poor">${esc(d.last_error)}</td></tr>`:"");
 }
 async function saveObserver(){
  const body={observer_enabled:$("obs_enabled").checked,observer_iata:$("obs_iata").value.trim().toUpperCase(),observer_status:$("obs_status").checked,observer_packets:$("obs_packets").checked,observer_rx:$("obs_rx").checked,observer_queue_max:Number($("obs_queue").value)};
  const r=await fetch("api/observer",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(body)});let m=r.ok?"Saved; broker settings are being refreshed.":"Could not save";try{if(!r.ok)m=(await r.json()).error||m}catch(e){}if(r.status===401){m="Your admin session has expired: log in again.";session()}$("obsmsg").textContent=m;setTimeout(load,500);
 }
+async function saveObserverWho(){const r=await fetch("api/observer",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({observer_identity:$("obs_who").value})});
+ let m=r.ok?"Saved: the observer now reports as "+($("obs_who").selectedOptions[0]||{}).text+".":"Could not save";try{if(!r.ok)m=(await r.json()).error||m}catch(e){}$("obsmsg").textContent=m;delete SIG.obswho;setTimeout(load,500)}
 async function saveObserverToggle(){
  const enabled=$("obs_enabled").checked;$("obsmsg").textContent="Saving observer state…";
  const r=await fetch("api/observer",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({observer_enabled:enabled})});let m=r.ok?(enabled?"Observer enabled; broker settings are being refreshed.":"Observer disabled; brokers are disconnecting."):"Could not save";try{if(!r.ok)m=(await r.json()).error||m}catch(e){}if(r.status===401){m="Your admin session has expired: log in again.";session()}$("obsmsg").textContent=m;setTimeout(load,500);
@@ -9394,12 +9437,13 @@ async function load(){
   `<span><span class="dim">Noise floor</span><b>${Hs.nf_avg??"-"}</b> <span class="dim small">avg &middot; ${Hs.nf_min??"-"} / ${Hs.nf_max??"-"} min / max dBm</span></span>`,
   `<span><span class="dim">Channel use</span>TX <b>${Hs.tx_pct}%</b> &middot; RX <b>${Hs.rx_pct}%</b></span>`,
   `<span><span class="dim">Packets / min</span>RX <b>${Hs.rx_pm}</b> &middot; TX <b>${Hs.tx_pm}</b></span>`,
-  `<span><span class="dim">Push pace</span><b>${Hs.pace} s</b></span>`,
-  `<span><span class="dim">Pushes / min</span><b>${Hs.pushes_pm}</b>${Hs.push_rf!=null?` &middot; <b class="${Hs.push_rf>=80?"good":Hs.push_rf>=50?"mid":"poor"}">${Hs.push_rf}%</b> delivered${(st.mqtt||{}).enabled?` <span class="dim small">(${Hs.push_ok}% per MQTT)</span>`:""}`:""}</span>`,
+  ...(R.host?[]:[`<span><span class="dim">Push pace</span><b>${Hs.pace} s</b></span>`,
+  `<span><span class="dim">Pushes / min</span><b>${Hs.pushes_pm}</b>${Hs.push_rf!=null?` &middot; <b class="${Hs.push_rf>=80?"good":Hs.push_rf>=50?"mid":"poor"}">${Hs.push_rf}%</b> delivered${(st.mqtt||{}).enabled?` <span class="dim small">(${Hs.push_ok}% per MQTT)</span>`:""}`:""}</span>`]),
   `<span class="dim small">last ${Hs.minutes>=60?"hour":Hs.minutes+" min"}</span>`].join(""):'<span class="dim small">stats appear after the first minute</span>';
  $("rclock").textContent="up "+ago(Date.now()/1000-R.uptime).replace("s"," s")+(R.clock_ok?"":"  CLOCK NOT SYNCED");
- observerState(st.observer,R.key);if(MAINADM)loadObserverTraffic();
- const k=[["Members",st.members.length],["Posts held",S.posts_held],["Pushes",S.pushes],["Delivered",S.acks],["Late ACKs",S.late_acks],["Timeouts",S.timeouts],["Floods failed",S.flood_fallbacks],["Duplicates dropped",S.deduped],["Traces heard",S.traces],["Noise floor",R.noise_floor+" dBm"],["RX / TX",S.recv+" / "+S.sent],["TX queue",S.tx_queue],["Names known",S.names_known]];
+ observerState(st.observer);if(MAINADM)loadObserverTraffic();
+ const k=[...(R.host?[["Rooms",R.rooms]]:[["Members",st.members.length],["Posts held",S.posts_held],["Pushes",S.pushes],["Delivered",S.acks],["Late ACKs",S.late_acks],["Timeouts",S.timeouts],["Floods failed",S.flood_fallbacks]]),
+  ["Duplicates dropped",S.deduped],["Traces heard",S.traces],["Noise floor",R.noise_floor+" dBm"],["RX / TX",S.recv+" / "+S.sent],["TX queue",S.tx_queue],["Names known",S.names_known]];
  $("kpis").innerHTML=k.map(x=>`<div class="kpi"><span class="dim small">${x[0]}</span><b>${esc(x[1])}</b></div>`).join("");
  const IC=n=>`<img src="icons/${n}.png" alt="${n}">`;
  const memSig=JSON.stringify(st.members)+"|"+ADMIN+"|"+[...EXP].join(",");
@@ -10405,6 +10449,16 @@ class WebUI:
                         if iata and not valid_iata(iata):
                             return self._send(400, '{"error":"IATA must be exactly three letters"}')
                         updates["observer_iata"] = iata
+                    if "observer_identity" in body:
+                        who = str(body["observer_identity"] or "")
+                        if who and who not in {c["id"] for c in room.observer_choices()}:
+                            return self._send(400, '{"error":"choose the virtual repeater or one of the rooms"}')
+                        updates["observer_identity"] = who
+                    if updates.get("observer_enabled", cfg.observer_enabled) and \
+                            updates.get("observer_identity", cfg.observer_identity) not in \
+                            {c["id"] for c in room.observer_choices()}:
+                        return self._send(400, '{"error":"choose who the observer reports as first: the virtual '
+                                               'repeater or a room (with neither, it can\'t be enabled)"}')
                     if updates.get("observer_enabled", cfg.observer_enabled) and \
                             not valid_iata(updates.get("observer_iata", cfg.observer_iata)):
                         return self._send(400, '{"error":"set the IATA region code first: your nearest airport, like '
@@ -10504,20 +10558,13 @@ class WebUI:
                             return self._send(429, '{"error":"an advert was just sent: wait a few seconds"}')
                         last_advert[0] = time.monotonic()
                     flood = bool(body.get("flood"))
-                    events.put(("advert", flood))                   # sent by the main loop
                     rpt = bool((room.web_state.get("repeater") or {}).get("enabled"))
+                    if not rpt:
+                        return self._send(409, '{"error":"the virtual repeater is off: adverts are sent from each Room\'s page"}')
+                    events.put(("advert", flood))                   # sent by the main loop
                     return self._send(200, json.dumps({"ok": True, "flood": flood, "repeater": rpt}))
                 if parts == ["api", "chat"]:
-                    try:
-                        body = json.loads(self._raw_body() or b"{}")
-                    except ValueError:
-                        body = {}
-                    text = str(body.get("text", "")).strip()
-                    if not text:
-                        return self._send(400, '{"error":"empty message"}')
-                    if len(text.encode()) > MAX_POST_TEXT_LEN:
-                        return self._send(400, json.dumps({"error": "too long: %d bytes max" % MAX_POST_TEXT_LEN}))
-                    events.put(("say", text))                       # posted + pushed by the main loop
+                    return self._send(404, '{"error":"the server isn\'t a room: post from a Room\'s page"}')
                     return self._send(200, '{"ok":true}')
                 if len(parts) == 4 and parts[:2] == ["api", "members"] and parts[3] == "route":
                     try:
@@ -10627,17 +10674,32 @@ def main():
             log.error("MQTT observer not started: set its IATA region code (your nearest airport, like SJC) on the "
                       "dashboard's Observer card")
             return
+        who = room.observer_who()
+        if who is None:
+            log.error("MQTT observer not started: choose who it reports as (the virtual repeater, or a room) on the "
+                      "dashboard's Observer card")
+            return
         try:
             # Kept optional: installations that do not opt in never import
             # paho-mqtt and retain their existing MeshRoom behavior.
             from meshroom_observer import ObserverBridge
-            observer = ObserverBridge(cfg, identity)
+            observer = ObserverBridge(cfg, who[0], name=who[1])
             room.observer = observer
-            log.info("MQTT observer enabled for %s", observer.iata)
+            log.info("MQTT observer enabled for %s, as %s (%s)", observer.iata, who[1], hexs(who[0].pub_key[:4]))
         except Exception as e:
             # An observer failure must never prevent the radio room from
             # starting.  The error is visible in the normal MeshRoom log.
             log.error("MQTT observer disabled: %s", e)
+    def observer_sync():
+        """Stop the observer when it's turned off or its identity changed or went away; start it as the chosen one."""
+        nonlocal observer
+        who = room.observer_who() if cfg.observer_enabled else None
+        if observer and (who is None or observer.public_key != hexs(who[0].pub_key) or observer.origin != who[1]):
+            observer.close()
+            observer = room.observer = None
+            log.info("MQTT observer stopped%s", "" if who is None else ": now reporting as %s" % who[1])
+        if who is not None and not observer:
+            start_observer()
     start_observer()
     room.mqtt_apply()
     if cfg.web_port:
@@ -10650,7 +10712,7 @@ def main():
     room.apply_radio()
     if room.radio:
         log.info("radio: %.3f MHz, BW %.1f kHz, SF%d, CR4/%d", room.radio[0] / 1e6, room.radio[1] / 1e3, room.radio[2], room.radio[3])
-    log.info("room %r, public key %s", cfg.name, hexs(identity.pub_key))
+    log.info("host %r, public key %s, %d room(s)", cfg.name, hexs(identity.pub_key), len(room.tenants))
 
     def stop(*_):
         events.put(("quit",))
@@ -10699,11 +10761,14 @@ def main():
             for k, v in ev[1].items():
                 room.cfg.set(k, v)
             room.repeater_apply()
+            observer_sync()                                 # (it may report as the repeater)
             room.web_dirty = True
         elif kind in ("vc_cmd", "vc_conn", "vc_disc", "vc_cfg"):
             room.companion_event(ev)
         elif kind.startswith("t_"):
             room.tenant_event(ev)
+            if kind == "t_delete":
+                observer_sync()                             # (it may report as that room)
         elif kind.startswith("kaas_"):
             room.kaas.event(ev)
         elif kind == "web_wake":
@@ -10712,10 +10777,9 @@ def main():
         elif kind == "observer_config":
             for key, value in ev[1].items():
                 cfg.set(key, value)
+            observer_sync()
             if observer:
                 observer.refresh()                            # worker owns all network lifecycle changes
-            else:
-                start_observer()
             room.web_dirty = True
         elif kind == "welcome_config":
             for key, value in ev[1].items():
