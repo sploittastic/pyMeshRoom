@@ -129,9 +129,16 @@ counts, and can:
 
 * **Allow send**: let a key send without being heard;
 * **Kick**: disconnect it, though it can log in again;
-* **Ban**: disconnect it and refuse it from then on; a key can also be banned before it ever logs in.
+* **Ban**: disconnect it and refuse it from then on; a key can also be banned before it ever logs in. A popup asks
+  whether to ban the **public key**, the **IP address** it last logged in from, or both. An address ban refuses every
+  web login and connection from that address; the card warns when other users share it (behind a proxy that
+  doesn't pass on `X-Forwarded-For`, everyone does).
 
 A banned person can make a new key, but a new key can't send until it's heard on the air or allowed.
+
+`POST /api/v1/web/users/<pub>/ban` takes `{"key": true, "ip": false}` (the defaults) to choose what is banned;
+`POST /api/v1/web/ips/<ip>/ban` and `.../unban` ban or unban an address directly. Each user's last address shows
+under their key on the card, and banned addresses are listed with the banned keys.
 
 ### Catching up (web logins only)
 
@@ -420,6 +427,7 @@ Bad input gets `{"type": "error", "id": ..., "error": ...}`. Questions share the
 | `web_max_clients` | 32 | Web sessions at once, apart from API keys' 16. |
 | `web_approved` | `[]` | Public keys (hex) allowed to send without being heard. Managed from the dashboard. |
 | `web_banned` | `[]` | `{"pub", "name", "ts"}` of banned keys. Managed from the dashboard. |
+| `web_banned_ips` | `[]` | `{"ip", "name", "ts"}` of banned addresses. Managed from the dashboard. |
 | `web_unknown_key_message` | "Your key must be heard on RF before you can send messages. Please send a flood advert." | What a web user whose key may not send yet is told. Set from the dashboard. |
 | `web_hosts` | `[]` | The names MeshCore Web is reached by (a domain, a proxy's name), besides this server's own `ip:port`. Set from the dashboard. |
 | `web_page_password` | `""` | A password for the MeshCore Web page and its logins, hashed. Set from the dashboard. |

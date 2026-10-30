@@ -177,7 +177,8 @@ DEFAULT_CONFIG = {
     "web_login": False,             # MeshCore Web: people log in by signing with their node's private key (no API key)
     "web_max_clients": 32,          #   web sessions at once (bots' API keys have their own limit)
     "web_approved": [],             #   public keys (hex) the admin let send although never heard on this radio
-    "web_banned": [],               #   [{"pub", "name", "ts"}]: may not log in
+    "web_banned": [],
+    "web_banned_ips": [],           #   [{"ip", "name", "ts"}]: addresses refused MeshCore Web logins and sessions               #   [{"pub", "name", "ts"}]: may not log in
     "web_unknown_key_message":      #   what a web user whose key may not send yet is told
         "Your key must be heard on RF before you can send messages. Please send a flood advert.",
     "web_motd_enabled": False,      #   show web users a message of the day when they log in...
@@ -7389,6 +7390,7 @@ class KaasConn:
 
     def __init__(self, hub, sock, rfile, key, peer):
         self.hub, self.sock, self.rfile, self.peer = hub, sock, rfile, peer
+        self.ip = peer                                      # the client's address (behind a proxy: the one it forwarded for)
         self.key_id, self.can_receive, self.can_send = key["id"], bool(key.get("receive")), bool(key.get("send"))
         self.web = key.get("web")                           # a web login: its public key (hex); None for an API key
         self.rooms = set()                                  # rooms on this server it follows (web logins: "room")
@@ -7677,6 +7679,9 @@ class KaasHub:
     def web_banned(self, pub_hex):
         return any(isinstance(b, dict) and b.get("pub") == pub_hex for b in (self.room.cfg.web_banned or []))
 
+    def web_ip_banned(self, ip):
+        return any(isinstance(b, dict) and b.get("ip") == ip for b in (self.room.cfg.web_banned_ips or []))
+
     def web_can_send(self, pub_hex):
         """Heard advertising on this radio (or by an observer, when trusted), or let in by the admin."""
         if pub_hex in (self.room.cfg.web_approved or []):
@@ -7750,7 +7755,7 @@ class KaasHub:
         if sum(1 for c in self.conns if c.web and not c.closed) >= cap:
             log.warning("web login (%s) from %s refused: all %d web sessions are in use", pub[:8], ip, cap)
             return 503, {"error": "all of this server's web sessions are in use (%d): try again later" % cap, "full": True}
-        self.web_seen(pub, name)
+        self.web_seen(pub, name, ip)
         key = self.web_key(pub)
         ticket = self.new_ticket(key) if key else None
         if ticket is None:
@@ -7768,7 +7773,7 @@ class KaasHub:
             while len(self.refused_hosts) > 10:
                 del self.refused_hosts[next(iter(self.refused_hosts))]
 
-    def web_seen(self, pub_hex, name=None):
+    def web_seen(self, pub_hex, name=None, ip=None):
         """A web user logged in, or is still connected: the dashboard's list (the least recently active go first)."""
         now = now_s()
         with self.slock:
@@ -7781,6 +7786,8 @@ class KaasHub:
                 u = self.wusers[pub_hex] = dict(name="", first=now, last=now, seq=self.bk_seq, floor=0)
             if name:
                 u["name"] = name
+            if ip and ip != "?":
+                u["ip"] = ip                                # (the last address they logged in from)
             u["last"] = now
             self.wusers_dirty = True
 
@@ -7805,12 +7812,15 @@ class KaasHub:
         with self.slock:
             users = {k: dict(v) for k, v in self.wusers.items()}
         rows = []
+        per_ip = collections.Counter(u.get("ip") for u in users.values() if u.get("ip"))
         for pub, u in users.items():
             n = self.room.nodes.get(bytes.fromhex(pub)) or {}
             connected = sum(1 for c in conns if c.web == pub)
             rows.append(dict(pub=pub, name=u["name"], advert_name=n.get("name") or None, first=u["first"], last=u["last"],
                              heard_rf=n.get("rf"), heard_obs=n.get("obs"), approved=pub in approved,
                              send=self.web_can_send(pub), banned=self.web_banned(pub), connected=connected,
+                             ip=u.get("ip"), ip_shared=max(0, per_ip[u.get("ip")] - 1) if u.get("ip") else 0,
+                             ip_banned=bool(u.get("ip")) and self.web_ip_banned(u.get("ip")),
                              stats=self.key_stats(WEB_ID_PREFIX + pub)))
         rows.sort(key=lambda r: (-min(r["connected"], 1), -r["last"]))
         for r in rows:                                      # backlog packets since they were last connected
@@ -7885,6 +7895,14 @@ class KaasHub:
             cfg.set("web_approved", [p for p in (cfg.web_approved or []) if p != pub_hex])
         elif action == "unban":
             cfg.set("web_banned", [b for b in (cfg.web_banned or []) if isinstance(b, dict) and b.get("pub") != pub_hex])
+        elif action == "ban_ip":                            # (pub_hex is the address here)
+            cfg.set("web_banned_ips", [b for b in (cfg.web_banned_ips or []) if isinstance(b, dict) and b.get("ip") != pub_hex] +
+                    [dict(ip=pub_hex, name=name, ts=now_s())])
+            for c in list(self.conns):
+                if c.web and getattr(c, "ip", None) == pub_hex:
+                    c.close(4003, "this address is banned from this server")
+        elif action == "unban_ip":
+            cfg.set("web_banned_ips", [b for b in (cfg.web_banned_ips or []) if isinstance(b, dict) and b.get("ip") != pub_hex])
         elif action == "purge":                             # their backlog: as if they'd caught up just now
             with self.slock:
                 u = self.wusers.get(pub_hex)
@@ -8651,6 +8669,9 @@ td.rcell .dir{flex:none}.mono4{font-family:ui-monospace,monospace}
 .mqrow input[type=checkbox]{transform:scale(1.2);margin-right:6px}.mqrow input[type=text],.mqrow input[type=password],.mqrow input[type=number],.mqrow select{width:auto;min-width:110px;padding:4px 6px;background:#0d1014;border:1px solid var(--line);border-radius:4px;color:var(--fg)}.mqnote{margin-top:10px;padding:8px 10px;border-left:3px solid var(--acc);background:#151a20;color:var(--dim);font-size:12px}
 .advrow{display:flex;gap:26px;align-items:center;flex-wrap:wrap}.adv{display:flex;gap:10px;align-items:center}
 .hdesc{color:var(--dim);font-weight:400;text-transform:none;letter-spacing:0;font-size:12px;margin-left:8px}.hdesc a{color:var(--acc)}.wbkey{font-family:ui-monospace,monospace}.wbacts{display:flex;flex-wrap:wrap;gap:4px;min-width:150px}.wbacts button{white-space:nowrap}.wbacts .wbwarn{color:var(--bad)}
+.dlg{background:var(--card);color:var(--fg);border:1px solid var(--line);border-radius:8px;padding:14px 18px;min-width:min(420px,90vw)}
+.dlg::backdrop{background:rgb(0 0 0/.5)}.dlg h3{margin:0 0 10px;font-size:15px}.dlgrow{display:flex;gap:8px;align-items:center;margin:6px 0}
+.dlgbtns{display:flex;gap:8px;justify-content:flex-end;margin-top:12px}.dlg .wbwarn{color:var(--bad)}
 #members tr.mrow{cursor:pointer}#members tr.mrow:hover td{background:#1e252d}#members tr.mrow.exp td{background:#1b2229}
 .hexr{font-family:ui-monospace,monospace;white-space:nowrap}.caret{color:var(--dim);font-size:11px;margin-right:4px}
 .mbox.wide{width:520px}.ac{position:relative}.aclist{background:#0d1014;border:1px solid var(--line);border-top:none;
@@ -8781,6 +8802,11 @@ A key is shown once, when it is made: only a hash of it is kept, so a lost key c
 <div class="rprow" style="margin-top:10px"><label>Ban a public key <input id="wb_banpub" class="mono" size="40" maxlength="64" placeholder="64 hex characters"></label>
 <button onclick="wbBanKey(this)">Ban</button><span id="wbbanmsg" class="small"></span></div>
 <table id="wbbanned" style="margin-top:8px"></table></div>
+<dialog id="wbbandlg" class="dlg"><form method="dialog"><h3 id="wbban_title">Ban</h3>
+<label class="dlgrow"><input type="checkbox" id="wbban_key"> Public key <span class="wbkey" id="wbban_pub"></span></label>
+<label class="dlgrow"><input type="checkbox" id="wbban_ip"> IP address <span class="wbkey" id="wbban_addr"></span></label>
+<div class="small" id="wbban_note"></div>
+<div class="dlgbtns"><button value="cancel">Cancel</button><button id="wbban_go" value="ban" class="wbwarn">Ban</button></div></form></dialog>
 <div class="card" id="advcard" style="display:none"><h2>Adverts <span class="hdesc">the room's, and the virtual repeater's when it's on</span></h2><div class="advrow">
 <div class="adv"><button class="act" title="Advert: zero-hop, heard by direct neighbours" onclick="sendAdvert(false,this)"><img src="icons/advert.png" alt="advert"></button><div>Advert<br><span class="dim small">zero-hop</span></div></div>
 <div class="adv"><button class="act" title="Flood advert: spreads across the whole mesh" onclick="sendAdvert(true,this)"><img src="icons/flood_advert.png" alt="flood advert"></button><div>Flood advert<br><span class="dim small">whole mesh</span></div></div>
@@ -8903,12 +8929,13 @@ async function loadWeb(){if(!MAINADM)return;let d;try{const r=await fetch("api/v
  $("wb_burst").textContent=$("kk_burst").textContent;$("wb_win").textContent=$("kk_win").textContent;
  const t=$("wblist");if(!d.users.length){t.innerHTML='<tr><td class="dim">'+(d.enabled?"Nobody has logged in yet.":"Web logins are off.")+'</td></tr>'}else{
  const key=p=>`<span class="wbkey" title="${esc(p)}">${esc(p.slice(0,8))}&hellip;</span>`;
+ const addr=u=>u.ip?`<br><span class="dim small${u.ip_banned?" poor":""}" title="last logged in from${u.ip_shared?" (and "+u.ip_shared+" other user"+(u.ip_shared>1?"s":"")+")":""}">${esc(u.ip)}${u.ip_banned?" banned":u.ip_shared?" +"+u.ip_shared:""}</span>`:"";
  const access=u=>u.banned?'<span class="poor">banned</span>':u.send?('<span class="good">can send</span> <span class="dim small">'+(u.heard_rf?"heard "+ago(u.heard_rf)+" ago":u.approved?"allowed":"heard by an observer")+'</span>'):'<span class="mid">pending</span> <span class="dim small">not heard on the air</span>';
  t.innerHTML="<tr><th>Name</th><th>Public key</th><th>Access</th><th>Last active</th><th>Connected</th>"+
   '<th title="packets streamed to this user: last 24 h / total">Received <span class="dim small">24h / total</span></th><th title="packets this user sent: last 24 h / total">Sent <span class="dim small">24h / total</span></th>'+
   '<th title="refused sends and other errors: last 24 h / total">Errors <span class="dim small">24h / total</span></th>'+
   '<th title="backlog packets kept since they were last connected: they catch up on these when they come back">Missed</th><th></th></tr>'+d.users.map(u=>
-  `<tr><td>${esc(u.name)||'<span class="dim">(no name)</span>'}${u.advert_name&&u.advert_name!==u.name?' <span class="dim small">adverts as '+esc(u.advert_name)+'</span>':''}</td><td>${key(u.pub)}</td>`+
+  `<tr><td>${esc(u.name)||'<span class="dim">(no name)</span>'}${u.advert_name&&u.advert_name!==u.name?' <span class="dim small">adverts as '+esc(u.advert_name)+'</span>':''}</td><td>${key(u.pub)}${addr(u)}</td>`+
   `<td>${access(u)}</td><td>${ago(u.last)} ago</td><td>${u.connected?'<span class="mqdot on"></span> '+u.connected:'<span class="dim">no</span>'}</td>`+
   ["rx","tx","err"].map(f=>{const v=(u.stats||{})[f]||[0,0];return `<td class="${f==="err"&&v[0]?"poor":""}">${v[0].toLocaleString()} <span class="dim">/ ${v[1].toLocaleString()}</span></td>`}).join("")+
   `<td>${u.connected?'<span class="dim">-</span>':(u.missed||0).toLocaleString()}</td>`+
@@ -8916,12 +8943,14 @@ async function loadWeb(){if(!MAINADM)return;let d;try{const r=await fetch("api/v
    [u.approved&&!u.banned,"unallow","Unallow","take back Allow send: it sends again once the radio hears it"],
    [u.connected,"kick","Kick","disconnect now; they can log in again"],
    [u.missed,"purge","Purge","count them as caught up to now: they won't get what they missed"],
-   [!u.banned,"ban","Ban","disconnect, and refuse this key from now on"],
+   [!u.banned||(u.ip&&!u.ip_banned),"ban","Ban","disconnect, and refuse this key and/or its address from now on"],
    [true,"delete","Delete","disconnect and forget them (not a ban: they can log in again as a new user)"]].filter(x=>x[0]).map(([,a,l,tip])=>
-   `<button data-pub="${esc(u.pub)}" data-name="${esc(u.name)}" data-act="${a}" title="${tip}"${a==="ban"||a==="delete"?' class="wbwarn"':""} onclick="wbAct(this)">${l}</button>`).join("")}</div></td></tr>`).join("")}
- const b=$("wbbanned");b.innerHTML=d.banned.length?"<tr><th>Banned</th><th>Public key</th><th>Since</th><th></th></tr>"+d.banned.map(x=>
+   `<button data-pub="${esc(u.pub)}" data-name="${esc(u.name)}" data-act="${a}" data-ip="${esc(u.ip||"")}" data-shared="${u.ip_shared||0}" data-banned="${u.banned?1:""}" data-ipbanned="${u.ip_banned?1:""}" title="${tip}"${a==="ban"||a==="delete"?' class="wbwarn"':""} onclick="wbAct(this)">${l}</button>`).join("")}</div></td></tr>`).join("")}
+ const bi=d.banned_ips||[],b=$("wbbanned");b.innerHTML=d.banned.length||bi.length?"<tr><th>Banned</th><th>Public key or address</th><th>Since</th><th></th></tr>"+d.banned.map(x=>
   `<tr><td>${esc(x.name)||'<span class="dim">(no name)</span>'}</td><td class="mono">${esc(x.pub)}</td><td>${ago(x.ts)} ago</td>`+
-  `<td><button data-pub="${esc(x.pub)}" data-act="unban" onclick="wbAct(this)">Unban</button></td></tr>`).join(""):""}
+  `<td><button data-pub="${esc(x.pub)}" data-act="unban" onclick="wbAct(this)">Unban</button></td></tr>`).join("")+bi.map(x=>
+  `<tr><td>${esc(x.name)||'<span class="dim">(no name)</span>'}</td><td class="mono">${esc(x.ip)} <span class="dim small">address</span></td><td>${ago(x.ts)} ago</td>`+
+  `<td><button data-ip="${esc(x.ip)}" onclick="wbIp(this)">Unban</button></td></tr>`).join(""):""}
 async function wbBacklog(btn){const n=Number($("wb_days").value);
  if(!Number.isInteger(n)||n<0){$("wbmsg").className="poor small";$("wbmsg").textContent=" Days: a whole number, 0 for none.";return}
  if(n===0&&!confirm("Keep no backlog? What's kept now is deleted, and web users won't catch up on what they missed."))return;
@@ -8942,8 +8971,19 @@ async function wbGiphy(btn,remove){const k=remove?"":$("wb_giphy").value.trim();
  if(!remove&&!/^[A-Za-z0-9]{8,64}$/.test(k)){$("wbmsg").className="poor small";$("wbmsg").textContent=" A Giphy API key is letters and digits.";return}
  btn.disabled=true;await wbSettings({giphy_key:k});btn.disabled=false;$("wb_giphy").value=""}
 async function wbSettings(o){const m=await tnPost("api/v1/web/settings",o);$("wbmsg").className="poor small";$("wbmsg").textContent=m?" "+m:"";setTimeout(loadWeb,500)}
+function wbBan(btn){const d=btn.dataset,p=d.pub,ip=d.ip,dlg=$("wbbandlg");
+ $("wbban_title").textContent="Ban "+(d.name||p.slice(0,8));$("wbban_pub").textContent=p.slice(0,16)+"\u2026";
+ $("wbban_key").checked=!d.banned;$("wbban_key").disabled=!!d.banned;
+ $("wbban_addr").textContent=ip||"(not known)";$("wbban_ip").checked=false;$("wbban_ip").disabled=!ip||!!d.ipbanned;
+ const sh=+d.shared||0;$("wbban_note").className="small"+(sh?" poor":" dim");
+ $("wbban_note").textContent=d.banned?"The key is banned already.":sh?"That address was also used by "+sh+" other user"+(sh>1?"s":"")+": banning it shuts them out too. (Behind a proxy that doesn't pass on the visitor's address, everyone shares one.)":
+  "A key is free to make, so a key ban alone is easy to get round; an address ban hits everyone behind that address.";
+ dlg.onclose=async()=>{if(dlg.returnValue!=="ban")return;const k=$("wbban_key").checked&&!d.banned,i=$("wbban_ip").checked;
+  if(!k&&!i)return;btn.disabled=true;const m=await tnPost("api/v1/web/users/"+p+"/ban",{name:d.name||"",key:k,ip:i});if(m)alert(m);setTimeout(loadWeb,500)};
+ dlg.returnValue="";dlg.showModal()}
+async function wbIp(btn){btn.disabled=true;const m=await tnPost("api/v1/web/ips/"+encodeURIComponent(btn.dataset.ip)+"/unban",{});if(m)alert(m);setTimeout(loadWeb,500)}
 async function wbAct(btn){const a=btn.dataset.act,p=btn.dataset.pub;if(!a)return;
- if(a==="ban"&&!confirm("Ban "+(btn.dataset.name||p.slice(0,8))+"? They are disconnected now and can't log in with this key again."))return;
+ if(a==="ban")return wbBan(btn);
  if(a==="kick"&&!confirm("Disconnect "+p.slice(0,8)+"? They can log in again."))return;
  if(a==="delete"&&!confirm("Delete "+(btn.dataset.name||p.slice(0,8))+"? They are disconnected and forgotten, and lose \"allow send\". It isn't a ban: they can log in again as a new user."))return;
  if(a==="purge"&&!confirm("Purge "+(btn.dataset.name||p.slice(0,8))+"'s backlog? They'll count as caught up to now, and won't get what they missed."))return;
@@ -9672,7 +9712,10 @@ class WebUI:
                             hub.ticket_outcome(ticket, why)
                         self._penalty()
                         return self._send(401, '{"error":"missing, unknown, revoked or expired API key or ticket"}')
+                    if key.get("web") and hub.web_ip_banned(self._client_ip()):
+                        return refuse(403, "this address is banned from this server", "refused", "a banned address")
                     conn = KaasConn(hub, self.connection, self.rfile, key, self.client_address[0])
+                    conn.ip = self._client_ip()
                     if not hub.add(conn):
                         return refuse(503, "at most %d %s at once" % (
                             (int(cfg.web_max_clients), "web sessions") if conn.web else (KAAS_MAX_CLIENTS, "API clients")),
@@ -9769,6 +9812,8 @@ class WebUI:
                 node's private key, which never leaves the browser. Any origin may ask (CORS: *); no cookies."""
                 cors = {"Access-Control-Allow-Origin": "*"}
                 body = self._body()
+                if room.kaas.web_ip_banned(self._client_ip()):
+                    return self._send(403, '{"error":"this address is banned from this server"}', headers=cors)
                 if cfg.web_login and not self._page_password_ok((body or {}).get("page_password")):
                     return self._send(401, json.dumps({"error": "MeshCore Web on this server has a password",
                                                        "page_password": True}), headers=cors)
@@ -9780,7 +9825,7 @@ class WebUI:
                         return self._send(503, '{"error":"too many logins at once: try again shortly"}', headers=cors)
                     return self._send(200, json.dumps({"challenge": ch, "expires_in": WEB_CHALLENGE_S,
                                                        "label": WEB_LOGIN_LABEL}), headers=cors)
-                code, answer = room.kaas.web_login(body, self._web_hosts(), self.client_address[0])
+                code, answer = room.kaas.web_login(body, self._web_hosts(), self._client_ip())
                 if code == 200:
                     log.info("web login %s (%s) from %s: %s", answer["state"], (body or {}).get("pub", "")[:8],
                              self.client_address[0], (body or {}).get("name", ""))
@@ -9834,7 +9879,8 @@ class WebUI:
                         "page_password": bool(cfg.web_page_password), "giphy_key": bool(cfg.web_giphy_key),
                         "backlog": hub.backlog_info(),
                         "max": int(cfg.web_max_clients), "connected": sum(1 for c in hub.conns if c.web),
-                        "users": hub.web_rows(), "banned": [b for b in (cfg.web_banned or []) if isinstance(b, dict)]}))
+                        "users": hub.web_rows(), "banned": [b for b in (cfg.web_banned or []) if isinstance(b, dict)],
+                        "banned_ips": [b for b in (cfg.web_banned_ips or []) if isinstance(b, dict)]}))
                 if path == KAAS_PATH + "/keys":
                     if not self._is_admin():
                         return self._send(401, '{"error":"log in first"}')
@@ -10047,7 +10093,28 @@ class WebUI:
                         pub = b""
                     if len(pub) != PUB_KEY_SIZE:
                         return self._send(400, '{"error":"a 32-byte public key in hex"}')
-                    events.put(("kaas_web_admin", parts[5], pub.hex(), str((self._body() or {}).get("name", ""))[:32]))
+                    body = self._body() or {}
+                    name = str(body.get("name", ""))[:32]
+                    if parts[5] == "ban":
+                        by_key, by_ip = body.get("key", True) is not False, body.get("ip") is True
+                        ip = room.kaas.wusers.get(pub.hex(), {}).get("ip") if by_ip else None
+                        if by_ip and not ip:
+                            return self._send(400, '{"error":"no address is known for that key"}')
+                        if not (by_key or by_ip):
+                            return self._send(400, '{"error":"ban the key, the address, or both"}')
+                        if by_ip:
+                            events.put(("kaas_web_admin", "ban_ip", ip, name))
+                        if by_key:
+                            events.put(("kaas_web_admin", "ban", pub.hex(), name))
+                        return self._send(200, json.dumps({"ok": True, "ip": ip}))
+                    events.put(("kaas_web_admin", parts[5], pub.hex(), name))
+                    return self._send(200, '{"ok":true}')
+                if parts[:4] == ["api", "v1", "web", "ips"] and len(parts) == 6 and parts[5] in ("ban", "unban"):
+                    try:
+                        ip = str(ipaddress.ip_address(urllib.parse.unquote(parts[4])))
+                    except ValueError:
+                        return self._send(400, '{"error":"an IP address"}')
+                    events.put(("kaas_web_admin", parts[5] + "_ip", ip, str((self._body() or {}).get("name", ""))[:32]))
                     return self._send(200, '{"ok":true}')
                 if len(parts) == 6 and parts[:4] == ["api", "v1", "kaas", "keys"] and parts[5] == "revoke":
                     if room.kaas.key_by_id(parts[4]) is None:

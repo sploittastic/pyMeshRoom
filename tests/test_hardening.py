@@ -189,6 +189,43 @@ class HardeningTests(WebHelpers):
         self.assertEqual(wrong("203.0.113.9"), 429)
         self.assertEqual(wrong("198.51.100.7"), 401)                                # someone else behind the proxy
 
+    def test_ban_by_key_address_or_both(self):
+        """The ban popup chooses: the key, the address it last logged in from (via the proxy's X-Forwarded-For), or
+        both. An address ban refuses everything from that address, whatever key."""
+        self.enable()
+        def login_from(addr, ident):
+            h = {"X-Forwarded-For": addr}
+            code, d = self.post("/api/v1/web/challenge", headers=h)
+            if code != 200:
+                return code
+            msg = mr.web_login_message(self.host, d["challenge"], ident.pub.hex())
+            return self.post("/api/v1/web/login", dict(pub=ident.pub.hex(), signature=ident.sign(msg).hex(),
+                                                       challenge=d["challenge"], host=self.host, name="X"), h)[0]
+        hub, a, b = self.h.room.kaas, kc.Identity.generate(), kc.Identity.generate()
+        self.assertEqual(login_from("203.0.113.5", a), 200)
+        self.assertEqual(login_from("203.0.113.5", b), 200)
+        self.assertTrue(self.h.pump(lambda: hub.wusers.get(a.pub.hex(), {}).get("ip") == "203.0.113.5", 5))
+        rows = {r["pub"]: r for r in self.http("GET", "/api/v1/web/users")[1]["users"]}
+        self.assertEqual((rows[a.pub.hex()]["ip"], rows[a.pub.hex()]["ip_shared"]), ("203.0.113.5", 1))
+        # neither: refused
+        self.assertEqual(self.http("POST", "/api/v1/web/users/%s/ban" % a.pub.hex(), {"key": False, "ip": False})[0], 400)
+        # key only: the address still works for another key
+        self.assertEqual(self.http("POST", "/api/v1/web/users/%s/ban" % a.pub.hex(), {"key": True, "ip": False})[0], 200)
+        self.assertTrue(self.h.pump(lambda: hub.web_banned(a.pub.hex()), 5))
+        self.assertEqual(login_from("203.0.113.5", b), 200)
+        # address only: every key from it is refused, other addresses aren't
+        self.assertEqual(self.http("POST", "/api/v1/web/users/%s/ban" % b.pub.hex(), {"key": False, "ip": True})[0], 200)
+        self.assertTrue(self.h.pump(lambda: hub.web_ip_banned("203.0.113.5"), 5))
+        self.assertFalse(hub.web_banned(b.pub.hex()))
+        self.assertEqual(login_from("203.0.113.5", kc.Identity.generate()), 403)
+        self.assertEqual(login_from("198.51.100.7", b), 200)
+        d = self.http("GET", "/api/v1/web/users")[1]
+        self.assertEqual([x["ip"] for x in d["banned_ips"]], ["203.0.113.5"])
+        self.assertEqual(self.http("POST", "/api/v1/web/ips/not-an-ip/ban")[0], 400)
+        self.assertEqual(self.http("POST", "/api/v1/web/ips/203.0.113.5/unban")[0], 200)
+        self.assertTrue(self.h.pump(lambda: not hub.web_ip_banned("203.0.113.5"), 5))
+        self.assertEqual(login_from("203.0.113.5", b), 200)
+
     def test_stats_of_forgotten_web_keys_are_pruned(self):
         hub = self.h.room.kaas
         hub.kstats[mr.WEB_ID_PREFIX + "ab" * 32] = {"total": [1, 0, 0], "hours": {}}
