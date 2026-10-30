@@ -93,6 +93,12 @@ DEFAULT_CONFIG = {
     "radio_sf": 7,
     "radio_cr": 5,
     "radio_tx_power_dbm": None,     # None = leave the modem's default
+    "tx_duty_pct": 50,              # airtime ceiling: all this radio sends together, % of the time (see Airtime)
+    "tx_share_control_pct": 10,     #   guaranteed shares of it: the rooms' ACKs, replies and path returns
+    "tx_share_relay_pct": 15,       #     the virtual repeater's relays
+    "tx_share_room_pct": 10,        #     room pushes (posts delivered to members)
+    "tx_share_users_pct": 10,       #     web users, API keys and the virtual companion
+    "tx_share_background_pct": 5,   #     adverts and traces
     "route_halflife_h": 6,          # how fast route/member-location evidence fades (nodes move)
     "topology_halflife_h": 24,      # how fast the repeater map fades (repeaters rarely move)
     "routes_per_member": 6,         # proven routes kept per member
@@ -156,7 +162,6 @@ DEFAULT_CONFIG = {
     "repeater_flood_advert_interval_h": 12,   # flood advert (0 = off)
     "repeater_scope_mode": "allow", #   scoped (region) floods: "allow" = relay only these regions, "deny" = all but these
     "repeater_regions": [],         #   region names ("#name" or "name"); unscoped floods are always relayed
-    "repeater_airtime_pct": 10,     #   relays may use at most this share of airtime (100 = no cap)
     "repeater_loop_detect": "minimal",        # off / minimal / moderate / strict (the firmware's loop.detect)
     "companion_enabled": False,     # virtual companion: a chat node on the room's radio that MeshCore apps connect to over TCP
     "companion_name": "pyMeshRoom Companion",
@@ -173,12 +178,11 @@ DEFAULT_CONFIG = {
     "kaas_keys": [],                # KaaS API keys (made on the dashboard): only a hash of each key is kept, never the key
     "kaas_send_burst": 3,           #   per key: at most this many packets...
     "kaas_send_window_s": 20,       #   ...in any this many seconds (ACKs and path returns excepted)
-    "kaas_airtime_pct": 5,          #   all API clients together may use at most this share of airtime
     "web_login": False,             # MeshCore Web: people log in by signing with their node's private key (no API key)
     "web_max_clients": 32,          #   web sessions at once (bots' API keys have their own limit)
     "web_approved": [],             #   public keys (hex) the admin let send although never heard on this radio
-    "web_banned": [],
-    "web_banned_ips": [],           #   [{"ip", "name", "ts"}]: addresses refused MeshCore Web logins and sessions               #   [{"pub", "name", "ts"}]: may not log in
+    "web_banned": [],               #   [{"pub", "name", "ts"}]: may not log in
+    "web_banned_ips": [],           #   [{"ip", "name", "ts"}]: addresses refused MeshCore Web logins and sessions
     "web_unknown_key_message":      #   what a web user whose key may not send yet is told
         "Your key must be heard on RF before you can send messages. Please send a flood advert.",
     "web_motd_enabled": False,      #   show web users a message of the day when they log in...
@@ -208,6 +212,13 @@ FAIL_LIMIT = 20                       # wrong passwords / keys / tickets from on
 FAIL_WINDOW_S = 600                   # ...and its POSTs and websockets get 429 until the oldest is this old
 CROSS_SITE_POSTS = {"/api/v1/web/challenge", "/api/v1/web/login", "/api/v1/web/ticket"}   # (CORS: any origin)
 HTTP_MAX_THREADS = 400                # connections beyond this many threads in the process are closed at once
+# per visitor's address (not for private addresses: the LAN, or a proxy that doesn't say who it forwarded for)
+LAN_NETS = [ipaddress.ip_network(n) for n in ("10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16", "fc00::/7")]
+IP_LOGINS_PER_MIN = 10                # web login challenges an address may ask for a minute
+IP_WS_PER_MIN = 30                    # websockets an address may open a minute (web logins and API keys)
+IP_WEB_SESSIONS = 4                   # web sessions open at once from an address
+KAAS_MSG_RATE = 20                    # messages a second a websocket client may send, on average...
+KAAS_MSG_BURST = 40                   # ...in bursts of up to this many; one this far over the limit is disconnected
 
 REPEATERS_MAX = 2000                  # repeaters known by key (heard, or from MQTT): beyond it the longest silent go
 
@@ -229,12 +240,127 @@ class RepeaterTable(dict):
                 del self[pub]
 
 
+TX_CLASSES = ("control", "relay", "room", "users", "background")
+TX_BUCKET_S = 60                      # each share saves up at most this many seconds' worth, so a burst goes at once
+TX_STALE_S = {"relay": 20.0, "users": 120.0}   # held this long past due by the airtime limits: dropped (late is useless)
+TX_USAGE_S = 600                      # airtime used, as the dashboard shows it: over the last 10 minutes
+TX_CONTROL_OVER_MS = 10000            # the rooms' ACKs and replies may go this far over the ceiling before they wait too
+
+
+def tx_class(pkt, deferrable, relay, src, tag):
+    """Which share of airtime a packet comes out of."""
+    if relay:
+        return "relay"
+    if tag is not None or src == "vc":
+        return "users"                                      # API keys, web users, the virtual companion
+    if pkt.ptype in (PT_ADVERT, PT_TRACE):
+        return "background"
+    return "room" if deferrable else "control"
+
+
+class Airtime:
+    """One ceiling for everything this radio sends (tx_duty_pct of the time), and a guaranteed share of it for each
+    class of traffic, like Linux's HTB: a class spends its own share first, then borrows what the others leave unused,
+    up to the ceiling. So a class alone on the air may use the whole ceiling; when all are busy, each still gets its
+    share. Token buckets in ms of airtime, refilled at their rates and holding TX_BUCKET_S worth. Sending always
+    charges the ceiling's bucket (down to minus its depth); borrowing needs it positive. The rooms' ACKs and replies
+    (control), useless late, may also go over the ceiling by up to TX_CONTROL_OVER_MS, a burst; only after that do
+    they wait like the rest."""
+
+    def __init__(self, cfg):
+        self.cfg = cfg
+        self.t = self.start = time.monotonic()
+        self.own = dict.fromkeys(TX_CLASSES)
+        self.pool = None
+        self.used = collections.deque()                     # (monotonic, class, ms), the last TX_USAGE_S
+        self.dropped = dict.fromkeys(TX_CLASSES, 0)
+
+    def rates(self):
+        """(ceiling, {class: guaranteed share}) as fractions of the time; shares adding up to more than the
+        ceiling are scaled down to fit it."""
+        c = self.cfg
+        ceiling = max(1.0, min(100.0, float(getattr(c, "tx_duty_pct", 50) or 0))) / 100.0
+        shares = {k: max(0.0, float(getattr(c, "tx_share_%s_pct" % k, 0) or 0)) / 100.0 for k in TX_CLASSES}
+        total = sum(shares.values())
+        if total > ceiling:
+            shares = {k: v * ceiling / total for k, v in shares.items()}
+        return ceiling, shares
+
+    def refill(self):
+        now = time.monotonic()
+        dt, self.t = max(0.0, now - self.t) * 1000.0, now
+        ceiling, shares = self.rates()
+        cap = ceiling * TX_BUCKET_S * 1000.0
+        self.pool = cap if self.pool is None else min(cap, self.pool + dt * ceiling)
+        for k, r in shares.items():
+            depth = r * TX_BUCKET_S * 1000.0
+            self.own[k] = depth if self.own[k] is None else min(depth, self.own[k] + dt * r)
+        return cap
+
+    def can(self, cls, ms):
+        """May a packet of this class, ms long, go now? (A full bucket lets even a packet longer than it go.)"""
+        cap = self.refill()
+        if cls == "control":
+            return self.own[cls] >= ms or self.pool >= min(ms, cap) - TX_CONTROL_OVER_MS
+        return self.own[cls] >= ms or self.pool >= min(ms, cap)
+
+    def charge(self, cls, ms):
+        cap = self.refill()
+        _, shares = self.rates()
+        if self.own[cls] >= ms:
+            self.own[cls] -= ms
+        self.pool = max(self.pool - ms, -cap - TX_CONTROL_OVER_MS)
+        now = time.monotonic()
+        self.used.append((now, cls, ms))
+        while self.used and now - self.used[0][0] > TX_USAGE_S:
+            self.used.popleft()
+
+    def state(self):
+        ceiling, shares = self.rates()
+        now = time.monotonic()
+        span = max(60.0, min(float(TX_USAGE_S), now - self.start)) * 1000.0
+        used = dict.fromkeys(TX_CLASSES, 0.0)
+        for t, k, ms in self.used:
+            if now - t <= TX_USAGE_S:
+                used[k] += ms
+        r = lambda x: round(100.0 * x, 1)
+        return dict(ceiling_pct=r(ceiling), share_pct={k: r(v) for k, v in shares.items()},
+                    used_pct={k: r(v / span) for k, v in used.items()}, total_pct=r(sum(used.values()) / span),
+                    dropped=dict(self.dropped), window_s=int(span / 1000))
+
+
+def airtime_changes(body):
+    """Dashboard airtime settings -> {config key: value}, validated."""
+    if not isinstance(body, dict):
+        raise ValueError("bad request")
+    ch = {}
+
+    def pct(v, what, lo):
+        try:
+            v = float(v)
+        except (TypeError, ValueError):
+            raise ValueError("%s: not a number" % what)
+        if not lo <= v <= 100:
+            raise ValueError("%s: %g to 100 %%" % (what, lo))
+        return int(v) if v == int(v) else v
+    if "duty_pct" in body:
+        ch["tx_duty_pct"] = pct(body["duty_pct"], "ceiling", 1)
+    shares = body.get("share_pct") or {}
+    if not isinstance(shares, dict):
+        raise ValueError("bad request")
+    for k, v in shares.items():
+        if k not in TX_CLASSES:
+            raise ValueError("unknown class %r" % k)
+        ch["tx_share_%s_pct" % k] = pct(v, k, 0)
+    return ch
+
+
 def valid_iata(code):
     """An observer's region code: three letters (an airport code, like SJC)."""
     return isinstance(code, str) and len(code) == 3 and code.isascii() and code.isalpha() and code.isupper()
 
 
-RETIRED_SETTINGS = {"web_trust_observers"}   # settings older versions had: ignored quietly
+RETIRED_SETTINGS = {"web_trust_observers", "repeater_airtime_pct", "kaas_airtime_pct"}   # settings older versions had: ignored quietly
 
 
 class Config:
@@ -1077,11 +1203,11 @@ def repeater_changes(body):
             if len(r) > 30 or r.startswith("$") or not all(c in "-$#" or "0" <= c <= "9" or c >= "A" for c in r):
                 raise ValueError("region %r: letters, digits and - only (private $ regions aren't supported)" % r)
         ch["repeater_regions"] = regs
-    if "airtime_cap" in body:
+    if "airtime_cap" in body:                               # (its guaranteed share of the airtime ceiling)
         v = num("airtime_cap")
-        if not 1 <= v <= 100:
-            raise ValueError("airtime cap: 1 to 100 %")
-        ch["repeater_airtime_pct"] = v
+        if not 0 <= v <= 100:
+            raise ValueError("guaranteed airtime: 0 to 100 %")
+        ch["tx_share_relay_pct"] = v
     if "loop_detect" in body:
         if body["loop_detect"] not in ("off", "minimal", "moderate", "strict"):
             raise ValueError("loop detection: off, minimal, moderate or strict")
@@ -1305,7 +1431,8 @@ class RoomServer:
         self.names = {}                   # key8 -> (ts, name)
         self.neighbours = {}              # pubkey -> dict(advert_ts, heard, snr4, name)
         self.seen = {}                    # packet hash -> None (insertion ordered)
-        self.txq = []                     # heap (due, prio, seq, raw, ptype, is_flood)
+        self.txq = []                     # heap (due, prio, seq, raw, ptype, is_flood, deferrable, relay, tag, class)
+        self.air = Airtime(cfg)
         self.txseq = 0
         self.tx_busy_until = 0.0
         self.next_push = 0.0
@@ -1540,7 +1667,7 @@ class RoomServer:
             self.vr.seen_mark(pkt)                          # the virtual repeater never relays what this radio sent
         self.txseq += 1
         heapq.heappush(self.txq, (time.monotonic() + delay, prio, self.txseq, raw, pkt.ptype, pkt.is_flood, deferrable, relay,
-                                  tag))
+                                  tag, tx_class(pkt, deferrable, relay, src, tag)))
 
     def service_tx(self):
         now = time.monotonic()
@@ -1549,7 +1676,18 @@ class RoomServer:
         quiet = now - self.last_rx_mono >= self.cfg.push_quiet_ms / 1000.0
         # pushes aren't urgent: they wait for a quiet gap (floods arrive as bursts of rebroadcasts);
         # ACKs and replies go straight out. The modem's own CSMA still guards the instant of transmit.
-        due = [e for e in self.txq if e[0] <= now and (quiet or not e[6])]
+        late = [e for e in self.txq if e[9] in TX_STALE_S and now - e[0] > TX_STALE_S[e[9]]]
+        if late:                                            # relays and users' packets the airtime limits held too long
+            self.txq[:] = [e for e in self.txq if e not in late]
+            heapq.heapify(self.txq)
+            for e in late:
+                self.air.dropped[e[9]] += 1
+                if e[7] and self.vr is not None:
+                    self.vr.stats["drop_airtime"] += 1
+                if e[8] is not None and self.kaas is not None:
+                    self.kaas.dropped(e[8], "held too long by the airtime limits (the channel is busy)")
+        # within the airtime ceiling, and each class's share of it (borrowing what others leave unused)
+        due = [e for e in self.txq if e[0] <= now and (quiet or not e[6]) and self.air.can(e[9], self.airtime_ms(len(e[3])))]
         if not due:
             return
         # the room's own ACKs and replies first, then the virtual repeater's relays, then pushes, then API clients';
@@ -1568,6 +1706,7 @@ class RoomServer:
         self.stats["sent"] += 1
         self.stats["sent_flood" if is_flood else "sent_direct"] += 1
         self.stats["airtime_ms"] += at
+        self.air.charge(best[9], at)
 
     def wanted_radio(self):
         c = self.cfg
@@ -3286,7 +3425,7 @@ class RoomServer:
         c = self.cfg
         out = dict(enabled=self.vr is not None, relay=bool(c.repeater_relay), name=c.repeater_name, lat=float(c.repeater_lat or 0), lon=float(c.repeater_lon or 0),
                    scope_mode=c.repeater_scope_mode, regions=list(c.repeater_regions or []),
-                   airtime_cap=c.repeater_airtime_pct, loop_detect=c.repeater_loop_detect,
+                   airtime_cap=c.tx_share_relay_pct, loop_detect=c.repeater_loop_detect,
                    advert_min=c.repeater_advert_interval_min, flood_advert_h=c.repeater_flood_advert_interval_h)
         if self.vr is not None:
             out.update(self.vr.state(), key=hexs(self.vr.pub), id=hexs(self.vr.pub[:2]))
@@ -4427,7 +4566,7 @@ class RoomServer:
                 uptime=0, last_rx=0, last_error="", brokers={
                     "gomesh": dict(enabled=bool(self.cfg.observer_gomesh), connected=False, last_publish=0, last_error=""),
                     "meshmapper": dict(enabled=bool(self.cfg.observer_meshmapper), connected=False, last_publish=0, last_error="")}),
-            mqtt=self.mqtt_state(), repeater=self.vr_state(), companion=self.vc_state())
+            mqtt=self.mqtt_state(), repeater=self.vr_state(), companion=self.vc_state(), airtime=self.air.state())
         self.web_vc_admin = self.vc_admin_state()          # (served to admins only)
         if self.tenants:
             self.web_tenant_rows = [t.admin_row() for t in self.tenants.values()]
@@ -4536,7 +4675,6 @@ class VirtualRepeater:
         self.stats = dict(flood=0, direct=0, acks=0, traces=0, discovery=0, internal=0, adverts=0, dups=0,
                           drop_scope=0, drop_hops=0, drop_loop=0, drop_airtime=0, drop_queue=0, drop_off=0)
         self.recent = collections.deque()                   # (monotonic, airtime ms) of each relay, last 10 minutes
-        self.budget_ms, self.budget_t = None, time.monotonic()
         self.disc_window = [0, 0]                           # discovery answers: window start (s), count
         self.started = now_s()                              # the firmware's discovery_mod_timestamp
         self.next_zero_advert = time.monotonic() + 8
@@ -4608,28 +4746,12 @@ class VirtualRepeater:
         t = int(self.room.airtime_ms(path_bytes(pkt.path_len) + len(pkt.payload) + 2) * factor)
         return random.randint(0, 5 * t) / 1000.0
 
-    def airtime_ok(self, airtime):
-        """Relays share an airtime budget: refills at repeater_airtime_pct of the time, holds a minute's worth."""
-        pct = max(0.0, min(100.0, float(self.cfg.repeater_airtime_pct or 0)))
-        if pct >= 100:
-            return True
-        now = time.monotonic()
-        cap = 60000.0 * pct / 100.0
-        if self.budget_ms is None:
-            self.budget_ms = cap
-        self.budget_ms = min(cap, self.budget_ms + (now - self.budget_t) * 1000.0 * pct / 100.0)
-        self.budget_t = now
-        if self.budget_ms < airtime:
-            return False
-        self.budget_ms -= airtime
-        return True
-
     def transmit(self, fwd, prio, delay, kind):
         if sum(1 for e in self.room.txq if e[7]) >= RPT_MAX_QUEUED:
             self.stats["drop_queue"] += 1
             return False
         at = self.room.airtime_ms(fwd.raw_length())
-        if not self.airtime_ok(at):
+        if not self.room.air.can("relay", at):             # (its share, or what others leave unused, is spent)
             self.stats["drop_airtime"] += 1
             return False
         self.room.queue_tx(fwd, prio, delay, relay=True)
@@ -7217,7 +7339,6 @@ LINK_GRAPH_TTL_S = 30                  # route questions reuse the repeater link
 KAAS_MAX_INFLIGHT = 4                 # a client's sends waiting for the main loop
 ROUTE_HOP_COST = 0.95                 # each hop of a suggested route scores this much less
 KAAS_MAX_ROUTES = 5                   # route suggestions per request
-KAAS_AIR_WINDOW_S = 600               # the airtime cap is a share of this rolling window
 KAAS_PING_S = 30                      # websocket ping this often; nothing heard for 3 of these closes the connection
 KAAS_STATS = ("rx", "tx", "err")      # per key: packets streamed to it, packets it sent (accepted), errors it got
 KAAS_STATS_SAVE_S = 300
@@ -7439,8 +7560,10 @@ class KaasConn:
 
     def run(self):
         """In the HTTP thread that upgraded: start the writer, then read until the connection ends."""
+        tokens, t_tok = float(KAAS_MSG_BURST), time.monotonic()
+        writer = threading.Thread(target=self._writer, name="kaas-w", daemon=True)
         try:
-            threading.Thread(target=self._writer, name="kaas-w", daemon=True).start()
+            writer.start()
             while not self.closed:
                 op, data = ws_read(self.rfile, KAAS_MAX_MESSAGE, on_control=self._control)
                 self.last_rx = time.monotonic()
@@ -7457,6 +7580,15 @@ class KaasConn:
                 if not isinstance(msg, dict):
                     self.send_json({"type": "error", "error": "not a JSON object"})
                     continue
+                now = time.monotonic()                      # (a token bucket: KAAS_MSG_RATE a second, KAAS_MSG_BURST deep)
+                tokens, t_tok = min(KAAS_MSG_BURST, tokens + (now - t_tok) * KAAS_MSG_RATE) - 1, now
+                if tokens < -KAAS_MSG_BURST:
+                    self.close(1008, "too many messages")
+                    break
+                if tokens < 0:
+                    self.send_json({"type": "error", "id": msg.get("id") if isinstance(msg.get("id"), (str, int)) else None,
+                                    "error": "too many messages: at most %d a second" % KAAS_MSG_RATE})
+                    continue
                 self.hub.on_message(self, msg)
         except ValueError as e:
             self.close(1002, str(e)[:100])
@@ -7465,6 +7597,8 @@ class KaasConn:
         finally:
             self.close()
             self.hub.drop(self)                             # (the writer drops it too: whichever ends first frees the slot)
+            if writer.is_alive() and writer is not threading.current_thread():
+                writer.join(2.0)                            # (its close frame goes out before the socket is closed)
 
     def _writer(self):
         last_ping = time.monotonic()
@@ -7512,7 +7646,6 @@ class KaasHub:
         self.conns = []                     # (replaced, never mutated: the main loop reads it without the lock)
         self.last_used = {}                 # key id -> time (this run; the config keeps the last connect)
         self.last_send = {}                 # key id -> deque of monotonic times of its rate-limited sends in the window
-        self.air = collections.deque()      # (monotonic, airtime ms) of clients' transmissions: the shared cap
         self.stats = dict(rx=0, tx=0, sent=0, local=0, dropped=0)
         self.next_check = 0.0
         self.tickets = {}                   # ticket -> (web login's pub hex, monotonic expiry): one websocket, once
@@ -7940,6 +8073,9 @@ class KaasHub:
         with self.lock:
             self.conns = [c for c in self.conns if c is not conn]
 
+    def web_sessions_from(self, ip):
+        return sum(1 for c in self.conns if c.web and c.ip == ip and not c.closed)
+
     def close_all(self):
         for c in self.conns:
             c.close(1001, "server shutting down")
@@ -7955,7 +8091,7 @@ class KaasHub:
                                 "pending_message": str(room.cfg.web_unknown_key_message or "")}
                                if key.get("web") else {})),
                 "send_burst": int(room.cfg.kaas_send_burst), "send_window_s": float(room.cfg.kaas_send_window_s),
-                "airtime_pct": float(room.cfg.kaas_airtime_pct),
+                "airtime_pct": room.air.rates()[1]["users"] * 100.0,   # (users' guaranteed share; more when it's quiet)
                 "radio": radio,
                 "giphy_key": (room.cfg.web_giphy_key or None) if key.get("web") else None,   # (Giphy keys are for browsers)
                 "motd": (str(room.cfg.web_motd).strip() or None) if key.get("web") and room.cfg.web_motd_enabled else None,
@@ -8502,7 +8638,7 @@ class KaasHub:
     def send(self, conn, raw, rid):
         """A client's packet: checked, rate-limited, offered to the nodes on this radio, then queued for the air at the
         lowest priority. ACKs and path returns (which usually carry an ACK) skip the per-key rate limit, since a bot must
-        answer what it's sent, but count toward the airtime cap."""
+        answer what it's sent. Airtime comes out of the users' share (see Airtime)."""
         with conn.cv:
             conn.inflight -= 1
 
@@ -8540,14 +8676,6 @@ class KaasHub:
         if not exempt and len(recent) >= burst:
             return result("dropped", reason="rate limit: %d packets per %g s per key (ACKs and paths excepted)" % (burst, window),
                           retry_after=round(max(recent[0] + window - now, 0.1), 1))
-        at = self.room.airtime_ms(len(raw))
-        while self.air and self.air[0][0] < now - KAAS_AIR_WINDOW_S:
-            self.air.popleft()
-        budget = float(self.room.cfg.kaas_airtime_pct or 0) / 100.0 * KAAS_AIR_WINDOW_S * 1000
-        if sum(a for _, a in self.air) + at > budget:
-            wait = (self.air[0][0] + KAAS_AIR_WINDOW_S - now) if self.air else KAAS_AIR_WINDOW_S
-            return result("dropped", reason="API airtime cap reached (%g%% of airtime)" % float(self.room.cfg.kaas_airtime_pct),
-                          retry_after=round(max(wait, 1.0), 1))
         if not exempt:
             recent.append(now)
         self.last_used[conn.key_id] = now_s()
@@ -8557,7 +8685,6 @@ class KaasHub:
         if self.room.offer(pkt, self) and (pkt.is_flood or pkt.hop_count == 0 or pkt.ptype == PT_TRACE):
             self.stats["local"] += 1
             return result("local")                          # only for a node on this radio: it never goes on the air
-        self.air.append((now, at))
         self.room.queue_tx(pkt, KAAS_PRIO, 0.0, deferrable=not exempt, src=self, tag=(conn, rid))
         result("queued")
 
@@ -8565,6 +8692,12 @@ class KaasHub:
         conn, rid = tag
         self.stats["sent"] += 1
         conn.send_json({"type": "send_result", "id": rid, "status": "sent"})
+
+    def dropped(self, tag, reason):
+        """A queued packet that never went out."""
+        conn, rid = tag
+        self.stats["dropped"] += 1
+        conn.send_json({"type": "send_result", "id": rid, "status": "dropped", "reason": reason})
 
     def periodic(self):
         """Close connections whose key was revoked or has expired; save the per-key stats now and then; the backlog."""
@@ -8669,6 +8802,8 @@ td.rcell .dir{flex:none}.mono4{font-family:ui-monospace,monospace}
 .mqrow input[type=checkbox]{transform:scale(1.2);margin-right:6px}.mqrow input[type=text],.mqrow input[type=password],.mqrow input[type=number],.mqrow select{width:auto;min-width:110px;padding:4px 6px;background:#0d1014;border:1px solid var(--line);border-radius:4px;color:var(--fg)}.mqnote{margin-top:10px;padding:8px 10px;border-left:3px solid var(--acc);background:#151a20;color:var(--dim);font-size:12px}
 .advrow{display:flex;gap:26px;align-items:center;flex-wrap:wrap}.adv{display:flex;gap:10px;align-items:center}
 .hdesc{color:var(--dim);font-weight:400;text-transform:none;letter-spacing:0;font-size:12px;margin-left:8px}.hdesc a{color:var(--acc)}.wbkey{font-family:ui-monospace,monospace}.wbacts{display:flex;flex-wrap:wrap;gap:4px;min-width:150px}.wbacts button{white-space:nowrap}.wbacts .wbwarn{color:var(--bad)}
+.airtab td{padding:3px 8px}.airtab input{width:4.5em;padding:4px 6px;background:#0d1014;border:1px solid var(--line);border-radius:4px;color:var(--fg)}.airbar{display:inline-block;width:160px;height:8px;background:var(--line);border-radius:4px;position:relative;vertical-align:middle;overflow:hidden}
+.airbar i{position:absolute;left:0;top:0;bottom:0;background:var(--acc)}.airbar b{position:absolute;top:0;bottom:0;width:2px;background:var(--fg);opacity:.6}
 .dlg{background:var(--card);color:var(--fg);border:1px solid var(--line);border-radius:8px;padding:14px 18px;min-width:min(420px,90vw)}
 .dlg::backdrop{background:rgb(0 0 0/.5)}.dlg h3{margin:0 0 10px;font-size:15px}.dlgrow{display:flex;gap:8px;align-items:center;margin:6px 0}
 .dlgbtns{display:flex;gap:8px;justify-content:flex-end;margin-top:12px}.dlg .wbwarn{color:var(--bad)}
@@ -8700,6 +8835,14 @@ Separate with commas. Type a name or id for suggestions.</div>
 <div id="loginerr" class="poor small"></div><div style="margin-top:10px;display:flex;gap:8px;justify-content:flex-end"><button onclick="closeLogin()">Cancel</button><button onclick="doLogin()">Log in</button></div></div></div>
 <main>
 <div class="card"><div class="kpis" id="kpis"></div></div>
+<div class="card" id="aircard" style="display:none"><h2>Airtime <span class="hdesc">how much this radio may transmit, and who gets it</span></h2>
+<div class="rprow"><label>Ceiling <input id="air_duty" type="number" min="1" max="100" step="1" style="width:4.5em">% of the time</label>
+<span class="dim small">everything this radio sends together, over about a minute (the rooms' ACKs and replies may go briefly over)</span></div>
+<table id="airtab" class="airtab"></table>
+<div class="rprow"><button onclick="airSave()">Save</button><span id="airmsg" class="small"></span></div>
+<div class="hint" style="margin-left:26px">Each class is guaranteed its share; when others leave theirs unused it may borrow, up to the ceiling.
+Packets over their share wait their turn; relays waiting over 20 s, and web or API packets over 2 minutes, are dropped.
+Shares adding up to more than the ceiling are scaled down to fit.</div></div>
 <div class="card" id="mqcard" style="display:none"><h2>MQTT augmentation <span class="hdesc">listen to the observer network as well as the radio</span></h2>
 <div class="mqrow"><label class="sw"><input type="checkbox" id="mq_en" onchange="mqSet({enabled:this.checked})"> <b>MQTT augmentation</b></label>
 <span id="mqstat" class="dim small"></span></div>
@@ -8725,7 +8868,7 @@ delivery scores or the push pace, and if the broker is unreachable the room carr
 <span class="dim small">unscoped floods are always relayed</span></div>
 <div class="rprow"><label>Position <input id="rp_lat" size="10" placeholder="room's"> , <input id="rp_lon" size="11" placeholder="room's"></label>
 <span class="dim small">lat, lon in degrees; blank = the room's (set it a little apart so map icons don't overlap)</span></div>
-<div class="rprow"><label>Airtime cap <input id="rp_air" type="number" min="1" max="100" step="1" style="width:4.5em">%</label>
+<div class="rprow"><label title="its guaranteed share of the airtime ceiling (see Airtime); it may borrow more when the channel is quiet">Guaranteed airtime <input id="rp_air" type="number" min="0" max="100" step="0.5" style="width:4.5em">%</label>
 <label>Loop detection <select id="rp_loop"><option>off</option><option>minimal</option><option>moderate</option><option>strict</option></select></label>
 <label>Adverts every <input id="rp_adv" type="number" min="0" max="1440" style="width:5em"> min</label>
 <label>flood every <input id="rp_fadv" type="number" min="0" max="168" style="width:4.5em"> h</label>
@@ -8771,8 +8914,8 @@ Tenant rooms share this radio, its map and its airtime; nothing a tenant does re
 <label>Expires <input id="kk_exp" type="date"></label><span class="dim small">(optional)</span>
 <button onclick="kkCreate(this)">Save</button><span id="kkmsg" class="small"></span></div>
 <div class="hint" style="margin-left:26px">Clients connect a websocket to <code id="kk_url"></code> with the header <code>Authorization: Bearer &lt;key&gt;</code>.
-Receive streams every packet this radio hears and sends. Send may send raw packets: <span id="kk_burst">3</span> per <span id="kk_win">20</span> s per key (ACKs and path returns excepted), all keys
-together within <span id="kk_air">5</span>% of airtime, after everything of the room's. Clients do their own MeshCore crypto: see docs/api.md and the Python client in client/.
+Receive streams every packet this radio hears and sends. Send may send raw packets: <span id="kk_burst">3</span> per <span id="kk_win">20</span> s per key (ACKs and path returns excepted), within the users' share
+of airtime (<span id="kk_air">10</span>% guaranteed, more when the channel is quiet: see Airtime), after everything of the room's. Clients do their own MeshCore crypto: see docs/api.md and the Python client in client/.
 A key is shown once, when it is made: only a hash of it is kept, so a lost key can't be recovered, only revoked and replaced.</div>
 <table id="kklist" style="margin-top:8px"></table></div>
 <div class="card" id="webcard" style="display:none"><h2>Web users <span class="hdesc">MeshCore Web: people log in by signing with their node's private key, which never leaves their browser &middot; <a href="meshcore-web/" target="_blank" rel="noopener">open MeshCore Web</a></span></h2>
@@ -8797,7 +8940,7 @@ A key is shown once, when it is made: only a hash of it is kept, so a lost key c
 <label title="Also keep what MQTT observers report (each packet is kept once, whether heard here or reported), and show it to web users as it comes"><input id="wb_bk_mqtt" type="checkbox" onchange="wbSettings({web_backlog_mqtt:this.checked})"> Include MQTT packets</label>
 <span class="dim small" id="wb_bk_state"></span></div>
 <div class="hint" style="margin-left:26px">Anyone can log in and read. A key may send once this radio has heard it advertise (or after you press Allow send):
-<span id="wb_burst">3</span> packets per <span id="wb_win">20</span> s each, within the API's shared airtime cap, and only as itself. A ban is by public key: a new key starts out unable to send.</div>
+<span id="wb_burst">3</span> packets per <span id="wb_win">20</span> s each, within the users' share of airtime, and only as itself. A ban is by public key: a new key starts out unable to send.</div>
 <table id="wblist" style="margin-top:8px"></table>
 <div class="rprow" style="margin-top:10px"><label>Ban a public key <input id="wb_banpub" class="mono" size="40" maxlength="64" placeholder="64 hex characters"></label>
 <button onclick="wbBanKey(this)">Ban</button><span id="wbbanmsg" class="small"></span></div>
@@ -8868,6 +9011,21 @@ async function rpSet(o){const r=await fetch("api/repeater",{method:"POST",header
  if(r.status===401){m="Your admin session has expired: log in again.";session()}
  $("rpmsg").className=r.ok?"good small":"poor small";$("rpmsg").textContent=r.ok?"saved":m;delete SIG.rpform;setTimeout(load,400);return r.ok}
 async function rpImportKey(){const k=$("rp_key").value.trim();if(!k)return;const ok=await rpSet({private_key:k});$("rp_key").value="";$("rpkeymsg").textContent=ok?"key imported; repeater remains disabled":"key was not imported"}
+const AIR_CLASSES=[["control","Control","the rooms' ACKs, replies and path returns"],["relay","Relays","the virtual repeater"],
+ ["room","Room","posts delivered to members"],["users","Users","web users, API keys and the virtual companion"],["background","Background","adverts and traces"]];
+function renderAir(A){if(!A||!A.share_pct)return;const f=document.activeElement,typing=f&&f.closest&&f.closest("#aircard")&&f.type==="number";
+ const scale=Math.max(A.ceiling_pct,A.total_pct,1),bar=(u,g)=>`<span class="airbar"><i style="width:${Math.min(100,100*u/scale)}%"></i><b style="left:${Math.min(100,100*g/scale)}%"></b></span>`;
+ if(!typing&&changed("airform",[A.ceiling_pct,JSON.stringify(A.share_pct)])){$("air_duty").value=A.ceiling_pct;
+  $("airtab").innerHTML="<tr><th>Class</th><th>Guaranteed</th><th>Used (last "+Math.round(A.window_s/60)+" min)</th><th></th></tr>"+AIR_CLASSES.map(([k,n,t])=>
+   `<tr><td title="${t}">${n} <span class="dim small">${t}</span></td><td><input type="number" min="0" max="100" step="0.5" id="air_${k}">%</td><td id="airu_${k}"></td><td id="aird_${k}" class="small"></td></tr>`).join("")+
+   `<tr><td><b>Total</b></td><td id="air_sum" class="dim small"></td><td id="airu_total"></td><td></td></tr>`;
+  for(const [k] of AIR_CLASSES)$("air_"+k).value=A.share_pct[k]}
+ for(const [k] of AIR_CLASSES){$("airu_"+k).innerHTML=bar(A.used_pct[k],A.share_pct[k])+` ${A.used_pct[k]}%`;const d=A.dropped[k];$("aird_"+k).innerHTML=d?`<span class="poor">${d} dropped</span>`:""}
+ $("airu_total").innerHTML=bar(A.total_pct,A.ceiling_pct)+` ${A.total_pct}% <span class="dim small">of ${A.ceiling_pct}%</span>`;
+ $("air_sum").textContent=Math.round(AIR_CLASSES.reduce((a,[k])=>a+A.share_pct[k],0)*10)/10+"%"}
+async function airSave(){const sh={};for(const [k] of AIR_CLASSES)sh[k]=+$("air_"+k).value;
+ const r=await fetch("api/airtime",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({duty_pct:+$("air_duty").value,share_pct:sh})});
+ let m="Saved";if(!r.ok){m="Could not save";try{m=(await r.json()).error||m}catch(e){}}$("airmsg").className=r.ok?"dim small":"poor small";$("airmsg").textContent=" "+m;setTimeout(load,500)}
 function rpSave(){rpSet({name:$("rp_name").value,lat:$("rp_lat").value.trim(),lon:$("rp_lon").value.trim(),scope_mode:$("rp_mode").value,regions:$("rp_regions").value,
  airtime_cap:+$("rp_air").value,loop_detect:$("rp_loop").value,advert_min:+$("rp_adv").value,flood_advert_h:+$("rp_fadv").value})}
 async function vcSet(o){const r=await fetch("api/companion",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(o)});
@@ -9035,7 +9193,7 @@ async function session(){try{const r=await (await fetch("api/session")).json();A
  MAINADM=ADMIN&&!TENANT;
  const was=$("chatcard").style.display!=="none";$("chatcard").style.display=ADMIN?"":"none";$("advcard").style.display=ADMIN?"":"none";$("observercard").style.display=MAINADM?"":"none";$("trafficcard").style.display=MAINADM?"":"none";$("welcomecard").style.display=MAINADM?"":"none";if(ADMIN&&!was)loadChat(true);if(MAINADM&&!WELCOME_LOADED)loadWelcome();if(!ADMIN)WELCOME_LOADED=false;
  $("mqcard").style.display=MAINADM?"":"none";
- $("rpcard").style.display=MAINADM?"":"none";
+ $("rpcard").style.display=MAINADM?"":"none";$("aircard").style.display=MAINADM?"":"none";
  $("vccard").style.display=MAINADM?"":"none";
  $("tncard").style.display=MAINADM?"":"none";if(MAINADM)loadTenants();
  $("kaascard").style.display=MAINADM?"":"none";if(MAINADM)loadKaas();$("webcard").style.display=MAINADM?"":"none";if(MAINADM)loadWeb();
@@ -9167,9 +9325,10 @@ async function load(){
   const rg=regionsOf(Mq.topics);$("mq_regions").value=rg||"";$("mqreg").className="dim small";$("mqreg").textContent=rg===null?"custom topic filters in use (below)":rg?"taking in only these regions":"every region";}
   $("mqstat").innerHTML=Mq.enabled?(Mq.connected?`connected to ${esc(Mq.host)} &middot; ${subStatus} &middot; MQTT packets received: ${Md.received||0}; accepted: ${Md.accepted||0} &middot; deliveries confirmed: ${Mq.acks} &middot; posts captured: ${Mq.posts} &middot; links: ${Mq.links} &middot; adverts: ${Mq.adverts} &middot; channel msgs: ${Mq.channel_msgs} &middot; wakes: ${Mq.wakes}`
    :`<span class="poor">not connected</span> ${esc(Mq.error||"(connecting...)")}`):"off"}
+ if(MAINADM)renderAir(st.airtime);
  const Rp=st.repeater||{};
  $("rrpt").innerHTML=Rp.enabled?`<span class="dim">Repeater</span> ${esc(Rp.name)} <span class="dim small">${esc(Rp.id||"")}</span> `+
-   (Rp.relay?`<span class="good">relaying</span> <span class="dim small">${Rp.per_min}/min &middot; ${Rp.airtime_used}% air (cap ${Rp.airtime_cap}%)</span>`:'<span class="mid">not relaying</span>')
+   (Rp.relay?`<span class="good">relaying</span> <span class="dim small">${Rp.per_min}/min &middot; ${Rp.airtime_used}% air (guaranteed ${Rp.airtime_cap}%)</span>`:'<span class="mid">not relaying</span>')
    :'<span class="dim">Repeater off</span>';
  if(ADMIN){$("rp_en").checked=!!Rp.enabled;$("rp_relay").checked=!!Rp.relay;$("rp_relay").disabled=!Rp.enabled;
   const f=document.activeElement,typing=f&&f.closest&&f.closest("#rpcard")&&f.tagName!=="BUTTON"&&f.type!=="checkbox";
@@ -9179,7 +9338,7 @@ async function load(){
   $("rpstat").innerHTML=Rp.enabled?`id ${esc(Rp.id)} &middot; key ${esc((Rp.key||"").slice(0,16))}&hellip;`:"off";
   $("rpcounts").innerHTML=Rp.enabled?`relayed: ${Rp.flood} flood, ${Rp.direct} direct, ${Rp.acks} ACKs, ${Rp.traces} traces &middot; discovery answers: ${Rp.discovery} &middot; `+
    `kept internal: ${Rp.internal} &middot; duplicates: ${Rp.dups} &middot; not relayed: ${Rp.drop_scope} scope, ${Rp.drop_hops} hop limit, ${Rp.drop_loop} loop, `+
-   `${Rp.drop_airtime} airtime cap, ${Rp.drop_queue} queue full${Rp.relay?"":`, ${Rp.drop_off} while off`} &middot; adverts: ${Rp.adverts}`:""}
+   `${Rp.drop_airtime} airtime, ${Rp.drop_queue} queue full${Rp.relay?"":`, ${Rp.drop_off} while off`} &middot; adverts: ${Rp.adverts}`:""}
  const Vc=st.companion||{};
  if(MAINADM){try{const r=await fetch("api/companion");if(r.ok)VCA=await r.json()}catch(e){}}
  $("rvc").innerHTML=Vc.enabled?`<span class="dim">Companion</span> ${esc(Vc.name)} `+(Vc.client?`<span class="good">app connected</span>`:Vc.listening?'<span class="dim small">no app connected</span>':'<span class="poor">port not open</span>'):"";
@@ -9336,6 +9495,7 @@ class WebUI:
         clock_ = threading.Lock()
         slots = threading.BoundedSemaphore(16)
         failures, flock = {}, threading.Lock()              # address -> recent failed logins (monotonic): see _locked_out
+        recent_by_ip = {}                                   # (what, address) -> recent requests (monotonic): see _ip_rate
         last_advert = [float("-inf")]
 
         files = {}                                          # path -> (mtime, raw, gzipped or None)
@@ -9445,6 +9605,32 @@ class WebUI:
                     except ValueError:
                         pass
                 return ip
+
+            def _ip_limited(self):
+                """The per-address limits are for visitors' addresses: not the LAN's, nor a proxy's that doesn't pass
+                on who it forwarded for (that would put everyone behind it under one limit)."""
+                try:
+                    a = ipaddress.ip_address(self._client_ip().replace("::ffff:", ""))
+                except ValueError:
+                    return True
+                return not (a.is_loopback or a.is_link_local or any(a in n for n in LAN_NETS))
+
+            def _ip_rate(self, what, limit, window=60.0):
+                """Count one request of this kind from this address: 0 if within limit a window, else seconds to wait."""
+                if not self._ip_limited():
+                    return 0
+                ip, now = self._client_ip(), time.monotonic()
+                with flock:
+                    q = recent_by_ip.setdefault((what, ip), collections.deque())
+                    while q and now - q[0] >= window:
+                        q.popleft()
+                    if len(q) >= limit:
+                        return max(1, int(q[0] + window - now + 1)) if q else int(window)
+                    q.append(now)
+                    if len(recent_by_ip) > 20000:           # (addresses gone quiet)
+                        for k in [k for k, d in recent_by_ip.items() if not d or now - d[-1] >= window]:
+                            del recent_by_ip[k]
+                return 0
 
             def _locked_out(self):
                 """Too many wrong passwords, keys or tickets from this address lately: 429, at once."""
@@ -9698,6 +9884,10 @@ class WebUI:
                                   "(Sec-WebSocket-Version: %r)" % self.headers.get("Sec-WebSocket-Version"))
                 if self._locked_out():
                     return
+                wait = self._ip_rate("ws", IP_WS_PER_MIN)
+                if wait:
+                    return refuse(429, "too many connections from your address: try again in %d s" % wait, "too_many",
+                                  "over %d websockets a minute from %s" % (IP_WS_PER_MIN, self._client_ip()))
                 if not slots.acquire(blocking=False):
                     return refuse(503, "busy", "busy", "too many requests at once")
                 try:
@@ -9716,6 +9906,9 @@ class WebUI:
                         return refuse(403, "this address is banned from this server", "refused", "a banned address")
                     conn = KaasConn(hub, self.connection, self.rfile, key, self.client_address[0])
                     conn.ip = self._client_ip()
+                    if conn.web and self._ip_limited() and hub.web_sessions_from(conn.ip) >= IP_WEB_SESSIONS:
+                        return refuse(429, "at most %d web sessions from one address: close another tab" % IP_WEB_SESSIONS,
+                                      "too_many", "%s has %d web sessions open" % (conn.ip, IP_WEB_SESSIONS))
                     if not hub.add(conn):
                         return refuse(503, "at most %d %s at once" % (
                             (int(cfg.web_max_clients), "web sessions") if conn.web else (KAAS_MAX_CLIENTS, "API clients")),
@@ -9820,6 +10013,11 @@ class WebUI:
                 if path.endswith("/challenge"):
                     if not cfg.web_login:
                         return self._send(403, '{"error":"web logins are off on this server"}', headers=cors)
+                    wait = self._ip_rate("login", IP_LOGINS_PER_MIN)
+                    if wait:
+                        return self._send(429, json.dumps({"error": "too many logins from your address: try again in "
+                                                                    "%d s" % wait, "retry_after": wait}),
+                                          headers=dict(cors, **{"Retry-After": str(wait)}))
                     ch = room.kaas.new_challenge()
                     if ch is None:
                         return self._send(503, '{"error":"too many logins at once: try again shortly"}', headers=cors)
@@ -9888,7 +10086,8 @@ class WebUI:
                     return self._send(200, json.dumps({"keys": hub.key_rows(), "path": KAAS_PATH, "max": KAAS_MAX_KEYS,
                                                        "send_burst": int(cfg.kaas_send_burst),
                                                        "send_window_s": float(cfg.kaas_send_window_s),
-                                                       "airtime_pct": float(cfg.kaas_airtime_pct), "stats": dict(hub.stats)}))
+                                                       "airtime_pct": room.air.rates()[1]["users"] * 100.0,
+                                                       "stats": dict(hub.stats)}))
                 if path.startswith("/static/"):
                     # files in data_dir/static (e.g. a local copy of Leaflet); Leaflet falls back to the CDN
                     root = os.path.realpath(os.path.join(cfg.data_dir, "static"))
@@ -10234,6 +10433,15 @@ class WebUI:
                         return self._send(400, '{"error":"nothing to change"}')
                     events.put(("mqtt_cfg", ch))                    # applied (and saved) by the main loop
                     return self._send(200, json.dumps({"ok": True, "changed": list(ch)}))
+                if parts == ["api", "airtime"]:
+                    try:
+                        ch = airtime_changes(json.loads(self._raw_body() or b"{}"))
+                    except ValueError as e:
+                        return self._send(400, json.dumps({"error": str(e) or "bad request"}))
+                    if not ch:
+                        return self._send(400, '{"error":"nothing to change"}')
+                    events.put(("air_cfg", ch))                     # applied (and saved) by the main loop
+                    return self._send(200, json.dumps({"ok": True, "changed": list(ch)}))
                 if parts == ["api", "repeater"]:
                     try:
                         body = json.loads(self._raw_body() or b"{}")
@@ -10454,6 +10662,10 @@ def main():
             for k, v in ev[1].items():
                 room.cfg.set(k, v)                          # saved to the config file, in place
             room.mqtt_apply(restart=reconnect)
+            room.web_dirty = True
+        elif kind == "air_cfg":
+            for k, v in ev[1].items():
+                room.cfg.set(k, v)
             room.web_dirty = True
         elif kind == "rpt_cfg":
             for k, v in ev[1].items():

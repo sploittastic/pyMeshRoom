@@ -396,7 +396,7 @@ If you already generated a matching private key for a vanity public key elsewher
 
 The RoomServer does not search for vanity keys and never exports a private key through the dashboard or status API. Preserve an encrypted offline backup of the private configuration before replacing a key. `repeater_relay` remains a separate relay kill switch: a repeater may advertise while forwarding is off.
 
-`repeater_relay` is an independent immediate relay kill switch. When false, the repeater may advertise but relays no packets. Configure its name, coordinates, scoped regions, advert intervals, airtime cap, and loop-detection mode through the admin dashboard. Keep it disabled until RF validation is explicitly planned.
+`repeater_relay` is an independent immediate relay kill switch. When false, the repeater may advertise but relays no packets. Configure its name, coordinates, scoped regions, advert intervals, guaranteed airtime, and loop-detection mode through the admin dashboard. Keep it disabled until RF validation is explicitly planned.
 
 ## Optional Virtual Companion
 
@@ -449,7 +449,9 @@ How it fits together:
   pyMeshRoom user). The web UI password is stored hashed.
 * Tenant rooms share the main room's map: heard repeaters, links and routes to repeaters, which only the main room
   learns (tenants don't run discovery or traces).
-* All rooms share one radio and its airtime: they take turns pushing posts, and messages between rooms, the virtual
+* All rooms share one radio and its airtime (one ceiling, 50% by default, with a guaranteed share for ACKs and
+  replies, relays, room pushes, users and adverts: see the dashboard's **Airtime** card and docs/api.md): they take
+  turns pushing posts, and messages between rooms, the virtual
   companion and the virtual repeater on this radio never go on the air.
 * Without any tenant rooms, nothing changes for an existing installation.
 
@@ -460,7 +462,7 @@ KaaS ("KISS radio as an API service") lets bots and other integrations use the r
 sends. A **Send** key can also send raw packets:
 
 * 3 in any 20 s per key (ACKs and path returns excepted)
-* within a 5% airtime cap shared by all keys
+* within the users' share of airtime, shared with web users: 10% guaranteed, more when the channel is quiet
 * at the lowest priority, after everything the room, its repeater and its pushes send
 
 Clients do all MeshCore crypto themselves. They can also ask the room what it has learned of the mesh: which

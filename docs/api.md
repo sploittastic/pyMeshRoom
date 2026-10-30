@@ -120,7 +120,7 @@ A web session may only send what a chat client needs, and only as itself:
 * channel messages and ACKs, which carry no sender identity in MeshCore;
 * nothing else: no traces, control or raw packets.
 
-It shares the API's rate limit (per key, so per web user) and the airtime cap. `hello` says it's a web login:
+It shares the API's rate limit (per key, so per web user) and the users' share of airtime. `hello` says it's a web login:
 `"key": {"id": "w:<pub>", "receive": true, "send": false, "expires": null, "web": true, "pub": "<64 hex>",
 "state": "pending"}`.
 
@@ -187,6 +187,10 @@ Failed handshakes return:
 * 429: too many failed attempts from this address (20 wrong passwords, keys or tickets in 10 minutes); it lifts as
   they age. Behind a proxy on a private address, the address counted is the one in `X-Forwarded-For`. The dashboard's
   POSTs answer the same way.
+* 429 also: more than 30 websockets a minute from one address, or a fifth web session open at once from one
+  address (`too_many` in `/api/v1/web/ticket`). These per-address limits, and 10 web login challenges a minute
+  (`/api/v1/web/challenge` answers 429 with `retry_after`), apply to visitors' addresses, not to the LAN
+  (10/8, 172.16/12, 192.168/16, fc00::/7, loopback) nor to a proxy that doesn't pass on `X-Forwarded-For`.
 * 426: not a websocket upgrade (a proxy may have dropped the `Upgrade` and `Connection` headers).
 * 503: too many clients. The limit is 16 connections across all API keys, and `web_max_clients` (32) web sessions on
   top of that.
@@ -211,7 +215,7 @@ Close codes from the server:
 ```json
 {"type": "hello", "api": 1, "server": "meshroom-py 4.9",
  "key": {"id": "3f2a9c1b", "receive": true, "send": true, "expires": null},
- "send_burst": 3, "send_window_s": 20, "airtime_pct": 5,
+ "send_burst": 3, "send_window_s": 20, "airtime_pct": 10,
  "radio": {"freq_hz": 910525000, "bw_hz": 62500, "sf": 7, "cr": 5},
  "nodes": {"room": "<64 hex>", "tenants": [], "repeater": null, "companion": null},
  "names": {"<64 hex>": "My Room"}}
@@ -248,7 +252,8 @@ arrive as tx packets.
 * `sent`: transmitted.
 * `local`: the packet was only for a node on this radio (a room here, for example). That node got it directly, and
   it never went on the air.
-* `dropped`: refused, with a `reason`. When waiting would help, `retry_after` says how many seconds.
+* `dropped`: refused, with a `reason`. When waiting would help, `retry_after` says how many seconds. A packet can
+  also be dropped after `queued`, if the airtime limits held it over 2 minutes (a busy channel).
 
 ```json
 {"type": "send_result", "id": 7, "status": "dropped",
@@ -399,13 +404,37 @@ observer, last heard it; name and position come from its newest signed advert. O
 
 Bad input gets `{"type": "error", "id": ..., "error": ...}`. Questions share the 4-at-a-time limit with sends.
 
+## Airtime
+
+Everything the radio sends shares one **ceiling**, `tx_duty_pct` (50% of the time), and each class of traffic has a
+**guaranteed share** of it. A class spends its own share first and borrows what the others leave unused, up to the
+ceiling, the way Linux's HTB does: alone on the air a class may use the whole ceiling, and when all are busy each
+still gets its share. Shares are token buckets holding a minute's worth, so short bursts go out at once.
+
+| Class | Setting | Default | What |
+|---|---|---|---|
+| Control | `tx_share_control_pct` | 10 | the rooms' ACKs, replies and path returns. These may go up to 10 s of airtime over the ceiling before they wait, since a late ACK is useless. |
+| Relays | `tx_share_relay_pct` | 15 | the virtual repeater. A relay held over 20 s is dropped. |
+| Room | `tx_share_room_pct` | 10 | posts pushed to room members |
+| Users | `tx_share_users_pct` | 10 | API keys, web users and the virtual companion. Held over 2 minutes: dropped, and the client is told. |
+| Background | `tx_share_background_pct` | 5 | adverts and traces |
+
+Shares adding up to more than the ceiling are scaled down to fit it. Within what the limits allow, packets still go in
+the room's order: its own ACKs and replies, then relays, then pushes, then API packets. The dashboard's **Airtime**
+card sets all of this and shows each class's use over the last 10 minutes; `POST /api/airtime` takes
+`{"duty_pct": 50, "share_pct": {"relay": 15, ...}}`. `repeater_airtime_pct` and `kaas_airtime_pct` from older versions
+are ignored.
+
 ## Sending rules
 
 * **3 packets in any 20 s per key** (`kaas_send_burst`, `kaas_send_window_s`), a rolling window, so a bot can send a
   short burst. ACKs and path returns are exempt: a bot has to answer
   what it receives, or room joins and DMs fail. Path returns usually carry an ACK.
-* **An airtime cap shared by every key**: 5% of airtime (`kaas_airtime_pct`) over a rolling 10 minutes. This one
-  includes ACKs.
+* **Airtime**: API keys, web users and the virtual companion share the **users' share** of the radio's airtime
+  (see [Airtime](#airtime)): 10% guaranteed, more when the channel is quiet, up to the 50% ceiling. ACKs count.
+  `airtime_pct` in `hello` is the guaranteed share. A packet held over 2 minutes is dropped.
+* **Messages**: a client may send 20 messages a second, in bursts of up to 40. Past that each gets an error; 40
+  beyond it, the connection is closed (1008).
 * **Lowest priority**: the room's ACKs and replies go first, then the virtual repeater's relays, then room pushes,
   then API packets. Packets other than ACKs and path returns also wait for a quiet moment on the channel, as room
   pushes do.
@@ -422,7 +451,6 @@ Bad input gets `{"type": "error", "id": ..., "error": ...}`. Questions share the
 | `kaas_keys` | `[]` | The keys, hashed. Managed from the dashboard. |
 | `kaas_send_burst` | 3 | Per key: at most this many packets... |
 | `kaas_send_window_s` | 20 | ...in any this many seconds. ACKs and path returns are excepted. |
-| `kaas_airtime_pct` | 5 | All API clients together: at most this share of airtime. |
 | `web_login` | false | MeshCore Web: people may log in by signing with their node's key. |
 | `web_max_clients` | 32 | Web sessions at once, apart from API keys' 16. |
 | `web_approved` | `[]` | Public keys (hex) allowed to send without being heard. Managed from the dashboard. |

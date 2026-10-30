@@ -89,7 +89,7 @@ class KeyAndFrameTests(unittest.TestCase):
 
 class SendTests(unittest.TestCase):
     def setUp(self):
-        self.h = Harness(kaas_send_burst=3, kaas_send_window_s=20, kaas_airtime_pct=5)
+        self.h = Harness(kaas_send_burst=3, kaas_send_window_s=20)
         self.hub = self.h.room.kaas
         _, self.key = self.hub.new_key(mr.kaas_key_spec({"receive": True, "send": True}))
         self.hub.event(("kaas_key_add", self.key))
@@ -120,11 +120,24 @@ class SendTests(unittest.TestCase):
             self.assertEqual(self.send(flood(mr.PT_ACK, os.urandom(4)))["status"], "queued")
         self.assertEqual(self.send(flood(mr.PT_PATH, os.urandom(40)))["status"], "queued")
 
-    def test_airtime_cap(self):
-        self.h.cfg.set("kaas_airtime_pct", 0.2)             # 1.2 s of every 10 minutes: 3 packets of 400 ms
-        got = [self.send(flood(mr.PT_ACK, os.urandom(4)))["status"] for _ in range(4)]
-        self.assertEqual(got, ["queued"] * 3 + ["dropped"])
-        self.assertIn("airtime", self.conn.results()[-1]["reason"])
+    def test_held_by_the_airtime_limits_too_long(self):
+        """Users' packets come out of their share of airtime; one that has to wait too long is dropped, and the
+        client is told."""
+        air = self.h.room.air
+        air.refill()
+        air.pool, air.own["users"] = -1e9, -1e9                  # (spent, for a long while)
+        old = dict(mr.TX_STALE_S)
+        mr.TX_STALE_S["users"] = 0.3
+        try:
+            self.assertEqual(self.send(flood(mr.PT_ACK, os.urandom(4)))["status"], "queued")
+            self.assertTrue(self.h.pump(lambda: self.conn.results()[-1]["status"] != "queued", 5))
+        finally:
+            mr.TX_STALE_S.update(old)
+        r = self.conn.results()[-1]
+        self.assertEqual(r["status"], "dropped")
+        self.assertIn("airtime", r["reason"])
+        self.assertEqual(air.dropped["users"], 1)
+        self.assertFalse(self.h.room.txq)
 
     def test_revoked_or_expired_key(self):
         self.hub.conns = [self.conn]

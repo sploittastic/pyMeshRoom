@@ -226,6 +226,64 @@ class HardeningTests(WebHelpers):
         self.assertTrue(self.h.pump(lambda: not hub.web_ip_banned("203.0.113.5"), 5))
         self.assertEqual(login_from("203.0.113.5", b), 200)
 
+    def xff_login(self, addr, ident=None):
+        """A web login through a proxy, for the visitor at addr: (status of the challenge or login, ticket)."""
+        ident, h = ident or kc.Identity.generate(), {"X-Forwarded-For": addr}
+        code, d = self.post("/api/v1/web/challenge", headers=h)
+        if code != 200:
+            return code, None
+        msg = mr.web_login_message(self.host, d["challenge"], ident.pub.hex())
+        code, d = self.post("/api/v1/web/login", dict(pub=ident.pub.hex(), signature=ident.sign(msg).hex(),
+                                                      challenge=d["challenge"], host=self.host, name="X"), h)
+        return code, d.get("ticket")
+
+    def test_logins_per_address(self):
+        """A visitor's address may ask for IP_LOGINS_PER_MIN logins a minute; the LAN isn't limited (nor a proxy
+        that doesn't say who it forwarded for)."""
+        self.enable()
+        codes = [self.xff_login("203.0.113.20")[0] for _ in range(mr.IP_LOGINS_PER_MIN + 1)]
+        self.assertEqual(codes, [200] * mr.IP_LOGINS_PER_MIN + [429])
+        self.assertEqual(self.xff_login("203.0.113.21")[0], 200)                 # someone else
+        self.assertEqual({self.xff_login("10.1.2.3")[0] for _ in range(mr.IP_LOGINS_PER_MIN + 2)}, {200})
+
+    def test_web_sessions_and_websockets_per_address(self):
+        self.enable()
+        addr, h = "203.0.113.30", {"X-Forwarded-For": "203.0.113.30"}
+        tickets = [self.xff_login(addr)[1] for _ in range(mr.IP_WEB_SESSIONS + 1)]
+        socks = [kc.ws.WebSocket.connect(self.url + "?ticket=" + t, h, 10) for t in tickets[:-1]]
+        with self.assertRaises(kc.ws.HandshakeError) as e:
+            kc.ws.WebSocket.connect(self.url + "?ticket=" + tickets[-1], h, 10)
+        self.assertEqual(e.exception.status, "429")
+        self.assertEqual(self.h.room.kaas.ticket_status(tickets[-1]), "too_many")
+        socks.pop().close()                                                         # one closes: room for another
+        self.assertTrue(self.h.pump(lambda: self.h.room.kaas.web_sessions_from(addr) < mr.IP_WEB_SESSIONS, 5))
+        socks.append(kc.ws.WebSocket.connect(self.url + "?ticket=" + self.xff_login("203.0.113.31")[1],
+                                             {"X-Forwarded-For": "203.0.113.31"}, 10))
+        for s in socks:
+            s.close()
+        old = mr.IP_WS_PER_MIN
+        mr.IP_WS_PER_MIN = 0                                                        # (every one counted so far is over)
+        try:
+            with self.assertRaises(kc.ws.HandshakeError) as e:
+                kc.ws.WebSocket.connect(self.url + "?ticket=x", {"X-Forwarded-For": "203.0.113.32"}, 10)
+            self.assertEqual(e.exception.status, "429")
+        finally:
+            mr.IP_WS_PER_MIN = old
+
+    def test_messages_per_connection(self):
+        """KAAS_MSG_RATE a second in bursts of KAAS_MSG_BURST: past that, an error each; far past it, disconnected."""
+        self.enable()
+        c = self.connect(self.login(kc.Identity.generate())[1]["ticket"])
+        for i in range(mr.KAAS_MSG_BURST * 3):
+            try:
+                c.ws.send_text(json.dumps({"type": "ping", "id": i}))
+            except OSError:
+                break
+        self.assertTrue(c.closed.wait(10))
+        self.assertEqual(c.close_reason.code, 1008)
+        self.assertIn("too many messages", json.dumps(c.msgs))
+        self.assertGreaterEqual(sum(1 for m in c.msgs if m.get("type") == "pong"), mr.KAAS_MSG_BURST - 2)
+
     def test_stats_of_forgotten_web_keys_are_pruned(self):
         hub = self.h.room.kaas
         hub.kstats[mr.WEB_ID_PREFIX + "ab" * 32] = {"total": [1, 0, 0], "hours": {}}

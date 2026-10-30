@@ -51,6 +51,7 @@ const TICKET_OUTCOMES = {
   bad_version: "the websocket reached pyMeshRoom in a version it doesn't speak (a proxy may be changing it)",
   busy: "the server was too busy",
   full: "all of this server's web sessions are in use",
+  too_many: "too many sessions or connections from your address: close another tab, or wait a minute",
   expired: "the login expired before the websocket opened",
   refused: "the server refused the session (web logins were turned off, or this key was banned)",
 };
