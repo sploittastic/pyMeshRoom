@@ -13,8 +13,8 @@ PKT_MS = 400
 
 
 def config(**kw):
-    c = dict(tx_duty_pct=50, tx_share_control_pct=10, tx_share_relay_pct=15, tx_share_room_pct=10,
-             tx_share_users_pct=10, tx_share_background_pct=5)
+    c = dict(tx_duty_pct=50, tx_weight_control=10, tx_weight_relay=15, tx_weight_room=10, tx_weight_web=5,
+             tx_weight_companion=2, tx_weight_kaas=3, tx_weight_background=5)
     c.update(kw)
     return SimpleNamespace(**c)
 
@@ -56,18 +56,18 @@ class AirtimeTests(unittest.TestCase):
 
     def test_when_all_are_busy_each_gets_its_share(self):
         air = mr.Airtime(config())
-        got = self.run_air(air, ["control", "relay", "room", "users", "background"], 3000)
+        got = self.run_air(air, list(mr.TX_CLASSES), 3000)
         self.assertLess(sum(got.values()), 0.53)
         for k, share in air.rates()[1].items():
             self.assertGreater(got[k], share * 0.9, k)
 
     def test_a_guarantee_holds_against_a_busy_borrower(self):
-        """Relays keep the channel busy; users who start later still get their 10%."""
+        """Relays keep the channel busy; web users who start later still get their 5%."""
         air = mr.Airtime(config())
         self.run_air(air, ["relay"], 600)
-        got = self.run_air(air, ["relay", "users"], 3000)              # (relays go first, as in the room)
-        self.assertGreater(got["users"], 0.095)
-        self.assertLess(got["relay"] + got["users"], 0.53)
+        got = self.run_air(air, ["relay", "web"], 3000)                # (relays go first, as in the room)
+        self.assertGreater(got["web"], 0.045)
+        self.assertLess(got["relay"] + got["web"], 0.53)
 
     def test_control_may_go_briefly_over(self):
         """ACKs are useless late: with the ceiling spent they still go, for a burst; then they wait too."""
@@ -84,18 +84,32 @@ class AirtimeTests(unittest.TestCase):
         got = self.run_air(air, ["control"], 3000)                      # kept up: no more than the ceiling
         self.assertLess(got["control"], 0.51)
 
-    def test_shares_beyond_the_ceiling_are_scaled_to_fit(self):
+    def test_weights_split_the_ceiling(self):
         ceiling, shares = mr.Airtime(config(tx_duty_pct=20)).rates()
         self.assertAlmostEqual(ceiling, 0.2)
         self.assertAlmostEqual(sum(shares.values()), 0.2)
-        self.assertAlmostEqual(shares["relay"], 0.06)
+        self.assertAlmostEqual(shares["relay"], 0.06)                   # 15 of 50
+        _, shares = mr.Airtime(config(tx_weight_control=1, tx_weight_relay=1, tx_weight_room=1, tx_weight_web=1,
+                                      tx_weight_companion=0, tx_weight_kaas=0, tx_weight_background=0)).rates()
+        self.assertAlmostEqual(shares["room"], 0.125)                   # any numbers: 1 of 4
+
+    def test_what_is_off_is_not_counted(self):
+        air = mr.Airtime(config(), off=lambda: ["relay", "companion"])
+        ceiling, shares = air.rates()
+        self.assertEqual((shares["relay"], shares["companion"]), (0.0, 0.0))
+        self.assertAlmostEqual(sum(shares.values()), 0.5)
+        self.assertAlmostEqual(shares["room"], 0.5 * 10 / 33)
+        st = air.state()
+        self.assertEqual(st["weight_total"], 33)
+        self.assertEqual(st["off"], ["companion", "relay"])
+        self.assertEqual(st["weight"]["relay"], 15)                     # (its setting is kept)
 
     def test_a_share_of_zero_only_borrows(self):
-        air = mr.Airtime(config(tx_share_users_pct=0))
-        got = self.run_air(air, ["users"], 1000)
-        self.assertGreater(got["users"], 0.45)
-        got = self.run_air(air, ["relay", "users"], 2000)
-        self.assertLess(got["users"], 0.05)
+        air = mr.Airtime(config(tx_weight_kaas=0))
+        got = self.run_air(air, ["kaas"], 1000)
+        self.assertGreater(got["kaas"], 0.45)
+        got = self.run_air(air, ["relay", "kaas"], 2000)
+        self.assertLess(got["kaas"], 0.05)
 
     def test_state(self):
         air = mr.Airtime(config())
@@ -109,17 +123,18 @@ class AirtimeTests(unittest.TestCase):
     def test_classes(self):
         p = mr.Packet(mr.PT_TXT_MSG, b"x" * 20)
         self.assertEqual(mr.tx_class(p, False, True, None, None), "relay")
-        self.assertEqual(mr.tx_class(p, True, False, object(), ("conn", 1)), "users")
-        self.assertEqual(mr.tx_class(p, False, False, "vc", None), "users")
+        self.assertEqual(mr.tx_class(p, True, False, object(), (SimpleNamespace(web=None), 1)), "kaas")
+        self.assertEqual(mr.tx_class(p, True, False, object(), (SimpleNamespace(web="ab" * 32), 1)), "web")
+        self.assertEqual(mr.tx_class(p, False, False, "vc", None), "companion")
         self.assertEqual(mr.tx_class(mr.Packet(mr.PT_ADVERT, b"x"), False, False, None, None), "background")
         self.assertEqual(mr.tx_class(p, True, False, None, None), "room")
         self.assertEqual(mr.tx_class(mr.Packet(mr.PT_ACK, b"x" * 4), False, False, None, None), "control")
 
     def test_settings(self):
-        self.assertEqual(mr.airtime_changes({"duty_pct": 40, "share_pct": {"relay": 20}}),
-                         {"tx_duty_pct": 40, "tx_share_relay_pct": 20})
-        for bad in ({"duty_pct": 0}, {"duty_pct": 101}, {"share_pct": {"relay": -1}}, {"share_pct": {"bots": 5}},
-                    {"duty_pct": "lots"}):
+        self.assertEqual(mr.airtime_changes({"duty_pct": 40, "weight": {"relay": 200, "web": 2.5}}),
+                         {"tx_duty_pct": 40, "tx_weight_relay": 200, "tx_weight_web": 2.5})
+        for bad in ({"duty_pct": 0}, {"duty_pct": 101}, {"weight": {"relay": -1}}, {"weight": {"users": 5}},
+                    {"duty_pct": "lots"}, {"weight": {"room": "x"}}):
             with self.assertRaises(ValueError):
                 mr.airtime_changes(bad)
 

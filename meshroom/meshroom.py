@@ -94,11 +94,13 @@ DEFAULT_CONFIG = {
     "radio_cr": 5,
     "radio_tx_power_dbm": None,     # None = leave the modem's default
     "tx_duty_pct": 50,              # airtime ceiling: all this radio sends together, % of the time (see Airtime)
-    "tx_share_control_pct": 10,     #   guaranteed shares of it: the rooms' ACKs, replies and path returns
-    "tx_share_relay_pct": 15,       #     the virtual repeater's relays
-    "tx_share_room_pct": 10,        #     room pushes (posts delivered to members)
-    "tx_share_users_pct": 10,       #     web users, API keys and the virtual companion
-    "tx_share_background_pct": 5,   #     adverts and traces
+    "tx_weight_control": 10,        #   weights: each class's guaranteed share of it is its weight over the sum of all
+    "tx_weight_relay": 15,          #   that are on. Control: ACKs, replies and path returns; relay: the virtual repeater
+    "tx_weight_room": 10,           #   (when on); room: message delivery to members (all rooms);
+    "tx_weight_web": 5,             #   web: MeshCore Web users;
+    "tx_weight_companion": 2,       #   companion: the virtual companion (when on);
+    "tx_weight_kaas": 3,            #   kaas: API clients;
+    "tx_weight_background": 5,      #   background: adverts and traces
     "route_halflife_h": 6,          # how fast route/member-location evidence fades (nodes move)
     "topology_halflife_h": 24,      # how fast the repeater map fades (repeaters rarely move)
     "routes_per_member": 6,         # proven routes kept per member
@@ -240,9 +242,10 @@ class RepeaterTable(dict):
                 del self[pub]
 
 
-TX_CLASSES = ("control", "relay", "room", "users", "background")
+TX_CLASSES = ("control", "relay", "room", "web", "companion", "kaas", "background")
 TX_BUCKET_S = 60                      # each share saves up at most this many seconds' worth, so a burst goes at once
-TX_STALE_S = {"relay": 20.0, "users": 120.0}   # held this long past due by the airtime limits: dropped (late is useless)
+TX_STALE_S = {"relay": 20.0, "web": 120.0, "companion": 120.0, "kaas": 120.0}   # held this long past due by the
+                                      # airtime limits: dropped (a late relay is useless)
 TX_USAGE_S = 600                      # airtime used, as the dashboard shows it: over the last 10 minutes
 TX_CONTROL_OVER_MS = 10000            # the rooms' ACKs and replies may go this far over the ceiling before they wait too
 
@@ -251,8 +254,10 @@ def tx_class(pkt, deferrable, relay, src, tag):
     """Which share of airtime a packet comes out of."""
     if relay:
         return "relay"
-    if tag is not None or src == "vc":
-        return "users"                                      # API keys, web users, the virtual companion
+    if src == "vc":
+        return "companion"
+    if tag is not None:                                     # (conn, request id) of a KaaS client
+        return "web" if getattr(tag[0], "web", None) else "kaas"
     if pkt.ptype in (PT_ADVERT, PT_TRACE):
         return "background"
     return "room" if deferrable else "control"
@@ -260,31 +265,33 @@ def tx_class(pkt, deferrable, relay, src, tag):
 
 class Airtime:
     """One ceiling for everything this radio sends (tx_duty_pct of the time), and a guaranteed share of it for each
-    class of traffic, like Linux's HTB: a class spends its own share first, then borrows what the others leave unused,
+    class of traffic, in proportion to its weight among the classes that are on (off() names those that aren't: the
+    virtual repeater or companion when disabled), like Linux's HTB: a class spends its own share first, then borrows what the others leave unused,
     up to the ceiling. So a class alone on the air may use the whole ceiling; when all are busy, each still gets its
     share. Token buckets in ms of airtime, refilled at their rates and holding TX_BUCKET_S worth. Sending always
     charges the ceiling's bucket (down to minus its depth); borrowing needs it positive. The rooms' ACKs and replies
     (control), useless late, may also go over the ceiling by up to TX_CONTROL_OVER_MS, a burst; only after that do
     they wait like the rest."""
 
-    def __init__(self, cfg):
-        self.cfg = cfg
+    def __init__(self, cfg, off=lambda: ()):
+        self.cfg, self.off = cfg, off
         self.t = self.start = time.monotonic()
         self.own = dict.fromkeys(TX_CLASSES)
         self.pool = None
         self.used = collections.deque()                     # (monotonic, class, ms), the last TX_USAGE_S
         self.dropped = dict.fromkeys(TX_CLASSES, 0)
 
+    def weights(self):
+        """{class: weight}, 0 for a class that's off."""
+        off = set(self.off())
+        return {k: 0.0 if k in off else max(0.0, float(getattr(self.cfg, "tx_weight_" + k, 0) or 0)) for k in TX_CLASSES}
+
     def rates(self):
-        """(ceiling, {class: guaranteed share}) as fractions of the time; shares adding up to more than the
-        ceiling are scaled down to fit it."""
-        c = self.cfg
-        ceiling = max(1.0, min(100.0, float(getattr(c, "tx_duty_pct", 50) or 0))) / 100.0
-        shares = {k: max(0.0, float(getattr(c, "tx_share_%s_pct" % k, 0) or 0)) / 100.0 for k in TX_CLASSES}
-        total = sum(shares.values())
-        if total > ceiling:
-            shares = {k: v * ceiling / total for k, v in shares.items()}
-        return ceiling, shares
+        """(ceiling, {class: guaranteed share}) as fractions of the time: the ceiling split by weight."""
+        ceiling = max(1.0, min(100.0, float(getattr(self.cfg, "tx_duty_pct", 50) or 0))) / 100.0
+        w = self.weights()
+        total = sum(w.values())
+        return ceiling, {k: ceiling * v / total if total else 0.0 for k, v in w.items()}
 
     def refill(self):
         now = time.monotonic()
@@ -324,7 +331,10 @@ class Airtime:
             if now - t <= TX_USAGE_S:
                 used[k] += ms
         r = lambda x: round(100.0 * x, 1)
+        w, off = self.weights(), set(self.off())
         return dict(ceiling_pct=r(ceiling), share_pct={k: r(v) for k, v in shares.items()},
+                    weight={k: getattr(self.cfg, "tx_weight_" + k, 0) for k in TX_CLASSES}, off=sorted(off),
+                    weight_total=round(sum(w.values()), 2),
                     used_pct={k: r(v / span) for k, v in used.items()}, total_pct=r(sum(used.values()) / span),
                     dropped=dict(self.dropped), window_s=int(span / 1000))
 
@@ -345,13 +355,19 @@ def airtime_changes(body):
         return int(v) if v == int(v) else v
     if "duty_pct" in body:
         ch["tx_duty_pct"] = pct(body["duty_pct"], "ceiling", 1)
-    shares = body.get("share_pct") or {}
-    if not isinstance(shares, dict):
+    weights = body.get("weight") or {}
+    if not isinstance(weights, dict):
         raise ValueError("bad request")
-    for k, v in shares.items():
+    for k, v in weights.items():
         if k not in TX_CLASSES:
             raise ValueError("unknown class %r" % k)
-        ch["tx_share_%s_pct" % k] = pct(v, k, 0)
+        try:
+            v = float(v)
+        except (TypeError, ValueError):
+            raise ValueError("%s: not a number" % k)
+        if not 0 <= v <= 10000:
+            raise ValueError("%s: a weight of 0 to 10000" % k)
+        ch["tx_weight_" + k] = int(v) if v == int(v) else v
     return ch
 
 
@@ -360,7 +376,9 @@ def valid_iata(code):
     return isinstance(code, str) and len(code) == 3 and code.isascii() and code.isalpha() and code.isupper()
 
 
-RETIRED_SETTINGS = {"web_trust_observers", "repeater_airtime_pct", "kaas_airtime_pct"}   # settings older versions had: ignored quietly
+# settings older versions had: ignored quietly
+RETIRED_SETTINGS = {"web_trust_observers", "repeater_airtime_pct", "kaas_airtime_pct", "tx_share_control_pct",
+                    "tx_share_relay_pct", "tx_share_room_pct", "tx_share_users_pct", "tx_share_background_pct"}
 
 
 class Config:
@@ -1203,11 +1221,11 @@ def repeater_changes(body):
             if len(r) > 30 or r.startswith("$") or not all(c in "-$#" or "0" <= c <= "9" or c >= "A" for c in r):
                 raise ValueError("region %r: letters, digits and - only (private $ regions aren't supported)" % r)
         ch["repeater_regions"] = regs
-    if "airtime_cap" in body:                               # (its guaranteed share of the airtime ceiling)
+    if "airtime_cap" in body:                               # (its airtime weight: see Airtime)
         v = num("airtime_cap")
-        if not 0 <= v <= 100:
-            raise ValueError("guaranteed airtime: 0 to 100 %")
-        ch["tx_share_relay_pct"] = v
+        if not 0 <= v <= 10000:
+            raise ValueError("airtime weight: 0 to 10000")
+        ch["tx_weight_relay"] = v
     if "loop_detect" in body:
         if body["loop_detect"] not in ("off", "minimal", "moderate", "strict"):
             raise ValueError("loop detection: off, minimal, moderate or strict")
@@ -1432,7 +1450,8 @@ class RoomServer:
         self.neighbours = {}              # pubkey -> dict(advert_ts, heard, snr4, name)
         self.seen = {}                    # packet hash -> None (insertion ordered)
         self.txq = []                     # heap (due, prio, seq, raw, ptype, is_flood, deferrable, relay, tag, class)
-        self.air = Airtime(cfg)
+        self.air = Airtime(cfg, lambda: [k for k, node in (("relay", getattr(self, "vr", None)),
+                                                            ("companion", getattr(self, "vc", None))) if node is None])
         self.txseq = 0
         self.tx_busy_until = 0.0
         self.next_push = 0.0
@@ -1677,7 +1696,7 @@ class RoomServer:
         # pushes aren't urgent: they wait for a quiet gap (floods arrive as bursts of rebroadcasts);
         # ACKs and replies go straight out. The modem's own CSMA still guards the instant of transmit.
         late = [e for e in self.txq if e[9] in TX_STALE_S and now - e[0] > TX_STALE_S[e[9]]]
-        if late:                                            # relays and users' packets the airtime limits held too long
+        if late:                                            # relays and clients' packets the airtime limits held too long
             self.txq[:] = [e for e in self.txq if e not in late]
             heapq.heapify(self.txq)
             for e in late:
@@ -3425,7 +3444,7 @@ class RoomServer:
         c = self.cfg
         out = dict(enabled=self.vr is not None, relay=bool(c.repeater_relay), name=c.repeater_name, lat=float(c.repeater_lat or 0), lon=float(c.repeater_lon or 0),
                    scope_mode=c.repeater_scope_mode, regions=list(c.repeater_regions or []),
-                   airtime_cap=c.tx_share_relay_pct, loop_detect=c.repeater_loop_detect,
+                   airtime_cap=c.tx_weight_relay, loop_detect=c.repeater_loop_detect,
                    advert_min=c.repeater_advert_interval_min, flood_advert_h=c.repeater_flood_advert_interval_h)
         if self.vr is not None:
             out.update(self.vr.state(), key=hexs(self.vr.pub), id=hexs(self.vr.pub[:2]))
@@ -8092,7 +8111,8 @@ class KaasHub:
                                 "pending_message": str(room.cfg.web_unknown_key_message or "")}
                                if key.get("web") else {})),
                 "send_burst": int(room.cfg.kaas_send_burst), "send_window_s": float(room.cfg.kaas_send_window_s),
-                "airtime_pct": room.air.rates()[1]["users"] * 100.0,   # (users' guaranteed share; more when it's quiet)
+                "airtime_pct": room.air.rates()[1]["web" if key.get("web") else "kaas"] * 100.0,   # (its class's
+                                                                                   # guaranteed share; more when quiet)
                 "radio": radio,
                 "giphy_key": (room.cfg.web_giphy_key or None) if key.get("web") else None,   # (Giphy keys are for browsers)
                 "motd": (str(room.cfg.web_motd).strip() or None) if key.get("web") and room.cfg.web_motd_enabled else None,
@@ -8639,7 +8659,7 @@ class KaasHub:
     def send(self, conn, raw, rid):
         """A client's packet: checked, rate-limited, offered to the nodes on this radio, then queued for the air at the
         lowest priority. ACKs and path returns (which usually carry an ACK) skip the per-key rate limit, since a bot must
-        answer what it's sent. Airtime comes out of the users' share (see Airtime)."""
+        answer what it's sent. Airtime comes out of the web users' or API clients' share (see Airtime)."""
         with conn.cv:
             conn.inflight -= 1
 
@@ -8838,14 +8858,14 @@ Separate with commas. Type a name or id for suggestions.</div>
 <div id="loginerr" class="poor small"></div><div style="margin-top:10px;display:flex;gap:8px;justify-content:flex-end"><button onclick="closeLogin()">Cancel</button><button onclick="doLogin()">Log in</button></div></div></div>
 <main>
 <div class="card"><div class="kpis" id="kpis"></div></div>
-<div class="card" id="aircard" style="display:none"><h2>Airtime <span class="hdesc">how much this radio may transmit, and who gets it</span></h2>
-<div class="rprow"><label>Ceiling <input id="air_duty" type="number" min="1" max="100" step="1" style="width:4.5em">% of the time</label>
-<span class="dim small">everything this radio sends together, over about a minute (the rooms' ACKs and replies may go briefly over)</span></div>
+<div class="card" id="aircard" style="display:none"><h2>Airtime <span class="hdesc">Max transmit duty cycle</span></h2>
+<div class="rprow"><label>Max duty cycle <input id="air_duty" type="number" min="1" max="100" step="1" style="width:4.5em" oninput="airSum()">% of the time</label>
+<span class="dim small">everything this radio sends together, over about a minute (ACKs and replies may go briefly over)</span></div>
 <table id="airtab" class="airtab"></table>
 <div class="rprow"><button onclick="airSave()">Save</button><span id="airmsg" class="small"></span></div>
-<div class="hint" style="margin-left:26px">Each class is guaranteed its share; when others leave theirs unused it may borrow, up to the ceiling.
-Packets over their share wait their turn; relays waiting over 20 s, and web or API packets over 2 minutes, are dropped.
-Shares adding up to more than the ceiling are scaled down to fit.</div></div>
+<div class="hint" style="margin-left:26px">Weights are any numbers: each class is guaranteed its weight's part of the max duty cycle
+(weight &divide; total), and may borrow what others leave unused, up to the max. The virtual repeater and companion don't count while they're off.
+Packets over their share wait their turn; relays waiting over 20 s, and web, companion or API packets over 2 minutes, are dropped.</div></div>
 <div class="card" id="mqcard" style="display:none"><h2>MQTT augmentation <span class="hdesc">listen to the observer network as well as the radio</span></h2>
 <div class="mqrow"><label class="sw"><input type="checkbox" id="mq_en" onchange="mqSet({enabled:this.checked})"> <b>MQTT augmentation</b></label>
 <span id="mqstat" class="dim small"></span></div>
@@ -8871,7 +8891,7 @@ delivery scores or the push pace, and if the broker is unreachable the room carr
 <span class="dim small">unscoped floods are always relayed</span></div>
 <div class="rprow"><label>Position <input id="rp_lat" size="10" placeholder="room's"> , <input id="rp_lon" size="11" placeholder="room's"></label>
 <span class="dim small">lat, lon in degrees; blank = the room's (set it a little apart so map icons don't overlap)</span></div>
-<div class="rprow"><label title="its guaranteed share of the airtime ceiling (see Airtime); it may borrow more when the channel is quiet">Guaranteed airtime <input id="rp_air" type="number" min="0" max="100" step="0.5" style="width:4.5em">%</label>
+<div class="rprow"><label title="its weight on the Airtime card: its guaranteed part of the max duty cycle; it may borrow more when the channel is quiet">Airtime weight <input id="rp_air" type="number" min="0" max="10000" step="1" style="width:4.5em"></label>
 <label>Loop detection <select id="rp_loop"><option>off</option><option>minimal</option><option>moderate</option><option>strict</option></select></label>
 <label>Adverts every <input id="rp_adv" type="number" min="0" max="1440" style="width:5em"> min</label>
 <label>flood every <input id="rp_fadv" type="number" min="0" max="168" style="width:4.5em"> h</label>
@@ -8917,7 +8937,7 @@ Tenant rooms share this radio, its map and its airtime; nothing a tenant does re
 <label>Expires <input id="kk_exp" type="date"></label><span class="dim small">(optional)</span>
 <button onclick="kkCreate(this)">Save</button><span id="kkmsg" class="small"></span></div>
 <div class="hint" style="margin-left:26px">Clients connect a websocket to <code id="kk_url"></code> with the header <code>Authorization: Bearer &lt;key&gt;</code>.
-Receive streams every packet this radio hears and sends. Send may send raw packets: <span id="kk_burst">3</span> per <span id="kk_win">20</span> s per key (ACKs and path returns excepted), within the users' share
+Receive streams every packet this radio hears and sends. Send may send raw packets: <span id="kk_burst">3</span> per <span id="kk_win">20</span> s per key (ACKs and path returns excepted), within the API clients' share
 of airtime (<span id="kk_air">10</span>% guaranteed, more when the channel is quiet: see Airtime), after everything of the room's. Clients do their own MeshCore crypto: see docs/api.md and the Python client in client/.
 A key is shown once, when it is made: only a hash of it is kept, so a lost key can't be recovered, only revoked and replaced.</div>
 <table id="kklist" style="margin-top:8px"></table></div>
@@ -8943,7 +8963,7 @@ A key is shown once, when it is made: only a hash of it is kept, so a lost key c
 <label title="Also keep what MQTT observers report (each packet is kept once, whether heard here or reported), and show it to web users as it comes"><input id="wb_bk_mqtt" type="checkbox" onchange="wbSettings({web_backlog_mqtt:this.checked})"> Include MQTT packets</label>
 <span class="dim small" id="wb_bk_state"></span></div>
 <div class="hint" style="margin-left:26px">Anyone can log in and read. A key may send once this radio has heard it advertise (or after you press Allow send):
-<span id="wb_burst">3</span> packets per <span id="wb_win">20</span> s each, within the users' share of airtime, and only as itself. A ban is by public key: a new key starts out unable to send.</div>
+<span id="wb_burst">3</span> packets per <span id="wb_win">20</span> s each, within the web users' share of airtime, and only as itself. A ban is by public key: a new key starts out unable to send.</div>
 <table id="wblist" style="margin-top:8px"></table>
 <div class="rprow" style="margin-top:10px"><label>Ban a public key <input id="wb_banpub" class="mono" size="40" maxlength="64" placeholder="64 hex characters"></label>
 <button onclick="wbBanKey(this)">Ban</button><span id="wbbanmsg" class="small"></span></div>
@@ -9014,20 +9034,25 @@ async function rpSet(o){const r=await fetch("api/repeater",{method:"POST",header
  if(r.status===401){m="Your admin session has expired: log in again.";session()}
  $("rpmsg").className=r.ok?"good small":"poor small";$("rpmsg").textContent=r.ok?"saved":m;delete SIG.rpform;setTimeout(load,400);return r.ok}
 async function rpImportKey(){const k=$("rp_key").value.trim();if(!k)return;const ok=await rpSet({private_key:k});$("rp_key").value="";$("rpkeymsg").textContent=ok?"key imported; repeater remains disabled":"key was not imported"}
-const AIR_CLASSES=[["control","Control","the rooms' ACKs, replies and path returns"],["relay","Relays","the virtual repeater"],
- ["room","Room","posts delivered to members"],["users","Users","web users, API keys and the virtual companion"],["background","Background","adverts and traces"]];
-function renderAir(A){if(!A||!A.share_pct)return;const f=document.activeElement,typing=f&&f.closest&&f.closest("#aircard")&&f.type==="number";
+const AIR_CLASSES=[["control","Control","ACKs, replies, and path returns"],["relay","Relays","virtual repeater transmit (when enabled)"],
+ ["room","Room","message delivery to members (all rooms)"],["web","Web users","users connected to web client"],
+ ["companion","Virtual companion","packets sent by virtual companion (when enabled)"],["kaas","KaaS","API clients"],["background","Background","adverts and traces"]];
+function renderAir(A){if(!A||!A.weight)return;const off=AIR_OFF=new Set(A.off||[]);const f=document.activeElement,typing=f&&f.closest&&f.closest("#aircard")&&f.type==="number";
  const scale=Math.max(A.ceiling_pct,A.total_pct,1),bar=(u,g)=>`<span class="airbar"><i style="width:${Math.min(100,100*u/scale)}%"></i><b style="left:${Math.min(100,100*g/scale)}%"></b></span>`;
- if(!typing&&changed("airform",[A.ceiling_pct,JSON.stringify(A.share_pct)])){$("air_duty").value=A.ceiling_pct;
-  $("airtab").innerHTML="<tr><th>Class</th><th>Guaranteed</th><th>Used (last "+Math.round(A.window_s/60)+" min)</th><th></th></tr>"+AIR_CLASSES.map(([k,n,t])=>
-   `<tr><td title="${t}">${n} <span class="dim small">${t}</span></td><td><input type="number" min="0" max="100" step="0.5" id="air_${k}">%</td><td id="airu_${k}"></td><td id="aird_${k}" class="small"></td></tr>`).join("")+
-   `<tr><td><b>Total</b></td><td id="air_sum" class="dim small"></td><td id="airu_total"></td><td></td></tr>`;
-  for(const [k] of AIR_CLASSES)$("air_"+k).value=A.share_pct[k]}
- for(const [k] of AIR_CLASSES){$("airu_"+k).innerHTML=bar(A.used_pct[k],A.share_pct[k])+` ${A.used_pct[k]}%`;const d=A.dropped[k];$("aird_"+k).innerHTML=d?`<span class="poor">${d} dropped</span>`:""}
- $("airu_total").innerHTML=bar(A.total_pct,A.ceiling_pct)+` ${A.total_pct}% <span class="dim small">of ${A.ceiling_pct}%</span>`;
- $("air_sum").textContent=Math.round(AIR_CLASSES.reduce((a,[k])=>a+A.share_pct[k],0)*10)/10+"%"}
-async function airSave(){const sh={};for(const [k] of AIR_CLASSES)sh[k]=+$("air_"+k).value;
- const r=await fetch("api/airtime",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({duty_pct:+$("air_duty").value,share_pct:sh})});
+ if(!typing&&changed("airform",[A.ceiling_pct,JSON.stringify(A.weight),A.off])){$("air_duty").value=A.ceiling_pct;
+  $("airtab").innerHTML="<tr><th>Class</th><th>Weight</th><th>Guaranteed</th><th>Used (last "+Math.round(A.window_s/60)+" min)</th><th></th></tr>"+AIR_CLASSES.map(([k,n,t])=>
+   `<tr${off.has(k)?' class="dim"':""}><td title="${t}">${n} <span class="dim small">${t}</span></td><td><input type="number" min="0" max="10000" step="1" id="air_${k}" oninput="airSum()"></td>`+
+   `<td id="airg_${k}" class="small"></td><td id="airu_${k}"></td><td id="aird_${k}" class="small"></td></tr>`).join("")+
+   `<tr><td><b>Total</b></td><td id="air_sum"></td><td class="small">${A.ceiling_pct}%</td><td id="airu_total"></td><td></td></tr>`;
+  for(const [k] of AIR_CLASSES)$("air_"+k).value=A.weight[k];airSum()}
+ for(const [k] of AIR_CLASSES){$("airu_"+k).innerHTML=off.has(k)?"":bar(A.used_pct[k],A.share_pct[k])+` ${A.used_pct[k]}%`;const d=A.dropped[k];$("aird_"+k).innerHTML=d?`<span class="poor">${d} dropped</span>`:""}
+ $("airu_total").innerHTML=bar(A.total_pct,A.ceiling_pct)+` ${A.total_pct}% <span class="dim small">of ${A.ceiling_pct}%</span>`}
+let AIR_OFF=new Set();
+function airSum(){const w=k=>Math.max(0,+$("air_"+k).value||0),tot=AIR_CLASSES.reduce((a,[k])=>a+(AIR_OFF.has(k)?0:w(k)),0),max=+$("air_duty").value||0;
+ $("air_sum").textContent=Math.round(tot*100)/100;
+ for(const [k] of AIR_CLASSES)$("airg_"+k).innerHTML=AIR_OFF.has(k)?'<span class="dim">off: not counted</span>':tot?Math.round(max*w(k)/tot*10)/10+"%":"0%"}
+async function airSave(){const wt={};for(const [k] of AIR_CLASSES)wt[k]=+$("air_"+k).value;
+ const r=await fetch("api/airtime",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({duty_pct:+$("air_duty").value,weight:wt})});
  let m="Saved";if(!r.ok){m="Could not save";try{m=(await r.json()).error||m}catch(e){}}$("airmsg").className=r.ok?"dim small":"poor small";$("airmsg").textContent=" "+m;setTimeout(load,500)}
 function rpSave(){rpSet({name:$("rp_name").value,lat:$("rp_lat").value.trim(),lon:$("rp_lon").value.trim(),scope_mode:$("rp_mode").value,regions:$("rp_regions").value,
  airtime_cap:+$("rp_air").value,loop_detect:$("rp_loop").value,advert_min:+$("rp_adv").value,flood_advert_h:+$("rp_fadv").value})}
@@ -9331,7 +9356,7 @@ async function load(){
  if(MAINADM)renderAir(st.airtime);
  const Rp=st.repeater||{};
  $("rrpt").innerHTML=Rp.enabled?`<span class="dim">Repeater</span> ${esc(Rp.name)} <span class="dim small">${esc(Rp.id||"")}</span> `+
-   (Rp.relay?`<span class="good">relaying</span> <span class="dim small">${Rp.per_min}/min &middot; ${Rp.airtime_used}% air (guaranteed ${Rp.airtime_cap}%)</span>`:'<span class="mid">not relaying</span>')
+   (Rp.relay?`<span class="good">relaying</span> <span class="dim small">${Rp.per_min}/min &middot; ${Rp.airtime_used}% air (airtime weight ${Rp.airtime_cap})</span>`:'<span class="mid">not relaying</span>')
    :'<span class="dim">Repeater off</span>';
  if(ADMIN){$("rp_en").checked=!!Rp.enabled;$("rp_relay").checked=!!Rp.relay;$("rp_relay").disabled=!Rp.enabled;
   const f=document.activeElement,typing=f&&f.closest&&f.closest("#rpcard")&&f.tagName!=="BUTTON"&&f.type!=="checkbox";
@@ -10089,7 +10114,7 @@ class WebUI:
                     return self._send(200, json.dumps({"keys": hub.key_rows(), "path": KAAS_PATH, "max": KAAS_MAX_KEYS,
                                                        "send_burst": int(cfg.kaas_send_burst),
                                                        "send_window_s": float(cfg.kaas_send_window_s),
-                                                       "airtime_pct": room.air.rates()[1]["users"] * 100.0,
+                                                       "airtime_pct": room.air.rates()[1]["kaas"] * 100.0,
                                                        "stats": dict(hub.stats)}))
                 if path.startswith("/static/"):
                     # files in data_dir/static (e.g. a local copy of Leaflet); Leaflet falls back to the CDN

@@ -120,7 +120,7 @@ A web session may only send what a chat client needs, and only as itself:
 * channel messages and ACKs, which carry no sender identity in MeshCore;
 * nothing else: no traces, control or raw packets.
 
-It shares the API's rate limit (per key, so per web user) and the users' share of airtime. `hello` says it's a web login:
+It shares the API's rate limit (per key, so per web user) and the web users' share of airtime. `hello` says it's a web login:
 `"key": {"id": "w:<pub>", "receive": true, "send": false, "expires": null, "web": true, "pub": "<64 hex>",
 "state": "pending"}`.
 
@@ -406,33 +406,38 @@ Bad input gets `{"type": "error", "id": ..., "error": ...}`. Questions share the
 
 ## Airtime
 
-Everything the radio sends shares one **ceiling**, `tx_duty_pct` (50% of the time), and each class of traffic has a
-**guaranteed share** of it. A class spends its own share first and borrows what the others leave unused, up to the
-ceiling, the way Linux's HTB does: alone on the air a class may use the whole ceiling, and when all are busy each
-still gets its share. Shares are token buckets holding a minute's worth, so short bursts go out at once.
+Everything the radio sends shares one **max transmit duty cycle**, `tx_duty_pct` (50% of the time). Each class of
+traffic has a **weight**, any number; its **guaranteed share** is its weight divided by the total of the weights of
+the classes that are on, times the max duty cycle. The virtual repeater and companion don't count while they're off.
+A class spends its own share first and borrows what the others leave unused, up to the max, the way Linux's HTB
+does: alone on the air a class may use the whole max, and when all are busy each still gets its share. Shares are
+token buckets holding a minute's worth, so short bursts go out at once.
 
-| Class | Setting | Default | What |
+| Class | Setting | Default weight | What |
 |---|---|---|---|
-| Control | `tx_share_control_pct` | 10 | the rooms' ACKs, replies and path returns. These may go up to 10 s of airtime over the ceiling before they wait, since a late ACK is useless. |
-| Relays | `tx_share_relay_pct` | 15 | the virtual repeater. A relay held over 20 s is dropped. |
-| Room | `tx_share_room_pct` | 10 | posts pushed to room members |
-| Users | `tx_share_users_pct` | 10 | API keys, web users and the virtual companion. Held over 2 minutes: dropped, and the client is told. |
-| Background | `tx_share_background_pct` | 5 | adverts and traces |
+| Control | `tx_weight_control` | 10 | ACKs, replies, and path returns. These may go up to 10 s of airtime over the max before they wait, since a late ACK is useless. |
+| Relays | `tx_weight_relay` | 15 | virtual repeater transmit (when enabled). A relay held over 20 s is dropped. |
+| Room | `tx_weight_room` | 10 | message delivery to members (all rooms) |
+| Web users | `tx_weight_web` | 5 | users connected to the web client |
+| Virtual companion | `tx_weight_companion` | 2 | packets sent by the virtual companion (when enabled) |
+| KaaS | `tx_weight_kaas` | 3 | API clients |
+| Background | `tx_weight_background` | 5 | adverts and traces |
 
-Shares adding up to more than the ceiling are scaled down to fit it. Within what the limits allow, packets still go in
-the room's order: its own ACKs and replies, then relays, then pushes, then API packets. The dashboard's **Airtime**
-card sets all of this and shows each class's use over the last 10 minutes; `POST /api/airtime` takes
-`{"duty_pct": 50, "share_pct": {"relay": 15, ...}}`. `repeater_airtime_pct` and `kaas_airtime_pct` from older versions
-are ignored.
+With the defaults and everything on, the weights total 50, so each weight is that many percent. Web, companion and
+API packets held over 2 minutes are dropped, and the client is told. Within what the limits allow, packets still go
+in the room's order: its own ACKs and replies, then relays, then pushes, then API packets. The dashboard's
+**Airtime** card sets all of this and shows each class's guaranteed share and its use over the last 10 minutes;
+`POST /api/airtime` takes `{"duty_pct": 50, "weight": {"relay": 15, ...}}`. `repeater_airtime_pct`,
+`kaas_airtime_pct` and `tx_share_*_pct` from older versions are ignored.
 
 ## Sending rules
 
 * **3 packets in any 20 s per key** (`kaas_send_burst`, `kaas_send_window_s`), a rolling window, so a bot can send a
   short burst. ACKs and path returns are exempt: a bot has to answer
   what it receives, or room joins and DMs fail. Path returns usually carry an ACK.
-* **Airtime**: API keys, web users and the virtual companion share the **users' share** of the radio's airtime
-  (see [Airtime](#airtime)): 10% guaranteed, more when the channel is quiet, up to the 50% ceiling. ACKs count.
-  `airtime_pct` in `hello` is the guaranteed share. A packet held over 2 minutes is dropped.
+* **Airtime**: API keys share the **KaaS** class's share of the radio's airtime, and web logins the **Web users**
+  class's (see [Airtime](#airtime)): guaranteed by weight, more when the channel is quiet, up to the max duty cycle.
+  ACKs count. `airtime_pct` in `hello` is the guaranteed share. A packet held over 2 minutes is dropped.
 * **Messages**: a client may send 20 messages a second, in bursts of up to 40. Past that each gets an error; 40
   beyond it, the connection is closed (1008).
 * **Lowest priority**: the room's ACKs and replies go first, then the virtual repeater's relays, then room pushes,

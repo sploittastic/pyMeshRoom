@@ -35,8 +35,8 @@ for pkt in client.packets():                 # every packet, heard ("rx") or sen
 * `dropped`: refused. `result["reason"]` says why, and `result.get("retry_after")` says how long to wait when waiting
   would help.
 
-Each key may send 3 packets in any 20 s. ACKs and path returns are exempt. API clients, web users and the
-virtual companion share the users' share of airtime: 10% guaranteed, more when the channel is quiet. A client may send
+Each key may send 3 packets in any 20 s. ACKs and path returns are exempt. API clients share the KaaS
+share of airtime (by weight on the dashboard's Airtime card: 3% by default), more when the channel is quiet. A client may send
 20 messages a second (bursts of 40).
 
 ## Route questions

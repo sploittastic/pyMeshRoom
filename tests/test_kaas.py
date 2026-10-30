@@ -125,9 +125,9 @@ class SendTests(unittest.TestCase):
         client is told."""
         air = self.h.room.air
         air.refill()
-        air.pool, air.own["users"] = -1e9, -1e9                  # (spent, for a long while)
+        air.pool, air.own["kaas"] = -1e9, -1e9                  # (spent, for a long while)
         old = dict(mr.TX_STALE_S)
-        mr.TX_STALE_S["users"] = 0.3
+        mr.TX_STALE_S["kaas"] = 0.3
         try:
             self.assertEqual(self.send(flood(mr.PT_ACK, os.urandom(4)))["status"], "queued")
             self.assertTrue(self.h.pump(lambda: self.conn.results()[-1]["status"] != "queued", 5))
@@ -136,7 +136,7 @@ class SendTests(unittest.TestCase):
         r = self.conn.results()[-1]
         self.assertEqual(r["status"], "dropped")
         self.assertIn("airtime", r["reason"])
-        self.assertEqual(air.dropped["users"], 1)
+        self.assertEqual(air.dropped["kaas"], 1)
         self.assertFalse(self.h.room.txq)
 
     def test_revoked_or_expired_key(self):
