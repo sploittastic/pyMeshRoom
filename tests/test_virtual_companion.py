@@ -100,6 +100,8 @@ class Harness:
                     self.room.on_txdone(ev[1])
                 elif kind == "say":
                     self.room.room_say(ev[1])
+                elif kind == "advert":
+                    self.room.dashboard_advert(ev[1], ev[2] if len(ev) > 2 else "repeater")
                 elif kind.startswith("t_"):
                     self.room.tenant_event(ev)
                 elif kind.startswith("kaas_"):

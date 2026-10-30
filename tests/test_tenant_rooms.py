@@ -281,5 +281,32 @@ class TenantWebTests(unittest.TestCase):
         self.assertEqual(self.req(tenant, "/hiking/")[0], 404)
 
 
+    def test_room_admins_set_welcome_and_location_and_advert(self):
+        """A room's own admins: its welcome DM, its position, its adverts. The host page sends the virtual
+        repeater's or companion's advert, only while it's on."""
+        room = self.h.room
+        admin, tenant = self.client(), self.client()
+        self.assertEqual(self.req(admin, "/api/login", dict(password="adminpw"))[0], 200)
+        self.assertEqual(self.req(admin, "/api/tenants", dict(name="Surf", path="surf", room_password="j",
+                                                              admin_password="boss", web_password="tenantpw"))[0], 200)
+        self.assertTrue(self.wait(lambda: len(room.tenants) == 1))
+        t = next(iter(room.tenants.values()))
+        self.assertEqual(self.req(tenant, "/surf/api/welcome")[0], 401)
+        self.assertEqual(self.req(tenant, "/surf/api/login", dict(password="tenantpw"))[0], 200)
+        self.assertEqual(json.loads(self.req(tenant, "/surf/api/welcome")[1])["welcome_message"], t.cfg.welcome_message)
+        self.assertEqual(self.req(tenant, "/surf/api/welcome", dict(welcome_message="Hi from {room}!"))[0], 200)
+        self.assertTrue(self.wait(lambda: t.cfg.welcome_message == "Hi from {room}!"))
+        self.assertNotEqual(room.cfg.welcome_message, "Hi from {room}!")              # (its own, not the host's)
+        self.assertEqual(self.req(tenant, "/surf/api/welcome", dict(welcome_message="x" * 200))[0], 400)
+        self.assertEqual(self.req(tenant, "/surf/api/location", dict(lat="36.6", lon="-121.9"))[0], 200)
+        self.assertTrue(self.wait(lambda: (t.cfg.lat, t.cfg.lon) == (36.6, -121.9)))
+        self.assertEqual(self.req(tenant, "/surf/api/location", dict(lat="36.6"))[0], 400)
+        self.assertEqual(self.req(tenant, "/surf/api/advert", dict(flood=False))[0], 200)
+        mine = lambda: [p for p in self.h.modem.on_air() if p and p.ptype == mr.PT_ADVERT and p.payload[:32] == t.id.pub_key]
+        self.assertTrue(self.wait(mine))
+        self.assertEqual(self.req(admin, "/api/advert", dict(node="repeater"))[0], 409)   # (it's off)
+        self.assertEqual(self.req(admin, "/api/advert", dict(node="room"))[0], 400)
+
+
 if __name__ == "__main__":
     unittest.main()

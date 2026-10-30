@@ -109,7 +109,7 @@ Core functionality fixed:
 
 ![Welcome DM settings](docs/images/welcome-dms-current.png)
 
-The admin-only **Welcome DMs** card lets an operator enable or disable the first-login message, customize the welcome text, and provide an optional prompt for members whose names are not yet known. Use `{room}` in either field to insert the room name.
+The admin-only **Welcome DMs** card on each room's page lets that room's admins enable or disable the first-login message, customize the welcome text, and provide an optional prompt for members whose names are not yet known. Use `{room}` in either field to insert the room name.
 
 # Additional useful features:
 * Web dashboard, public to view with an admin login, and isolated so it can't slow the radio.
@@ -437,7 +437,8 @@ out) and **Delete room**, which asks for the admin password and erases the room'
 good. Up to 100 rooms.
 
 A room's page shows its own members (active and suspended), bans, the room chat and the same repeater map and
-neighbour data as the host page. Its admins can post to the room, send its advert (zero-hop or flood), resync, suggest
+neighbour data as the host page. Its admins can post to the room, send its advert (zero-hop or flood) and set its location from the **Room** card,
+set its welcome DM, resync, suggest
 routes, kick, ban and unban, all for their room only. The host's admin can also act on any room's page.
 
 Nothing a room's admin does reaches outside their room. Over RF, a room's admin can change its name, position and

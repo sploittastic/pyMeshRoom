@@ -3711,6 +3711,10 @@ class RoomServer:
             log.info("tenant room %r: location set to %s, %s", t.cfg.name, ev[2], ev[3])
         elif kind == "t_say":
             t.room_say(ev[2])
+        elif kind == "t_welcome":
+            for k, v in ev[2].items():
+                t.cfg.set(k, v)
+            log.info("room %r: welcome DM settings changed", t.cfg.name)
         elif kind == "t_advert":
             t.dashboard_advert(ev[2])
         elif kind == "t_act":
@@ -4185,11 +4189,13 @@ class RoomServer:
         hits = [k for k, (ts, nm) in self.names.items() if nm.strip().casefold() == want]
         return max(hits, key=lambda k: (bool(self.mrpts.get(k)), self.names[k][0]), default=None)
 
-    def dashboard_advert(self, flood):
-        """The host dashboard's advert buttons: the virtual repeater's advert (a Room's page sends the Room's)."""
-        if self.vr is not None:
-            self.vr.send_advert(flood)
-            log.info("virtual repeater %s sent from the dashboard", "flood advert" if flood else "advert (zero-hop)")
+    def dashboard_advert(self, flood, node="repeater"):
+        """The host dashboard's advert buttons: the virtual repeater's or the companion's (a room's page sends the
+        room's)."""
+        n = self.vr if node == "repeater" else self.vc if node == "companion" else None
+        if n is not None:
+            n.send_advert(flood)
+            log.info("virtual %s: %s sent from the dashboard", node, "flood advert" if flood else "advert (zero-hop)")
 
     def send_advert(self, flood):
         if not self.TENANT:
@@ -6717,6 +6723,35 @@ def check_web_password(pw, stored):
     return hmac.compare_digest(got, h)
 
 
+def welcome_changes(body, room_name, cur):
+    """Welcome DM settings from a dashboard -> {setting: value}, validated against the room's name and current
+    settings (cur: an object with the welcome_* settings). Raises ValueError."""
+    if not isinstance(body, dict):
+        raise ValueError("invalid JSON")
+    updates = {}
+    if "welcome_new_members" in body:
+        if not isinstance(body["welcome_new_members"], bool):
+            raise ValueError("welcome_new_members must be true or false")
+        updates["welcome_new_members"] = body["welcome_new_members"]
+    for key in ("welcome_message", "welcome_advert_hint"):
+        if key in body:
+            if not isinstance(body[key], str):
+                raise ValueError("%s must be text" % key)
+            updates[key] = body[key]
+    if not updates:
+        raise ValueError("no welcome settings supplied")
+    enabled = updates.get("welcome_new_members", bool(cur.welcome_new_members))
+    message = updates.get("welcome_message", str(cur.welcome_message))
+    hint = updates.get("welcome_advert_hint", str(cur.welcome_advert_hint))
+    if enabled and message:
+        rendered = message.replace("{room}", str(room_name))
+        if hint:
+            rendered += " " + hint.replace("{room}", str(room_name))
+        if len(rendered.encode()) > MAX_POST_TEXT_LEN:
+            raise ValueError("welcome DM is too long after {room} is replaced (maximum %d UTF-8 bytes)" % MAX_POST_TEXT_LEN)
+    return updates
+
+
 def tenant_location(body):
     """A tenant room's advertised position from the dashboard: (lat, lon), both blank = none (0, 0). Raises ValueError."""
     def num(k, lim):
@@ -8875,7 +8910,8 @@ td.rcell .dir{flex:none}.mono4{font-family:ui-monospace,monospace}
 #tip h4{margin:0 0 4px;font-size:13px;color:var(--acc)}#tip .sec{margin-top:6px;color:var(--dim);text-transform:uppercase;font-size:10px;letter-spacing:.05em}
 #rpts tr[data-i]{cursor:pointer}#rpts tr[data-i]:hover td{background:#222a33}#rpts tr.sel td{background:#243447}.good{color:var(--ok)}.mid{color:var(--warn)}.poor{color:var(--bad)}.small{font-size:12px}.kpis{display:flex;flex-wrap:wrap;gap:22px}.kpi b{font-size:18px;display:block}
 .traffic-chart{height:88px;display:flex;align-items:flex-end;gap:1px;border-bottom:1px solid var(--line);padding:0 1px;margin:8px 0 4px}.traffic-chart i{display:block;flex:1;min-width:2px;background:var(--acc);border-radius:2px 2px 0 0}.traffic-chart i.zero{height:1px!important;background:var(--line)}.traffic-label{display:flex;justify-content:space-between}
-#advcard{order:1}#chatcard{order:2}#memberscard{order:3}#suspendedcard{order:4}#observercard{order:5}#trafficcard{order:6}#mqcard{order:7}#rpcard{order:8}#vccard{order:8}#tncard{order:-1}.host #memberscard,.host #suspendedcard,.host #banscard,.host #chatcard{display:none!important}#kaascard{order:8}#tnlist a{color:var(--acc)}.tenant #rmqtt,.tenant #rrpt,.tenant #rvc,.tenant #rsys,.tenant #rweb{display:none}#vcopts.locked{opacity:.5}#vcopts.locked *{cursor:not-allowed}#mapcard{order:9}#bestcard{order:10}#welcomecard{order:11}#repeaterscard{order:12}#banscard{order:13}
+.host #memberscard,.host #suspendedcard,.host #banscard,.host #chatcard{display:none!important}#tnlist a{color:var(--acc)}.tenant #rmqtt,.tenant #rrpt,.tenant #rvc,.tenant #rsys,.tenant #rweb{display:none}#vcopts.locked{opacity:.5}#vcopts.locked *{cursor:not-allowed}#kpicard{order:1}#aircard{order:2}#roomcard{order:3}#chatcard{order:4}#memberscard{order:5}#suspendedcard{order:6}#banscard{order:7}#tncard{order:8}#rpcard{order:9}#vccard{order:10}#kaascard{order:11}#webcard{order:12}#mapcard{order:13}#bestcard{order:14}#repeaterscard{order:15}#welcomecard{order:16}#mqcard{order:17}#observercard{order:18}#trafficcard{order:19}
+.card input:not([type=checkbox]):not([type=radio]):not([type=button]):not([type=submit]),.card select,.card textarea{padding:4px 6px;background:#0d1014;border:1px solid var(--line);border-radius:4px;color:var(--fg);font:inherit}.card input:focus,.card select:focus,.card textarea:focus{outline:none;border-color:var(--acc)}.advbtns{display:inline-flex;gap:6px;align-items:center;margin-left:10px}.advbtns .act:disabled{opacity:.35;cursor:not-allowed}
 </style></head><body>
 <header><h1 id="rname">meshroom</h1><span class="dim" id="rinfo"></span><span class="dim" id="rclock"></span><span id="rmqtt" class="volt"></span><span id="rrpt" class="volt"></span><span id="rvc" class="volt"></span><span id="rweb" class="volt"></span><span id="rsys" class="volt"></span><span id="rvolt" class="volt"></span>
 <span style="margin-left:auto"><span id="who" class="dim small"></span> <button id="loginbtn" onclick="loginClick()">Log in</button></span>
@@ -8893,7 +8929,7 @@ Separate with commas. Type a name or id for suggestions.</div>
 <div id="loginbox" class="modal"><div class="mbox"><h3>Admin log in</h3><input id="pw" type="password" placeholder="Password" onkeydown="if(event.key==='Enter')doLogin()">
 <div id="loginerr" class="poor small"></div><div style="margin-top:10px;display:flex;gap:8px;justify-content:flex-end"><button onclick="closeLogin()">Cancel</button><button onclick="doLogin()">Log in</button></div></div></div>
 <main>
-<div class="card"><div class="kpis" id="kpis"></div></div>
+<div class="card" id="kpicard"><div class="kpis" id="kpis"></div></div>
 <div class="card" id="aircard" style="display:none"><h2>Airtime <span class="hdesc">Max transmit duty cycle</span></h2>
 <div class="rprow"><label>Max duty cycle <input id="air_duty" type="number" min="1" max="100" step="1" style="width:4.5em" oninput="airSum()">% of the time</label>
 <span class="dim small">everything this radio sends together, over about a minute (ACKs and replies may go briefly over)</span></div>
@@ -8918,7 +8954,7 @@ Packets over their share wait their turn; relays waiting over 20 s, and web, com
 delivery scores or the push pace, and if the broker is unreachable the room carries on exactly as before.</div></div>
 <div class="card" id="rpcard" style="display:none"><h2>Virtual repeater <span class="hdesc">a second identity on the room's radio that relays for the mesh</span></h2>
 <div class="mqrow sub"><label>Import private key <input id="rp_key" type="password" autocomplete="new-password" placeholder="64 or 128 hex characters"></label><button onclick="rpImportKey()">Import key</button><span id="rpkeymsg" class="dim small"></span></div>
-<div class="mqrow"><label class="sw"><input type="checkbox" id="rp_en" onchange="rpSet({enabled:this.checked})"> <b>Virtual repeater</b></label>
+<div class="mqrow"><label class="sw"><input type="checkbox" id="rp_en" onchange="rpSet({enabled:this.checked})"> <b>Virtual repeater</b></label><span class="advbtns"><button class="act" title="Advert: zero-hop, heard by direct neighbours" onclick="sendAdvert(false,this,'repeater')"><img src="icons/advert.png" alt="advert"></button><button class="act" title="Flood advert: spreads across the whole mesh" onclick="sendAdvert(true,this,'repeater')"><img src="icons/flood_advert.png" alt="flood advert"></button><span class="dim small advmsg"></span></span>
 <span id="rpstat" class="dim small"></span></div>
 <div class="mqrow sub"><label class="sw"><input type="checkbox" id="rp_relay" onchange="rpSet({relay:this.checked})"> Relay packets <span class="dim">&mdash; turning this off stops relaying at once (queued relays are dropped); it keeps advertising</span></label></div>
 <div class="rprow"><label>Name <input id="rp_name" maxlength="31" size="16"></label>
@@ -8935,7 +8971,7 @@ delivery scores or the push pace, and if the broker is unreachable the room carr
 <div id="rpcounts" class="dim small" style="margin-left:26px"></div>
 </div>
 <div class="card" id="vccard" style="display:none"><h2>Virtual companion <span class="hdesc">a chat node on the room's radio that MeshCore apps connect to over the network</span></h2>
-<div class="mqrow"><label class="sw"><input type="checkbox" id="vc_en" onchange="vcToggle(this)"> <b>Virtual companion</b></label>
+<div class="mqrow"><label class="sw"><input type="checkbox" id="vc_en" onchange="vcToggle(this)"> <b>Virtual companion</b></label><span class="advbtns"><button class="act" title="Advert: zero-hop, heard by direct neighbours" onclick="sendAdvert(false,this,'companion')"><img src="icons/advert.png" alt="advert"></button><button class="act" title="Flood advert: spreads across the whole mesh" onclick="sendAdvert(true,this,'companion')"><img src="icons/flood_advert.png" alt="flood advert"></button><span class="dim small advmsg"></span></span>
 <span id="vcstat" class="dim small"></span><span id="vcmsg" class="small"></span></div>
 <div id="vcopts"><div class="hint" id="vclockhint" style="margin-left:26px"></div>
 <div class="mqrow sub"><label>Import private key <input id="vc_key" type="password" autocomplete="new-password" placeholder="64 or 128 hex characters"></label><button onclick="vcImportKey()">Import key</button><span id="vckeymsg" class="dim small"></span></div>
@@ -8964,7 +9000,7 @@ Messages between the companion and this room or its repeater never go on the air
 <button onclick="tnCreate(this)">Create</button><span id="tnmsg" class="small"></span></div>
 <div class="hint" style="margin-left:26px">If no private key is entered, one is generated randomly. Each room gets its own page at its path, where its
 admins (web UI password) see its members and the map, chat, advert, resync, suggest routes, kick and ban. The join and admin passwords are what
-people use from their MeshCore apps. The location is what the room's adverts put on maps; change it later from the room's Actions.
+people use from their MeshCore apps. The location is what the room's adverts put on maps; the room's admins can change it on its page, as can you from its Actions.
 Rooms share this radio, its map and its airtime; nothing a room's admin does reaches outside their room.</div>
 <table id="tnlist" style="margin-top:8px"></table></div>
 <div class="card" id="kaascard" style="display:none"><h2>KaaS <span class="hdesc">KISS radio as an API service - useful for bots or other integrations</span></h2>
@@ -9009,10 +9045,11 @@ A key is shown once, when it is made: only a hash of it is kept, so a lost key c
 <label class="dlgrow"><input type="checkbox" id="wbban_ip"> IP address <span class="wbkey" id="wbban_addr"></span></label>
 <div class="small" id="wbban_note"></div>
 <div class="dlgbtns"><button value="cancel">Cancel</button><button id="wbban_go" value="ban" class="wbwarn">Ban</button></div></form></dialog>
-<div class="card" id="advcard" style="display:none"><h2>Adverts <span class="hdesc">the virtual repeater's (each room sends its own from its page)</span></h2><div class="advrow">
-<div class="adv"><button class="act" title="Advert: zero-hop, heard by direct neighbours" onclick="sendAdvert(false,this)"><img src="icons/advert.png" alt="advert"></button><div>Advert<br><span class="dim small">zero-hop</span></div></div>
-<div class="adv"><button class="act" title="Flood advert: spreads across the whole mesh" onclick="sendAdvert(true,this)"><img src="icons/flood_advert.png" alt="flood advert"></button><div>Flood advert<br><span class="dim small">whole mesh</span></div></div>
-<span id="advmsg" class="dim small"></span></div></div>
+<div class="card" id="roomcard" style="display:none"><h2>Room <span class="hdesc">this room's adverts and location</span></h2>
+<div class="advrow"><b>Advert</b><span class="advbtns"><button class="act" title="Advert: zero-hop, heard by direct neighbours" onclick="sendAdvert(false,this)"><img src="icons/advert.png" alt="advert"></button><button class="act" title="Flood advert: spreads across the whole mesh" onclick="sendAdvert(true,this)"><img src="icons/flood_advert.png" alt="flood advert"></button><span class="dim small advmsg"></span></span></div>
+<div class="rprow"><label>Latitude <input id="rm_lat" size="10" placeholder="none" autocomplete="off"></label>
+<label>Longitude <input id="rm_lon" size="11" placeholder="none" autocomplete="off"></label><button onclick="roomLoc(this)">Save location</button><span id="rmlocmsg" class="small"></span></div>
+<div class="hint">What the room's adverts put on maps. Blank both for no position. An advert with the new position goes out within seconds.</div></div>
 <div class="card" id="chatcard" style="display:none"><h2>Room chat</h2>
 <div id="chatlog" class="chatlog"><div class="dim">loading...</div></div>
 <div class="chatin"><input id="chatmsg" maxlength="400" placeholder="Message everyone in the room (sent as the room)" autocomplete="off">
@@ -9034,16 +9071,15 @@ A key is shown once, when it is made: only a hash of it is kept, so a lost key c
 <table id="observerservers" style="margin-top:8px"></table>
 <table id="observerstatus" style="margin-top:10px"></table></div>
 <div class="card" id="trafficcard" style="display:none"><div id="observertraffic"></div></div>
-<div class="card" id="welcomecard" style="display:none"><h2>Welcome DMs <span class="hdesc">admin only &middot; sent only to newly logged-in members &middot; the default for every room</span></h2>
+<div class="card" id="welcomecard" style="display:none"><h2>Welcome DMs <span class="hdesc">admin only &middot; sent only to newly logged-in members</span></h2>
 <div class="advrow"><label><input id="welcome_enabled" type="checkbox"> Send welcome DM</label><button onclick="saveWelcome()">Save welcome settings</button><span id="welcomemsg" class="small dim"></span></div>
-<div style="margin-top:10px"><label>Welcome message<br><textarea id="welcome_message" rows="2" maxlength="151" style="width:min(680px,100%)"></textarea></label></div>
-<div style="margin-top:8px"><label>Name-unknown hint <span class="dim small">(optional; appended when the member has not sent an advert)</span><br><textarea id="welcome_hint" rows="2" maxlength="151" style="width:min(680px,100%)"></textarea></label></div>
+<div style="margin-top:10px"><label>Welcome message<br><textarea id="welcome_message" rows="2" maxlength="151" style="width:min(680px,100%);box-sizing:border-box"></textarea></label></div>
+<div style="margin-top:8px"><label>Name-unknown hint <span class="dim small">(optional; appended when the member has not sent an advert)</span><br><textarea id="welcome_hint" rows="2" maxlength="151" style="width:min(680px,100%);box-sizing:border-box"></textarea></label></div>
 <div class="hint">Use <code>{room}</code> for the room name. The rendered welcome message and optional hint together may be at most 151 UTF-8 bytes.</div></div>
 <div class="card" id="repeaterscard"><h2>Repeaters heard</h2><table id="rpts"></table></div>
 </main>
 <script>
-const TENANT=!!window.TENANT;if(TENANT){document.body.classList.add("tenant");
- document.querySelector("#advcard .hdesc").textContent="this room's adverts"}else document.body.classList.add("host");
+const TENANT=!!window.TENANT;document.body.classList.add(TENANT?"tenant":"host");
 const $=id=>document.getElementById(id), esc=s=>String(s??"").replace(/[&<>"'`]/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;","`":"&#96;"}[c]));
 function ago(t){if(!t)return"never";let d=Math.max(0,Date.now()/1000-t);return d<60?Math.round(d)+"s":d<3600?Math.round(d/60)+"m":d<86400?(d/3600).toFixed(1)+"h":(d/86400).toFixed(1)+"d"}
 async function act(url,label){if(!confirm(label))return;const r=await fetch(url,{method:"POST"});if(r.status===401){await session();alert("Your admin session has expired: log in again.")}setTimeout(load,300)}
@@ -9244,19 +9280,23 @@ async function mqRegions(btn){const codes=[...new Set($("mq_regions").value.toUp
  let m=r.ok?(codes.length?"saved: only "+codes.join(", ")+"; reconnecting":"saved: every region; reconnecting"):"not saved";if(!r.ok){try{m=(await r.json()).error||m}catch(e){}}
  if(r.status===401){m="Your admin session has expired: log in again.";session()}$("mqreg").className=r.ok?"good small":"poor small";$("mqreg").textContent=m;delete SIG.mqconn;setTimeout(load,700)}
 async function mqConnection(){const o={host:$("mq_host").value.trim(),port:+$("mq_port").value,transport:$("mq_transport").value,ws_path:$("mq_path").value.trim(),tls:$("mq_tls").checked,tls_verify:$("mq_verify").checked,topics:$("mq_topics").value};const r=await fetch("api/mqtt",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(o)});let m="broker settings were not saved";if(r.ok)m="broker settings saved; reconnecting";else{try{m=(await r.json()).error||m}catch(e){}}if(r.status===401){m="Your admin session has expired: log in again.";session()}$("mqconn").className=r.ok?"good small":"poor small";$("mqconn").textContent=m;delete SIG.mqconn;setTimeout(load,700)}
-async function sendAdvert(flood,btn){
+async function sendAdvert(flood,btn,node){
  if(flood&&!confirm("Send a flood advert? It is relayed across the whole mesh."))return;
- btn.disabled=true;const r=await fetch("api/advert",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({flood})});
- let m=r.ok?(flood?"Flood advert sent":"Advert sent (zero-hop)"):"Could not send";try{const d=await r.json();if(!r.ok)m=d.error||m;else if(d.repeater)m+=" (room and repeater)"}catch(e){}
+ btn.disabled=true;btn.dataset.busy=1;const r=await fetch("api/advert",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(node?{flood,node}:{flood})});
+ let m=r.ok?(flood?"Flood advert sent":"Advert sent (zero-hop)"):"Could not send";try{const d=await r.json();if(!r.ok)m=d.error||m}catch(e){}
  if(r.status===401){m="Your admin session has expired: log in again.";session()}
- $("advmsg").textContent=m+" · "+new Date().toLocaleTimeString();setTimeout(()=>btn.disabled=false,10000)}
+ btn.parentElement.querySelector(".advmsg").textContent=m+" · "+new Date().toLocaleTimeString();setTimeout(()=>{btn.disabled=false;delete btn.dataset.busy},10000)}
+async function roomLoc(btn){btn.disabled=true;const r=await fetch("api/location",{method:"POST",headers:{"Content-Type":"application/json"},
+  body:JSON.stringify({lat:$("rm_lat").value.trim(),lon:$("rm_lon").value.trim()})});btn.disabled=false;
+ let m=r.ok?"saved":"Could not save";try{if(!r.ok)m=(await r.json()).error||m}catch(e){}if(r.status===401){m="Your admin session has expired: log in again.";session()}
+ $("rmlocmsg").className=r.ok?"good small":"poor small";$("rmlocmsg").textContent=" "+m;delete SIG.rmloc;setTimeout(load,600)}
 async function sendChat(){const t=$("chatmsg").value.trim();if(!t)return;$("chaterr").textContent="";
  const r=await fetch("api/chat",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({text:t})});
  if(r.ok){$("chatmsg").value="";chatLeft();setTimeout(()=>loadChat(false),700)}
  else{let e="Could not send";try{e=(await r.json()).error||e}catch(x){}if(r.status===401){e="Your admin session has expired: log in again.";session()}$("chaterr").textContent=e}}
 async function session(){try{const r=await (await fetch("api/session")).json();ADMIN=r.admin;LOGIN_ON=r.login_enabled}catch(e){}
  MAINADM=ADMIN&&!TENANT;
- const was=$("chatcard").style.display!=="none";$("chatcard").style.display=ADMIN?"":"none";$("advcard").style.display=ADMIN?"":"none";$("observercard").style.display=MAINADM?"":"none";$("trafficcard").style.display=MAINADM?"":"none";$("welcomecard").style.display=MAINADM?"":"none";if(ADMIN&&!was)loadChat(true);if(MAINADM&&!WELCOME_LOADED)loadWelcome();if(!ADMIN)WELCOME_LOADED=false;
+ const was=$("chatcard").style.display!=="none";$("chatcard").style.display=ADMIN?"":"none";$("roomcard").style.display=ADMIN&&TENANT?"":"none";$("observercard").style.display=MAINADM?"":"none";$("trafficcard").style.display=MAINADM?"":"none";$("welcomecard").style.display=ADMIN&&TENANT?"":"none";if(ADMIN&&!was)loadChat(true);if(ADMIN&&TENANT&&!WELCOME_LOADED)loadWelcome();if(!ADMIN)WELCOME_LOADED=false;
  $("mqcard").style.display=MAINADM?"":"none";
  $("rpcard").style.display=MAINADM?"":"none";$("aircard").style.display=MAINADM?"":"none";
  $("vccard").style.display=MAINADM?"":"none";
@@ -9274,8 +9314,10 @@ function observerState(o){
   if(document.activeElement!==sel&&changed("obswho",[ch,d.identity])){sel.innerHTML='<option value="">— choose —</option>'+ch.map(c=>`<option value="${esc(c.id)}">${esc(c.label)}</option>`).join("");sel.value=valid?d.identity:""}
   $("obs_enabled").disabled=!valid&&!d.enabled;
   $("obswho_note").textContent=!ch.length?"Turn on the virtual repeater or create a room: the observer reports as one of them.":!valid?"Choose who it reports as to enable it.":"";
-  $("obs_enabled").checked=!!d.enabled;$("obs_iata").value=d.iata||"";$("obs_status").checked=d.status!==false;$("obs_packets").checked=d.packets!==false;$("obs_rx").checked=d.rx!==false;
-  $("obs_queue").value=d.queue_max||1000;OBS_SERVERS=d.servers||[];renderObserverServers();}
+  $("obs_enabled").checked=!!d.enabled;
+  const f=document.activeElement,typing=f&&f.closest&&f.closest("#observercard")&&f.tagName!=="BUTTON"&&f.type!=="checkbox";
+  if(!typing&&changed("obsform",[d.iata,d.status,d.packets,d.rx,d.queue_max])){$("obs_iata").value=d.iata||"";$("obs_status").checked=d.status!==false;$("obs_packets").checked=d.packets!==false;$("obs_rx").checked=d.rx!==false;$("obs_queue").value=d.queue_max||1000}
+  if(changed("obssrv",d.servers||[])){OBS_SERVERS=d.servers||[];renderObserverServers()}}
  const bs=d.brokers||{}, row=n=>{const b=bs[n]||{},s=b.connected?'<span class="good">connected</span>':'<span class="poor">disconnected</span>';return `<tr><td>${n}</td><td>${s}</td><td>${b.last_publish?ago(b.last_publish)+" ago":"never"}</td><td class="small">${esc(b.last_error||"-")}</td></tr>`};
  $("observerstatus").innerHTML=`<tr><th>Public key</th><td class="mono">${esc(d.public_key||((d.choices||[]).find(c=>c.id===d.identity)||{}).key||"-")}</td><th>Queue</th><td>${d.queue_depth}/${d.queue_max} &middot; ${d.dropped} dropped</td><th>Uptime</th><td>${d.uptime||0}s</td></tr>`+
   `<tr><th>Broker</th><th>State</th><th>Last publish</th><th colspan="3">Last error</th></tr>`+Object.keys(bs).map(row).join("")+(d.last_error?`<tr><th>Observer</th><td colspan="5" class="poor">${esc(d.last_error)}</td></tr>`:"");
@@ -9397,10 +9439,13 @@ async function load(){
   $("mqstat").innerHTML=Mq.enabled?(Mq.connected?`connected to ${esc(Mq.host)} &middot; ${subStatus} &middot; MQTT packets received: ${Md.received||0}; accepted: ${Md.accepted||0} &middot; deliveries confirmed: ${Mq.acks} &middot; posts captured: ${Mq.posts} &middot; links: ${Mq.links} &middot; adverts: ${Mq.adverts} &middot; channel msgs: ${Mq.channel_msgs} &middot; wakes: ${Mq.wakes}`
    :`<span class="poor">not connected</span> ${esc(Mq.error||"(connecting...)")}`):"off"}
  if(MAINADM)renderAir(st.airtime);
+ if(TENANT&&ADMIN){const f=document.activeElement,typing=f&&f.closest&&f.closest("#roomcard")&&f.tagName==="INPUT";
+  if(!typing&&changed("rmloc",[R.lat,R.lon])){const has=R.lat||R.lon;$("rm_lat").value=has?R.lat:"";$("rm_lon").value=has?R.lon:""}}
  const Rp=st.repeater||{};
  $("rrpt").innerHTML=Rp.enabled?`<span class="dim">Repeater</span> ${esc(Rp.name)} <span class="dim small">${esc(Rp.id||"")}</span> `+
    (Rp.relay?`<span class="good">relaying</span> <span class="dim small">${Rp.per_min}/min &middot; ${Rp.airtime_used}% air (airtime weight ${Rp.airtime_cap})</span>`:'<span class="mid">not relaying</span>')
    :'<span class="dim">Repeater off</span>';
+ document.querySelectorAll("#rpcard .advbtns .act").forEach(b=>{if(!b.dataset.busy)b.disabled=!Rp.enabled});
  if(ADMIN){$("rp_en").checked=!!Rp.enabled;$("rp_relay").checked=!!Rp.relay;$("rp_relay").disabled=!Rp.enabled;
   const f=document.activeElement,typing=f&&f.closest&&f.closest("#rpcard")&&f.tagName!=="BUTTON"&&f.type!=="checkbox";
   if(!typing&&changed("rpform",[Rp.name,Rp.lat,Rp.lon,Rp.scope_mode,Rp.regions,Rp.airtime_cap,Rp.loop_detect,Rp.advert_min,Rp.flood_advert_h])){
@@ -9411,6 +9456,7 @@ async function load(){
    `kept internal: ${Rp.internal} &middot; duplicates: ${Rp.dups} &middot; not relayed: ${Rp.drop_scope} scope, ${Rp.drop_hops} hop limit, ${Rp.drop_loop} loop, `+
    `${Rp.drop_airtime} airtime, ${Rp.drop_queue} queue full${Rp.relay?"":`, ${Rp.drop_off} while off`} &middot; adverts: ${Rp.adverts}`:""}
  const Vc=st.companion||{};
+ document.querySelectorAll("#vccard .advbtns .act").forEach(b=>{if(!b.dataset.busy)b.disabled=!Vc.enabled});
  if(MAINADM){try{const r=await fetch("api/companion");if(r.ok)VCA=await r.json()}catch(e){}}
  $("rvc").innerHTML=Vc.enabled?`<span class="dim">Companion</span> ${esc(Vc.name)} `+(Vc.client?`<span class="good">app connected</span>`:Vc.listening?'<span class="dim small">no app connected</span>':'<span class="poor">port not open</span>'):"";
  if(ADMIN){if(!$("vc_en").disabled)$("vc_en").checked=!!Vc.enabled;
@@ -9801,6 +9847,12 @@ class WebUI:
                     if path == "/api/map":
                         gz = "gzip" in (self.headers.get("Accept-Encoding") or "")
                         return self._send(200, snap_bytes("web_map", gz), gz=gz)
+                    if path == "/api/welcome":
+                        if not self._tenant_admin(t):
+                            return self._send(401, '{"error":"log in first"}')
+                        return self._send(200, json.dumps({"welcome_new_members": bool(t.cfg.welcome_new_members),
+                                                           "welcome_message": str(t.cfg.welcome_message),
+                                                           "welcome_advert_hint": str(t.cfg.welcome_advert_hint)}))
                     if path == "/api/chat":
                         if not self._tenant_admin(t):
                             return self._send(401, '{"error":"log in first"}')
@@ -9843,6 +9895,20 @@ class WebUI:
                         t_last_advert[key] = time.monotonic()
                     events.put(("t_advert", key, bool(body.get("flood"))))
                     return self._send(200, json.dumps({"ok": True, "flood": bool(body.get("flood")), "repeater": False}))
+                if parts == ["api", "welcome"]:
+                    try:
+                        updates = welcome_changes(self._body(), t.cfg.name, t.cfg)
+                    except ValueError as e:
+                        return self._send(400, json.dumps({"error": str(e)}))
+                    events.put(("t_welcome", key, updates))
+                    return self._send(200, json.dumps({"ok": True, "updates": updates}))
+                if parts == ["api", "location"]:
+                    try:
+                        lat, lon = tenant_location(self._body() or {})
+                    except ValueError as e:
+                        return self._send(400, json.dumps({"error": str(e)}))
+                    events.put(("t_loc", key, lat, lon))
+                    return self._send(200, json.dumps({"ok": True, "lat": lat, "lon": lon}))
                 if parts == ["api", "chat"]:
                     text = str((self._body() or {}).get("text", "")).strip()
                     if not text:
@@ -10477,32 +10543,11 @@ class WebUI:
                         return self._send(400, '{"error":"no observer settings supplied"}')
                     events.put(("observer_config", updates))     # persisted and applied by the main loop
                     return self._send(200, json.dumps({"ok": True, "updates": updates}))
-                if parts == ["api", "welcome"]:
+                if parts == ["api", "welcome"]:                # (the default for rooms without their own)
                     try:
-                        body = json.loads(self._raw_body() or b"{}")
-                    except ValueError:
-                        return self._send(400, '{"error":"invalid JSON"}')
-                    updates = {}
-                    if "welcome_new_members" in body:
-                        if not isinstance(body["welcome_new_members"], bool):
-                            return self._send(400, '{"error":"welcome_new_members must be true or false"}')
-                        updates["welcome_new_members"] = body["welcome_new_members"]
-                    for key in ("welcome_message", "welcome_advert_hint"):
-                        if key in body:
-                            if not isinstance(body[key], str):
-                                return self._send(400, json.dumps({"error": "%s must be text" % key}))
-                            updates[key] = body[key]
-                    if not updates:
-                        return self._send(400, '{"error":"no welcome settings supplied"}')
-                    enabled = updates.get("welcome_new_members", bool(cfg.welcome_new_members))
-                    message = updates.get("welcome_message", str(cfg.welcome_message))
-                    hint = updates.get("welcome_advert_hint", str(cfg.welcome_advert_hint))
-                    if enabled and message:
-                        rendered = message.replace("{room}", str(cfg.name))
-                        if hint:
-                            rendered += " " + hint.replace("{room}", str(cfg.name))
-                        if len(rendered.encode()) > MAX_POST_TEXT_LEN:
-                            return self._send(400, json.dumps({"error": "welcome DM is too long after {room} is replaced (maximum %d UTF-8 bytes)" % MAX_POST_TEXT_LEN}))
+                        updates = welcome_changes(json.loads(self._raw_body() or b"{}"), cfg.name, cfg)
+                    except ValueError as e:
+                        return self._send(400, json.dumps({"error": str(e)}))
                     events.put(("welcome_config", updates))      # main loop persists updates before a member can receive them
                     return self._send(200, json.dumps({"ok": True, "updates": updates}))
                 if parts == ["api", "mqtt"]:
@@ -10553,16 +10598,17 @@ class WebUI:
                         body = json.loads(self._raw_body() or b"{}")
                     except ValueError:
                         body = {}
+                    flood, node = bool(body.get("flood")), str(body.get("node") or "repeater")
+                    if node not in ("repeater", "companion"):
+                        return self._send(400, '{"error":"node: repeater or companion (rooms advertise from their page)"}')
+                    if not (room.web_state.get(node) or {}).get("enabled"):
+                        return self._send(409, json.dumps({"error": "the virtual %s is off" % node}))
                     with slock:
                         if time.monotonic() - last_advert[0] < 10:
                             return self._send(429, '{"error":"an advert was just sent: wait a few seconds"}')
                         last_advert[0] = time.monotonic()
-                    flood = bool(body.get("flood"))
-                    rpt = bool((room.web_state.get("repeater") or {}).get("enabled"))
-                    if not rpt:
-                        return self._send(409, '{"error":"the virtual repeater is off: adverts are sent from each Room\'s page"}')
-                    events.put(("advert", flood))                   # sent by the main loop
-                    return self._send(200, json.dumps({"ok": True, "flood": flood, "repeater": rpt}))
+                    events.put(("advert", flood, node))             # sent by the main loop
+                    return self._send(200, json.dumps({"ok": True, "flood": flood, "node": node}))
                 if parts == ["api", "chat"]:
                     return self._send(404, '{"error":"the server isn\'t a room: post from a Room\'s page"}')
                     return self._send(200, '{"ok":true}')
@@ -10739,7 +10785,7 @@ def main():
             getattr(room, "force_resync" if kind == "resync" else kind)(ev[1])
             room.web_dirty = True                           # refresh the dashboard once the radio is idle
         elif kind == "advert":
-            room.dashboard_advert(ev[1])
+            room.dashboard_advert(ev[1], ev[2] if len(ev) > 2 else "repeater")
         elif kind == "say":
             room.room_say(ev[1])
         elif kind == "suggest":
