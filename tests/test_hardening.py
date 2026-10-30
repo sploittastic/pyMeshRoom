@@ -378,6 +378,30 @@ class HardeningTests(WebHelpers):
         self.assertEqual(self.http("POST", "/api/v1/web/settings", {"motd": "x" * 1001})[0], 400)
 
 
+class TopLinksTests(unittest.TestCase):
+    def test_up_to_25_with_the_virtual_repeater_among_them(self):
+        from test_virtual_companion import Harness
+        h = Harness()
+        try:
+            room = h.room
+            for i in range(30):
+                hsh = bytes([0x10 + i, i])
+                room.probe_snr(hsh, 5.0, 4.0, 300, discovery=True)
+                st = room.probe_stats(hsh)
+                st["tr_n"], st["tr_s"] = 10.0, 10.0 - (i % 5)
+            rows = room.top_links()
+            self.assertEqual(len(rows), 25)
+            rel = [100 - r["loss"] for r in rows]
+            self.assertEqual(rel, sorted(rel, reverse=True))                  # most reliable first
+            room.vr = types.SimpleNamespace(pub=b"\xee" * 32)
+            rows = room.top_links()
+            self.assertEqual(len(rows), 25)
+            self.assertTrue(rows[0].get("virtual"))
+        finally:
+            room.vr = None
+            h.close()
+
+
 class RepeaterTableTests(unittest.TestCase):
     def test_capped_keeping_the_recent_and_our_own(self):
         ours = b"\x01" * 32

@@ -4582,8 +4582,9 @@ class RoomServer:
         return [dict(path=self.path_names(plen, path), hex=self.path_hex(plen, path), share=round(100 * w / tot))
                 for (plen, path), w in top if w > 0.05]
 
-    def top_links(self, n=10):
-        """Neighbours ranked by trace packet loss (lowest first, more traces first), untraced ones after."""
+    def top_links(self, n=25):
+        """Neighbours ranked by trace reliability (most reliable first, more traces first), untraced ones after; at
+        most n, our own virtual repeater (first, when it's on) among them."""
         rows = []
         f24 = lambda st: 0.5 ** (max(0, now_s() - st["tr_t"]) / (24 * 3600.0))
         for h, st in self.probes.items():
@@ -4603,7 +4604,7 @@ class RoomServer:
                 out_last=st["out_last"], out_avg=None if st["out_avg"] is None else round(st["out_avg"], 1),
                 rtt=None if st["rtt"] is None else int(st["rtt"]), last_ok=st["last_ok"])))
         rows.sort(key=lambda r: r[0])
-        out = [r[1] for r in rows[:n]]
+        out = [r[1] for r in rows[:n - (self.vr is not None)]]
         if self.vr is not None:                             # our own repeater: the same radio, a perfect link
             snr = VIRTUAL_LINK_SNR
             out.insert(0, dict(name="%s (virtual)" % self.rpt_label(self.vr.pub[:2]), hash=hexs(self.vr.pub[:2]), loss=0.0,
@@ -8802,6 +8803,8 @@ td.rcell .dir{flex:none}.mono4{font-family:ui-monospace,monospace}
 .mqrow input[type=checkbox]{transform:scale(1.2);margin-right:6px}.mqrow input[type=text],.mqrow input[type=password],.mqrow input[type=number],.mqrow select{width:auto;min-width:110px;padding:4px 6px;background:#0d1014;border:1px solid var(--line);border-radius:4px;color:var(--fg)}.mqnote{margin-top:10px;padding:8px 10px;border-left:3px solid var(--acc);background:#151a20;color:var(--dim);font-size:12px}
 .advrow{display:flex;gap:26px;align-items:center;flex-wrap:wrap}.adv{display:flex;gap:10px;align-items:center}
 .hdesc{color:var(--dim);font-weight:400;text-transform:none;letter-spacing:0;font-size:12px;margin-left:8px}.hdesc a{color:var(--acc)}.wbkey{font-family:ui-monospace,monospace}.wbacts{display:flex;flex-wrap:wrap;gap:4px;min-width:150px}.wbacts button{white-space:nowrap}.wbacts .wbwarn{color:var(--bad)}
+#wb_motd{font:inherit;max-width:100%;padding:6px 8px;background:#0d1014;border:1px solid var(--line);border-radius:4px;color:var(--fg);resize:vertical}
+#wb_motd:focus{outline:none;border-color:var(--acc)}
 .airtab td{padding:3px 8px}.airtab input{width:4.5em;padding:4px 6px;background:#0d1014;border:1px solid var(--line);border-radius:4px;color:var(--fg)}.airbar{display:inline-block;width:160px;height:8px;background:var(--line);border-radius:4px;position:relative;vertical-align:middle;overflow:hidden}
 .airbar i{position:absolute;left:0;top:0;bottom:0;background:var(--acc)}.airbar b{position:absolute;top:0;bottom:0;width:2px;background:var(--fg);opacity:.6}
 .dlg{background:var(--card);color:var(--fg);border:1px solid var(--line);border-radius:8px;padding:14px 18px;min-width:min(420px,90vw)}
@@ -8930,7 +8933,7 @@ A key is shown once, when it is made: only a hash of it is kept, so a lost key c
 <div class="rprow"><label title="Shown to a web user whose key may not send yet: not heard advertising on this radio (an MQTT report doesn't count), and not allowed by you">Unknown key message
 <input id="wb_unk" type="text" size="60" maxlength="200" autocomplete="off"></label><button onclick="wbUnknown(this)">Save</button></div>
 <div class="rprow" style="align-items:flex-start"><label class="sw" title="Shown to web users as a popup when they log in or open the page (each can tick &quot;don't show this again&quot;, until you change the text)"><input id="wb_motd_on" type="checkbox" onchange="wbSettings({motd_enabled:this.checked})"> Message of the day</label>
-<textarea id="wb_motd" rows="3" cols="60" maxlength="1000" placeholder="Shown when web users log in" style="font:inherit"></textarea><button onclick="wbMotd(this)">Save</button></div>
+<textarea id="wb_motd" rows="3" cols="60" maxlength="1000" placeholder="Shown when web users log in"></textarea><button onclick="wbMotd(this)">Save</button></div>
 <div class="rprow"><label title="For MeshCore Web's GIF picker: a free key from developers.giphy.com (an API key, not an SDK key). Web users' browsers use it to search Giphy">Giphy API key
 <input id="wb_giphy" type="password" size="18" maxlength="64" autocomplete="off" placeholder="none"></label>
 <button onclick="wbGiphy(this,false)">Set</button><button id="wb_giphy_rm" onclick="wbGiphy(this,true)">Remove</button>
@@ -9402,7 +9405,7 @@ async function load(){
  if(changed("toplinks",{t:st.top_links,d:st.discovery_min})){
  const TL=st.top_links||[], sn2=(a,b)=>`${a==null?"-":(a>0?"+":"")+a}<span class="dim"> / ${b==null?"-":(b>0?"+":"")+b}</span>`;
  $("toplinks").innerHTML=TL.length?"<tr><th>Repeater</th><th>Reliability</th><th>SNR in (last / avg)</th><th>SNR out (last / avg)</th><th>Round trip</th><th>Last reply</th></tr>"+
-  TL.map(r=>{const c=r.loss==null?"dim":r.loss<=5?"good":r.loss<=20?"mid":"poor";
+  TL.map(r=>{const c=r.loss==null?"dim":r.loss<=10?"good":r.loss<=30?"mid":"poor";   // reliability 90%+ / 70%+ / below
    return `<tr><td>${esc(r.name)}</td><td>${r.virtual?'<span class="good">100%</span> <span class="dim small">same radio</span>':r.loss==null?'<span class="dim">not traced yet</span>':`<span class="${c}">${(100-r.loss).toFixed(1)}%</span> <span class="dim small">${r.traces} trace${r.traces==1?"":"s"}${r.few?" &middot; few traces":""}</span>`}</td>`+
    `<td>${sn2(r.in_last,r.in_avg)}</td><td>${sn2(r.out_last,r.out_avg)}</td><td>${r.rtt!=null?r.rtt+" ms":"-"}</td><td>${r.last_ok?ago(r.last_ok)+" ago":"never"}</td></tr>`}).join("")
   :`<tr><td class="dim">no neighbours yet: the room discovers its direct repeaters every ${st.discovery_min||15} minutes</td></tr>`;
